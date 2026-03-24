@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&amp;family=Berkeley+Mono&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    colors: {
+                        "surface-container-lowest": "#0e0e0e",
+                        "inverse-on-surface": "#313030",
+                        "background": "#131313",
+                        "surface-container": "#201f1f",
+                        "surface-bright": "#3a3939",
+                        "on-primary": "#00174b",
+                        "inverse-surface": "#e5e2e1",
+                        "tertiary-fixed": "#0053db",
+                        "on-secondary-container": "#e2e2e2",
+                        "tertiary": "#dbe1ff",
+                        "error-container": "#93000a",
+                        "error": "#ffb4ab",
+                        "on-tertiary-fixed": "#ffffff",
+                        "on-error": "#690005",
+                        "surface-tint": "#b4c5ff",
+                        "surface-container-high": "#2a2a2a",
+                        "surface-dim": "#131313",
+                        "secondary-fixed": "#c6c6c7",
+                        "on-primary-fixed-variant": "#dbe1ff",
+                        "on-primary-fixed": "#ffffff",
+                        "secondary-fixed-dim": "#aaabab",
+                        "secondary": "#c6c6c7",
+                        "primary-container": "#c7d3ff",
+                        "on-tertiary-container": "#000000",
+                        "on-surface-variant": "#c6c6c6",
+                        "on-secondary-fixed": "#1a1c1c",
+                        "on-error-container": "#ffdad6",
+                        "outline": "#919191",
+                        "inverse-primary": "#0053db",
+                        "tertiary-fixed-dim": "#003ea8",
+                        "outline-variant": "#474747",
+                        "surface-container-low": "#1c1b1b",
+                        "on-tertiary": "#00174b",
+                        "surface": "#131313",
+                        "primary-fixed-dim": "#003ea8",
+                        "on-secondary-fixed-variant": "#3a3c3c",
+                        "on-secondary": "#1a1c1c",
+                        "surface-container-highest": "#353534",
+                        "secondary-container": "#454747",
+                        "on-primary-container": "#000000",
+                        "primary-fixed": "#0053db",
+                        "tertiary-container": "#618bff",
+                        "on-surface": "#e5e2e1",
+                        "primary": "#ffffff",
+                        "on-tertiary-fixed-variant": "#dbe1ff",
+                        "surface-variant": "#353534",
+                        "on-background": "#e5e2e1"
+                    },
+                    fontFamily: {
+                        "headline": ["Inter"],
+                        "body": ["Inter"],
+                        "label": ["Inter"],
+                        "mono": ["Berkeley Mono", "monospace"]
+                    },
+                    borderRadius: {"DEFAULT": "0px", "lg": "0px", "xl": "0px", "full": "9999px"},
+                },
+            },
+        }
+    </script>
+<style>
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+            font-size: 18px;
+        }
+        body {
+            background-color: #131313;
+            color: #e5e2e1;
+            font-family: 'Inter', sans-serif;
+        }
+        .mono-data {
+            font-family: 'Berkeley Mono', monospace;
+        }
+        ::-webkit-scrollbar {
+            width: 4px;
+            height: 4px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #131313;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #353534;
+        }
+    </style>
+</head>
+<body class="overflow-hidden">
+<!-- TopNavBar -->
+<header class="flex justify-between items-center w-full px-4 h-12 bg-[#131313] z-50 fixed top-0 border-b border-white/10">
+<div class="flex items-center gap-6">
+<span class="text-sm font-black tracking-[0.2em] text-[#0053db] drop-shadow-[0_0_8px_rgba(0,83,219,0.3)]">AUGMENTED OCR</span>
+<nav class="hidden md:flex items-center gap-4">
+<span class="font-['Inter'] font-bold tracking-tight text-sm uppercase text-zinc-500 hover:bg-zinc-800/50 transition-colors cursor-pointer px-2 py-1">Vendors</span>
+<span class="font-['Inter'] font-bold tracking-tight text-sm uppercase text-zinc-500 hover:bg-zinc-800/50 transition-colors cursor-pointer px-2 py-1">Field Palette</span>
+<span class="font-['Inter'] font-bold tracking-tight text-sm uppercase text-white font-bold px-2 py-1">Extraction</span>
+<span class="font-['Inter'] font-bold tracking-tight text-sm uppercase text-zinc-500 hover:bg-zinc-800/50 transition-colors cursor-pointer px-2 py-1">Logs</span>
+</nav>
+</div>
+<div class="flex items-center gap-4">
+<span class="font-['Inter'] font-bold tracking-tight text-[10px] uppercase text-zinc-500">System Status: Optimal</span>
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-zinc-500 cursor-pointer hover:text-white" data-icon="notifications">notifications</span>
+<span class="material-symbols-outlined text-zinc-500 cursor-pointer hover:text-white" data-icon="settings">settings</span>
+</div>
+</div>
+</header>
+<!-- SideNavBar -->
+<aside class="fixed left-0 top-12 bottom-0 w-64 flex flex-col py-4 z-40 bg-[#1c1b1b] border-r border-white/5">
+<div class="px-6 mb-8">
+<h2 class="font-['Inter'] text-[11px] uppercase tracking-wider font-semibold text-white">SOVEREIGN</h2>
+<p class="text-[9px] text-zinc-500 mono-data">Terminal v1.0.4</p>
+</div>
+<nav class="flex-1 space-y-1">
+<div class="flex items-center gap-3 px-6 py-2 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/30 cursor-pointer transition-all duration-150 ease-in-out font-['Inter'] text-[11px] uppercase tracking-wider font-semibold">
+<span class="material-symbols-outlined" data-icon="factory">factory</span>
+<span>Vendors</span>
+</div>
+<div class="flex items-center gap-3 px-6 py-2 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/30 cursor-pointer transition-all duration-150 ease-in-out font-['Inter'] text-[11px] uppercase tracking-wider font-semibold">
+<span class="material-symbols-outlined" data-icon="grid_view">grid_view</span>
+<span>Field Palette</span>
+</div>
+<div class="flex items-center gap-3 px-6 py-2 bg-[#2a2a2a] text-white border-l-2 border-[#0053db] cursor-pointer transition-all duration-150 ease-in-out font-['Inter'] text-[11px] uppercase tracking-wider font-semibold">
+<span class="material-symbols-outlined" data-icon="analytics">analytics</span>
+<span>Extraction</span>
+</div>
+<div class="flex items-center gap-3 px-6 py-2 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/30 cursor-pointer transition-all duration-150 ease-in-out font-['Inter'] text-[11px] uppercase tracking-wider font-semibold">
+<span class="material-symbols-outlined" data-icon="history_edu">history_edu</span>
+<span>Logs</span>
+</div>
+<div class="flex items-center gap-3 px-6 py-2 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/30 cursor-pointer transition-all duration-150 ease-in-out font-['Inter'] text-[11px] uppercase tracking-wider font-semibold">
+<span class="material-symbols-outlined" data-icon="inventory_2">inventory_2</span>
+<span>Archive</span>
+</div>
+</nav>
+<div class="mt-auto space-y-1 pt-4 border-t border-white/5">
+<div class="flex items-center gap-3 px-6 py-2 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/30 cursor-pointer transition-all duration-150 ease-in-out font-['Inter'] text-[11px] uppercase tracking-wider font-semibold">
+<span class="material-symbols-outlined" data-icon="settings">settings</span>
+<span>Settings</span>
+</div>
+<div class="flex items-center gap-3 px-6 py-2 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/30 cursor-pointer transition-all duration-150 ease-in-out font-['Inter'] text-[11px] uppercase tracking-wider font-semibold">
+<span class="material-symbols-outlined" data-icon="help_outline">help_outline</span>
+<span>Support</span>
+</div>
+</div>
+</aside>
+<!-- Main Content -->
+<main class="ml-64 mt-12 h-[calc(100vh-48px)] flex">
+<!-- Left Column: High Density Extraction List -->
+<div class="flex-1 flex flex-col border-r border-white/5 overflow-hidden">
+<div class="p-4 border-b border-white/5 flex justify-between items-center bg-surface-container-low">
+<div>
+<h1 class="text-xs font-bold uppercase tracking-widest text-white mb-1">Live Extraction Feed</h1>
+<div class="flex gap-4">
+<span class="text-[10px] mono-data text-zinc-400">BATCH: #OCR-2024-08-99</span>
+<span class="text-[10px] mono-data text-zinc-400">ENGINE: VULKAN_PRO_V3</span>
+</div>
+</div>
+<div class="flex gap-2">
+<button class="bg-surface-container-high px-3 py-1.5 text-[10px] font-bold uppercase tracking-tighter border border-white/10 hover:bg-surface-bright transition-colors">Export CSV</button>
+<button class="bg-primary-fixed px-3 py-1.5 text-[10px] font-bold uppercase tracking-tighter text-white hover:opacity-90 transition-opacity">Commit Batch</button>
+</div>
+</div>
+<div class="flex-1 overflow-y-auto bg-surface">
+<table class="w-full text-left border-collapse">
+<thead class="sticky top-0 bg-surface z-10">
+<tr class="border-b border-white/5">
+<th class="px-4 py-3 text-[10px] font-bold uppercase text-zinc-500 tracking-tighter">Field ID</th>
+<th class="px-4 py-3 text-[10px] font-bold uppercase text-zinc-500 tracking-tighter">Raw Output</th>
+<th class="px-4 py-3 text-[10px] font-bold uppercase text-zinc-500 tracking-tighter">Mapped Value</th>
+<th class="px-4 py-3 text-[10px] font-bold uppercase text-zinc-500 tracking-tighter">Confidence</th>
+<th class="px-4 py-3 text-[10px] font-bold uppercase text-zinc-500 tracking-tighter">Status</th>
+</tr>
+</thead>
+<tbody class="divide-y divide-white/5">
+<!-- Row 1 -->
+<tr class="hover:bg-surface-container-low transition-colors group">
+<td class="px-4 py-2.5 mono-data text-[11px] text-zinc-400">INV_NUM_X01</td>
+<td class="px-4 py-2.5 mono-data text-[11px] text-zinc-500">IV-98234-B</td>
+<td class="px-4 py-2.5 mono-data text-[11px] text-white">IV98234B</td>
+<td class="px-4 py-2.5">
+<div class="flex items-center gap-2">
+<div class="w-12 h-1 bg-zinc-800">
+<div class="h-full bg-blue-600" style="width: 98.4%"></div>
+</div>
+<span class="mono-data text-[10px] text-blue-400">98.4%</span>
+</div>
+</td>
+<td class="px-4 py-2.5"><span class="bg-secondary-container text-[9px] px-1.5 py-0.5 text-white uppercase font-bold">Verified</span></td>
+</tr>
+<!-- Row 2 -->
+<tr class="hover:bg-surface-container-low transition-colors group">
+<td class="px-4 py-2.5 mono-data text-[11px] text-zinc-400">TAX_ID_GLOBAL</td>
+<td class="px-4 py-2.5 mono-data text-[11px] text-zinc-500">DE 283 11 00</td>
+<td class="px-4 py-2.5 mono-data text-[11px] text-white">DE2831100</td>
+<td class="px-4 py-2.5">
+<div class="flex items-center gap-2">
+<div class="w-12 h-1 bg-zinc-800">
+<div class="h-full bg-blue-600" style="width: 99.1%"></div>
+</div>
+<span class="mono-data text-[10px] text-blue-400">99.1%</span>
+</div>
+</td>
+<td class="px-4 py-2.5"><span class="bg-secondary-container text-[9px] px-1.5 py-0.5 text-white uppercase font-bold">Verified</span></td>
+</tr>
+<!-- Row 3 (Alert) -->
+<tr class="bg-error-container/10 hover:bg-error-container/20 transition-colors group">
+<td class="px-4 py-2.5 mono-data text-[11px] text-error">TOTAL_AMT_VAL</td>
+<td class="px-4 py-2.5 mono-data text-[11px] text-error/80">€ 1,2?0.00</td>
+<td class="px-4 py-2.5 mono-data text-[11px] text-error font-bold">1280.00</td>
+<td class="px-4 py-2.5">
+<div class="flex items-center gap-2">
+<div class="w-12 h-1 bg-zinc-800">
+<div class="h-full bg-error" style="width: 42.0%"></div>
+</div>
+<span class="mono-data text-[10px] text-error">42.0%</span>
+</div>
+</td>
+<td class="px-4 py-2.5"><span class="bg-error-container text-[9px] px-1.5 py-0.5 text-white uppercase font-bold">Review</span></td>
+</tr>
+<!-- More Rows -->
+<tr class="hover:bg-surface-container-low transition-colors group">
+<td class="px-4 py-2.5 mono-data text-[11px] text-zinc-400">VENDOR_NAME_S</td>
+<td class="px-4 py-2.5 mono-data text-[11px] text-zinc-500">STRATOS LOGISTICS</td>
+<td class="px-4 py-2.5 mono-data text-[11px] text-white">Stratos Logistics Gmbh</td>
+<td class="px-4 py-2.5">
+<div class="flex items-center gap-2">
+<div class="w-12 h-1 bg-zinc-800">
+<div class="h-full bg-blue-600" style="width: 94.2%"></div>
+</div>
+<span class="mono-data text-[10px] text-blue-400">94.2%</span>
+</div>
+</td>
+<td class="px-4 py-2.5"><span class="bg-secondary-container text-[9px] px-1.5 py-0.5 text-white uppercase font-bold">Verified</span></td>
+</tr>
+<tr class="hover:bg-surface-container-low transition-colors group">
+<td class="px-4 py-2.5 mono-data text-[11px] text-zinc-400">CURRENCY_ID</td>
+<td class="px-4 py-2.5 mono-data text-[11px] text-zinc-500">EURO / EUR</td>
+<td class="px-4 py-2.5 mono-data text-[11px] text-white">EUR</td>
+<td class="px-4 py-2.5">
+<div class="flex items-center gap-2">
+<div class="w-12 h-1 bg-zinc-800">
+<div class="h-full bg-blue-600" style="width: 100%"></div>
+</div>
+<span class="mono-data text-[10px] text-blue-400">100%</span>
+</div>
+</td>
+<td class="px-4 py-2.5"><span class="bg-secondary-container text-[9px] px-1.5 py-0.5 text-white uppercase font-bold">Verified</span></td>
+</tr>
+<tr class="hover:bg-surface-container-low transition-colors group">
+<td class="px-4 py-2.5 mono-data text-[11px] text-zinc-400">DUE_DATE_RAW</td>
+<td class="px-4 py-2.5 mono-data text-[11px] text-zinc-500">30/09/2024</td>
+<td class="px-4 py-2.5 mono-data text-[11px] text-white">2024-09-30</td>
+<td class="px-4 py-2.5">
+<div class="flex items-center gap-2">
+<div class="w-12 h-1 bg-zinc-800">
+<div class="h-full bg-blue-600" style="width: 97.8%"></div>
+</div>
+<span class="mono-data text-[10px] text-blue-400">97.8%</span>
+</div>
+</td>
+<td class="px-4 py-2.5"><span class="bg-secondary-container text-[9px] px-1.5 py-0.5 text-white uppercase font-bold">Verified</span></td>
+</tr>
+<tr class="hover:bg-surface-container-low transition-colors group">
+<td class="px-4 py-2.5 mono-data text-[11px] text-zinc-400">GL_CODE_MAP</td>
+<td class="px-4 py-2.5 mono-data text-[11px] text-zinc-500">6000-01</td>
+<td class="px-4 py-2.5 mono-data text-[11px] text-white">6000-01</td>
+<td class="px-4 py-2.5">
+<div class="flex items-center gap-2">
+<div class="w-12 h-1 bg-zinc-800">
+<div class="h-full bg-blue-600" style="width: 91.2%"></div>
+</div>
+<span class="mono-data text-[10px] text-blue-400">91.2%</span>
+</div>
+</td>
+<td class="px-4 py-2.5"><span class="bg-secondary-container text-[9px] px-1.5 py-0.5 text-white uppercase font-bold">Verified</span></td>
+</tr>
+</tbody>
+</table>
+</div>
+<!-- Bottom Monospace Snippet Area -->
+<div class="h-1/3 bg-surface-container-lowest border-t border-white/10 flex flex-col">
+<div class="px-4 py-2 border-b border-white/5 flex justify-between items-center bg-[#0a0a0a]">
+<span class="text-[10px] font-bold uppercase tracking-widest text-zinc-400">Raw JSON Payload</span>
+<span class="material-symbols-outlined text-zinc-600 text-[14px] cursor-pointer" data-icon="content_copy">content_copy</span>
+</div>
+<div class="flex-1 p-4 mono-data text-[11px] text-blue-400/80 overflow-y-auto leading-relaxed">
+<pre>{
+  "extraction_id": "882a-991c-bf00",
+  "source_document": "invoice_stratos_992.pdf",
+  "metadata": {
+    "resolution": "300dpi",
+    "ocr_engine": "SOVEREIGN_V2",
+    "timestamp": "2024-03-24T14:22:11Z"
+  },
+  "results": [
+    { "field": "INV_NUM", "val": "IV98234B", "conf": 0.9841 },
+    { "field": "TAX_ID", "val": "DE2831100", "conf": 0.9912 },
+    { "field": "TOTAL", "val": 1280.00, "conf": 0.4201, "flag": "low_confidence_char_match" },
+    { "field": "CURRENCY", "val": "EUR", "conf": 1.0000 }
+  ]
+}</pre>
+</div>
+</div>
+</div>
+<!-- Right Panel: Data Accuracy & Confidence Focus -->
+<div class="w-96 bg-surface-container-low overflow-y-auto flex flex-col">
+<div class="p-6">
+<h3 class="text-[11px] font-black uppercase tracking-[0.2em] text-[#0053db] mb-6">Accuracy Analysis</h3>
+<!-- Macro Confidence Score -->
+<div class="mb-8 p-4 border border-white/5 bg-surface-container">
+<div class="flex justify-between items-end mb-2">
+<span class="text-[10px] uppercase font-bold text-zinc-500">Aggregate Confidence</span>
+<span class="mono-data text-2xl font-bold text-white">92.4%</span>
+</div>
+<div class="w-full h-1 bg-surface-container-high overflow-hidden">
+<div class="h-full bg-primary-fixed" style="width: 92.4%"></div>
+</div>
+<p class="mt-3 text-[10px] text-zinc-400 leading-tight">Batch meets sovereign threshold of 90.0% for automated processing. 1 field requires manual override.</p>
+</div>
+<!-- Field Detail Focus -->
+<div class="space-y-6">
+<div class="border-l-2 border-error pl-4">
+<span class="text-[9px] uppercase font-bold text-error mb-1 block">Critical Attention Required</span>
+<h4 class="text-xs font-bold text-white mono-data mb-2">TOTAL_AMT_VAL</h4>
+<div class="relative w-full aspect-video bg-surface-container-high border border-error/30 overflow-hidden mb-2">
+<img class="w-full h-full object-cover opacity-50 grayscale contrast-150" data-alt="Macro photography of an invoice total field with handwritten corrections and digital scanning artifacts, high contrast black and white" src="https://lh3.googleusercontent.com/aida-public/AB6AXuActOo4AoTkTYZqmaZ2Xy6ShbL1tUZZNy0nl4onbEA2cHFayjEzU4eMztseHDrHruks8qYzhp7-gKkRFVzTF_paHoA5_auSSxqMKjbTAJEtQmoacoEqF2s6TmbuMPEN_Z5D9w2-O6BDFjM-gWrRS_eN1XzNfafSnhUSA2VzsO_kjU3bpRSO7NItHA7qqBK5Xv_qFQOUZ7W3hWzaLZraL1G9FwtcfRFPQUFGd1eg6pa-8IgALBQToxJMOcLCGLtLxaSQ8V97mSGV27Y"/>
+<div class="absolute inset-0 flex items-center justify-center border-2 border-error/50">
+<span class="bg-error px-2 py-0.5 text-[10px] text-on-error font-bold uppercase">42% Match</span>
+</div>
+</div>
+<div class="space-y-2">
+<div class="flex justify-between items-center text-[10px]">
+<span class="text-zinc-500">OCR Sug:</span>
+<span class="mono-data text-white">1280.00</span>
+</div>
+<div class="flex justify-between items-center text-[10px]">
+<span class="text-zinc-500">Probable:</span>
+<span class="mono-data text-white">1220.00</span>
+</div>
+<button class="w-full bg-error-container text-white py-1.5 text-[9px] font-bold uppercase tracking-widest mt-2">Manual Correction</button>
+</div>
+</div>
+<!-- Confidence Breakdown -->
+<div>
+<span class="text-[9px] uppercase font-bold text-zinc-500 mb-4 block">Engine Benchmarks</span>
+<div class="space-y-4">
+<div class="flex items-center gap-4">
+<div class="w-12 h-12 flex-shrink-0 bg-surface-container-highest flex items-center justify-center border border-white/5">
+<span class="material-symbols-outlined text-blue-400" data-icon="match_word">match_word</span>
+</div>
+<div class="flex-1">
+<div class="flex justify-between items-center mb-1">
+<span class="text-[10px] font-bold text-white uppercase">Character Match</span>
+<span class="mono-data text-[10px] text-blue-400">99.8%</span>
+</div>
+<div class="w-full h-0.5 bg-zinc-800">
+<div class="h-full bg-blue-500" style="width: 99.8%"></div>
+</div>
+</div>
+</div>
+<div class="flex items-center gap-4">
+<div class="w-12 h-12 flex-shrink-0 bg-surface-container-highest flex items-center justify-center border border-white/5">
+<span class="material-symbols-outlined text-zinc-500" data-icon="schema">schema</span>
+</div>
+<div class="flex-1">
+<div class="flex justify-between items-center mb-1">
+<span class="text-[10px] font-bold text-white uppercase">Schema Alignment</span>
+<span class="mono-data text-[10px] text-zinc-500">82.1%</span>
+</div>
+<div class="w-full h-0.5 bg-zinc-800">
+<div class="h-full bg-zinc-500" style="width: 82.1%"></div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+<!-- Footer Action Panel -->
+<div class="mt-auto p-6 bg-surface-container-highest border-t border-white/5">
+<div class="flex items-center gap-2 mb-4">
+<span class="material-symbols-outlined text-primary-fixed" data-icon="verified_user">verified_user</span>
+<span class="text-[10px] font-bold text-white uppercase tracking-wider">Audit Trail Active</span>
+</div>
+<button class="w-full bg-white text-[#131313] py-3 text-[11px] font-black uppercase tracking-[0.2em] mb-3 hover:bg-zinc-200 transition-colors">Approve All</button>
+<div class="flex gap-2">
+<button class="flex-1 border border-white/10 text-white py-2 text-[10px] font-bold uppercase tracking-wider hover:bg-white/5 transition-colors">Discard</button>
+<button class="flex-1 border border-white/10 text-white py-2 text-[10px] font-bold uppercase tracking-wider hover:bg-white/5 transition-colors">Re-Scan</button>
+</div>
+</div>
+</div>
+</main>
+<!-- Floating Action Button (FAB) - Suppressed as per Task Logic for Extraction screen -->
+</body></html>

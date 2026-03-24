@@ -1,0 +1,38 @@
+# FastAPI + server
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
+python-multipart>=0.0.20
+
+# Pydantic
+pydantic>=2.10.0
+pydantic-settings>=2.7.0
+
+# Database
+sqlalchemy[asyncio]>=2.0.36
+asyncpg>=0.30.0
+alembic>=1.14.0
+psycopg2-binary>=2.9.10
+
+# Celery + Redis
+celery>=5.4.0
+redis>=5.2.0
+
+# MinIO (S3-compatible)
+minio>=7.2.0
+
+# PDF processing
+PyMuPDF>=1.25.0
+
+# PaddleOCR layout analysis
+paddlepaddle>=3.0.0b1
+paddleocr>=3.0.0
+
+# VLM HTTP client
+httpx>=0.28.0
+
+# Image processing
+opencv-python-headless>=4.10.0
+numpy>=1.26.0,<2.0
+
+# WebSocket
+websockets>=14.0

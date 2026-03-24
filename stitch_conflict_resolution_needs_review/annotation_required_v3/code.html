@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>AUGMENTED OCR - Annotation Terminal</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&amp;family=Berkeley+Mono&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            colors: {
+              "surface-container-lowest": "#0e0e0e",
+              "inverse-on-surface": "#313030",
+              "background": "#131313",
+              "surface-container": "#201f1f",
+              "surface-bright": "#3a3939",
+              "on-primary": "#00174b",
+              "inverse-surface": "#e5e2e1",
+              "tertiary-fixed": "#0053db",
+              "on-secondary-container": "#e2e2e2",
+              "tertiary": "#dbe1ff",
+              "error-container": "#93000a",
+              "error": "#ffb4ab",
+              "on-tertiary-fixed": "#ffffff",
+              "on-error": "#690005",
+              "surface-tint": "#b4c5ff",
+              "surface-container-high": "#2a2a2a",
+              "surface-dim": "#131313",
+              "secondary-fixed": "#c6c6c7",
+              "on-primary-fixed-variant": "#dbe1ff",
+              "on-primary-fixed": "#ffffff",
+              "secondary-fixed-dim": "#aaabab",
+              "secondary": "#c6c6c7",
+              "primary-container": "#c7d3ff",
+              "on-tertiary-container": "#000000",
+              "on-surface-variant": "#c6c6c6",
+              "on-secondary-fixed": "#1a1c1c",
+              "on-error-container": "#ffdad6",
+              "outline": "#919191",
+              "inverse-primary": "#0053db",
+              "tertiary-fixed-dim": "#003ea8",
+              "outline-variant": "#474747",
+              "surface-container-low": "#1c1b1b",
+              "on-tertiary": "#00174b",
+              "surface": "#131313",
+              "primary-fixed-dim": "#003ea8",
+              "on-secondary-fixed-variant": "#3a3c3c",
+              "on-secondary": "#1a1c1c",
+              "surface-container-highest": "#353534",
+              "secondary-container": "#454747",
+              "on-primary-container": "#000000",
+              "primary-fixed": "#0053db",
+              "tertiary-container": "#618bff",
+              "on-surface": "#e5e2e1",
+              "primary": "#ffffff",
+              "on-tertiary-fixed-variant": "#dbe1ff",
+              "surface-variant": "#353534",
+              "on-background": "#e5e2e1"
+            },
+            fontFamily: {
+              "headline": ["Inter"],
+              "body": ["Inter"],
+              "label": ["Inter"],
+              "mono": ["Berkeley Mono"]
+            },
+            borderRadius: {"DEFAULT": "0px", "lg": "0px", "xl": "0px", "full": "9999px"},
+          },
+        },
+      }
+    </script>
+<style>
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 300, 'GRAD' 0, 'opsz' 24;
+            font-size: 18px;
+        }
+        .mono-data { font-family: 'Berkeley Mono', monospace; }
+        ::-webkit-scrollbar { width: 4px; height: 4px; }
+        ::-webkit-scrollbar-track { background: #131313; }
+        ::-webkit-scrollbar-thumb { background: #2a2a2a; }
+        .anchor-crosshair {
+            background: linear-gradient(90deg, #0053db 1px, transparent 1px) 50% 50% / 20px 1px no-repeat,
+                        linear-gradient(0deg, #0053db 1px, transparent 1px) 50% 50% / 1px 20px no-repeat;
+        }
+    </style>
+</head>
+<body class="bg-background text-on-background font-body selection:bg-primary-fixed selection:text-white overflow-hidden">
+<!-- TopNavBar -->
+<nav class="flex justify-between items-center w-full px-4 h-12 bg-[#131313] z-50 fixed top-0 border-b border-white/10 docked full-width shadow-none">
+<div class="flex items-center gap-6">
+<span class="text-sm font-black tracking-[0.2em] text-[#0053db] drop-shadow-[0_0_8px_rgba(0,83,219,0.3)]">AUGMENTED OCR</span>
+<div class="hidden md:flex gap-4">
+<span class="font-['Inter'] font-bold tracking-tight text-sm uppercase text-white cursor-pointer active:opacity-80">Extraction</span>
+<span class="font-['Inter'] font-bold tracking-tight text-sm uppercase text-zinc-500 hover:bg-zinc-800/50 transition-colors cursor-pointer active:opacity-80">History</span>
+</div>
+</div>
+<div class="flex items-center gap-4">
+<span class="font-mono text-[10px] text-primary-fixed opacity-80 uppercase tracking-widest bg-primary-fixed/5 px-2 py-1">System Status: Optimal</span>
+<div class="flex gap-2">
+<button class="p-1.5 text-zinc-500 hover:bg-zinc-800/50 transition-colors cursor-pointer active:opacity-80">
+<span class="material-symbols-outlined" data-icon="notifications">notifications</span>
+</button>
+<button class="p-1.5 text-zinc-500 hover:bg-zinc-800/50 transition-colors cursor-pointer active:opacity-80">
+<span class="material-symbols-outlined" data-icon="settings">settings</span>
+</button>
+</div>
+</div>
+</nav>
+<!-- SideNavBar -->
+<aside class="fixed left-0 top-12 bottom-0 w-64 flex flex-col py-4 z-40 bg-[#1c1b1b] border-r border-white/5 docked left-0 h-full shadow-none">
+<div class="px-6 mb-8">
+<div class="flex items-center gap-3">
+<div class="w-8 h-8 bg-surface-container-highest border border-white/10 flex items-center justify-center">
+<span class="material-symbols-outlined text-primary-fixed" data-icon="terminal">terminal</span>
+</div>
+<div>
+<div class="font-['Inter'] text-[11px] uppercase tracking-wider font-bold text-white">SOVEREIGN</div>
+<div class="font-mono text-[9px] text-zinc-500 uppercase">Terminal v1.0.4</div>
+</div>
+</div>
+</div>
+<nav class="flex-1 px-3 space-y-1">
+<div class="flex items-center gap-3 px-3 py-2.5 transition-all duration-150 ease-in-out cursor-pointer bg-[#2a2a2a] text-white border-l-2 border-[#0053db]">
+<span class="material-symbols-outlined" data-icon="factory">factory</span>
+<span class="font-['Inter'] text-[11px] uppercase tracking-wider font-semibold">Vendors</span>
+</div>
+<div class="flex items-center gap-3 px-3 py-2.5 transition-all duration-150 ease-in-out cursor-pointer text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/30">
+<span class="material-symbols-outlined" data-icon="grid_view">grid_view</span>
+<span class="font-['Inter'] text-[11px] uppercase tracking-wider font-semibold">Field Palette</span>
+</div>
+<div class="flex items-center gap-3 px-3 py-2.5 transition-all duration-150 ease-in-out cursor-pointer text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/30">
+<span class="material-symbols-outlined" data-icon="analytics">analytics</span>
+<span class="font-['Inter'] text-[11px] uppercase tracking-wider font-semibold">Extraction</span>
+</div>
+<div class="flex items-center gap-3 px-3 py-2.5 transition-all duration-150 ease-in-out cursor-pointer text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/30">
+<span class="material-symbols-outlined" data-icon="history_edu">history_edu</span>
+<span class="font-['Inter'] text-[11px] uppercase tracking-wider font-semibold">Logs</span>
+</div>
+<div class="flex items-center gap-3 px-3 py-2.5 transition-all duration-150 ease-in-out cursor-pointer text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/30">
+<span class="material-symbols-outlined" data-icon="inventory_2">inventory_2</span>
+<span class="font-['Inter'] text-[11px] uppercase tracking-wider font-semibold">Archive</span>
+</div>
+</nav>
+<div class="px-3 pt-4 border-t border-white/5 space-y-1">
+<div class="flex items-center gap-3 px-3 py-2 text-zinc-500 hover:bg-[#201f1f] cursor-pointer">
+<span class="material-symbols-outlined" data-icon="settings">settings</span>
+<span class="font-['Inter'] text-[11px] uppercase tracking-wider font-semibold">Settings</span>
+</div>
+<div class="flex items-center gap-3 px-3 py-2 text-zinc-500 hover:bg-[#201f1f] cursor-pointer">
+<span class="material-symbols-outlined" data-icon="help_outline">help_outline</span>
+<span class="font-['Inter'] text-[11px] uppercase tracking-wider font-semibold">Support</span>
+</div>
+</div>
+</aside>
+<!-- Main Content Canvas -->
+<main class="ml-64 mt-12 h-[calc(100vh-48px)] flex">
+<!-- Left Pane: Vendors List -->
+<section class="w-72 bg-surface-container-low border-r border-white/5 flex flex-col">
+<div class="p-4 border-b border-white/5 bg-surface-container">
+<h2 class="text-[10px] font-bold uppercase tracking-[0.2em] text-primary-fixed mb-4">Active Vendors</h2>
+<div class="relative">
+<input class="w-full bg-surface-container-lowest border-none text-[11px] font-mono py-2 pl-8 text-on-surface focus:ring-1 focus:ring-primary-fixed" placeholder="Filter sources..." type="text"/>
+<span class="material-symbols-outlined absolute left-2 top-2 text-zinc-600" style="font-size: 14px;">search</span>
+</div>
+</div>
+<div class="flex-1 overflow-y-auto">
+<!-- Vendor Items -->
+<div class="p-4 border-b border-white/5 bg-surface-container-high border-l-2 border-primary-fixed cursor-pointer">
+<div class="flex justify-between items-start mb-1">
+<span class="text-[11px] font-bold text-white uppercase">Aerospace Global</span>
+<span class="font-mono text-[9px] text-primary-fixed bg-primary-fixed/10 px-1">ACTIVE</span>
+</div>
+<p class="text-[10px] text-zinc-500 mono-data uppercase">ID: AS-9921-X</p>
+</div>
+<div class="p-4 border-b border-white/5 hover:bg-surface-container-highest cursor-pointer transition-colors">
+<div class="flex justify-between items-start mb-1">
+<span class="text-[11px] font-bold text-zinc-400 uppercase">Nexus Logistics</span>
+<span class="font-mono text-[9px] text-zinc-600">PENDING</span>
+</div>
+<p class="text-[10px] text-zinc-600 mono-data uppercase">ID: NL-4402-B</p>
+</div>
+<div class="p-4 border-b border-white/5 hover:bg-surface-container-highest cursor-pointer transition-colors">
+<div class="flex justify-between items-start mb-1">
+<span class="text-[11px] font-bold text-zinc-400 uppercase">Titan Energy</span>
+<span class="font-mono text-[9px] text-zinc-600">IDLE</span>
+</div>
+<p class="text-[10px] text-zinc-600 mono-data uppercase">ID: TE-1182-Q</p>
+</div>
+<div class="p-4 border-b border-white/5 hover:bg-surface-container-highest cursor-pointer transition-colors">
+<div class="flex justify-between items-start mb-1">
+<span class="text-[11px] font-bold text-zinc-400 uppercase">Omni Corp</span>
+<span class="font-mono text-[9px] text-zinc-600">IDLE</span>
+</div>
+<p class="text-[10px] text-zinc-600 mono-data uppercase">ID: OC-5001-Z</p>
+</div>
+</div>
+</section>
+<!-- Center Pane: Anchor Workspace -->
+<section class="flex-1 bg-surface-container relative overflow-hidden flex flex-col">
+<div class="absolute inset-0 opacity-10 pointer-events-none" style="background-image: radial-gradient(#ffffff 0.5px, transparent 0.5px); background-size: 20px 20px;"></div>
+<div class="h-10 bg-surface-container-high border-b border-white/10 flex items-center justify-between px-4 z-10">
+<div class="flex items-center gap-4">
+<span class="text-[10px] font-bold text-white uppercase tracking-widest">Anchor Alignment Mode</span>
+<div class="h-3 w-px bg-white/10"></div>
+<span class="mono-data text-[10px] text-zinc-500">ZOOM: 145%</span>
+</div>
+<div class="flex gap-2">
+<button class="w-6 h-6 flex items-center justify-center bg-surface-container hover:bg-primary-fixed transition-colors">
+<span class="material-symbols-outlined" style="font-size: 14px;">zoom_in</span>
+</button>
+<button class="w-6 h-6 flex items-center justify-center bg-surface-container hover:bg-primary-fixed transition-colors">
+<span class="material-symbols-outlined" style="font-size: 14px;">zoom_out</span>
+</button>
+<button class="w-6 h-6 flex items-center justify-center bg-surface-container hover:bg-primary-fixed transition-colors">
+<span class="material-symbols-outlined" style="font-size: 14px;">refresh</span>
+</button>
+</div>
+</div>
+<div class="flex-1 flex items-center justify-center p-8">
+<!-- Document Canvas -->
+<div class="w-full max-w-2xl aspect-[1/1.4] bg-white relative shadow-2xl overflow-hidden">
+<img alt="Technical engineering document" class="absolute inset-0 w-full h-full object-cover opacity-90 grayscale" data-alt="Black and white complex technical engineering schematic on architectural paper with sharp lines and high contrast" src="https://lh3.googleusercontent.com/aida-public/AB6AXuCU6n8qUJ8_FxejsxkwY1BZeQBgr3Rwchz71q5QZ2HiluP3x63MzfU2iA_igoWkl0eemdHKtmlnjD-EMM31OJBI0Pi6V-_WKCTZTjj7hxTCO5M_GXNkKO-Tu8_-57N8XKrtK9l9stOeNG84-dupKxSj7hv5w2l2qtQUeRFepzt8W33FKuPH--zl2alZN33kadbL8BQ-cEBB2CbrU1q2IanD5hpJaHCyyxIvbQdV_6gBQNJD--blqVO6Y86yBmICPO6nrzcSKHBnGPI"/>
+<!-- SVG Overlays for Anchors -->
+<div class="absolute inset-0 pointer-events-none border-4 border-primary-fixed/20">
+<!-- Horizontal Scan Line -->
+<div class="absolute top-1/3 left-0 right-0 h-px bg-primary-fixed shadow-[0_0_10px_#0053db]"></div>
+<!-- Anchor Point 1 -->
+<div class="absolute top-1/4 left-1/4 w-12 h-12 -translate-x-1/2 -translate-y-1/2 flex items-center justify-center">
+<div class="absolute inset-0 border border-primary-fixed/50 animate-pulse"></div>
+<div class="anchor-crosshair w-full h-full"></div>
+<span class="absolute -top-6 left-0 mono-data text-[9px] bg-primary-fixed text-white px-1">ANCHOR_ALPHA</span>
+</div>
+<!-- Anchor Point 2 -->
+<div class="absolute bottom-1/4 right-1/3 w-12 h-12 -translate-x-1/2 -translate-y-1/2 flex items-center justify-center">
+<div class="absolute inset-0 border border-primary-fixed/50"></div>
+<div class="anchor-crosshair w-full h-full"></div>
+<span class="absolute -top-6 left-0 mono-data text-[9px] bg-primary-fixed text-white px-1">ANCHOR_BETA</span>
+</div>
+</div>
+</div>
+</div>
+<!-- Contextual Footer Actions -->
+<div class="p-4 bg-surface-container-highest flex justify-between items-center border-t border-white/10">
+<div class="flex gap-4">
+<div class="flex flex-col">
+<span class="text-[9px] text-zinc-500 uppercase font-bold tracking-tighter">Coordinates</span>
+<span class="mono-data text-[11px] text-white">X: 44.129 Y: 102.883</span>
+</div>
+<div class="flex flex-col">
+<span class="text-[9px] text-zinc-500 uppercase font-bold tracking-tighter">Skew Angle</span>
+<span class="mono-data text-[11px] text-white">0.024°</span>
+</div>
+</div>
+<button class="px-6 py-2.5 bg-primary-fixed text-white font-bold text-[11px] uppercase tracking-[0.15em] hover:bg-primary-fixed-dim transition-all active:scale-95">
+                    ANALYZE FIELDS
+                </button>
+</div>
+</section>
+<!-- Right Pane: Field Status -->
+<section class="w-80 bg-surface-container-low border-l border-white/5 flex flex-col">
+<div class="p-4 border-b border-white/5">
+<h2 class="text-[10px] font-bold uppercase tracking-[0.2em] text-on-surface">Extraction Map</h2>
+</div>
+<div class="flex-1 overflow-y-auto p-4 space-y-4">
+<!-- Field Group -->
+<div>
+<h3 class="text-[9px] text-zinc-500 uppercase font-bold mb-2 tracking-widest">Primary Metadata</h3>
+<div class="space-y-1">
+<div class="flex items-center justify-between p-2 bg-surface-container hover:bg-surface-container-high transition-colors group">
+<div class="flex items-center gap-3">
+<div class="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.5)]"></div>
+<span class="text-[11px] text-zinc-400 uppercase font-medium">Invoice Number</span>
+</div>
+<span class="mono-data text-[10px] text-zinc-600 group-hover:text-primary-fixed transition-colors">READY</span>
+</div>
+<div class="flex items-center justify-between p-2 bg-surface-container hover:bg-surface-container-high transition-colors group">
+<div class="flex items-center gap-3">
+<div class="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.5)]"></div>
+<span class="text-[11px] text-zinc-400 uppercase font-medium">Issue Date</span>
+</div>
+<span class="mono-data text-[10px] text-zinc-600 group-hover:text-primary-fixed transition-colors">READY</span>
+</div>
+<div class="flex items-center justify-between p-2 bg-surface-container-highest border border-primary-fixed/30 group">
+<div class="flex items-center gap-3">
+<div class="w-1.5 h-1.5 rounded-full bg-primary-fixed animate-pulse"></div>
+<span class="text-[11px] text-white uppercase font-bold">Total Amount</span>
+</div>
+<span class="mono-data text-[10px] text-primary-fixed">ALIGNING</span>
+</div>
+</div>
+</div>
+<!-- Field Group -->
+<div>
+<h3 class="text-[9px] text-zinc-500 uppercase font-bold mb-2 tracking-widest">Line Items</h3>
+<div class="space-y-1">
+<div class="flex items-center justify-between p-2 bg-surface-container opacity-50">
+<div class="flex items-center gap-3">
+<div class="w-1.5 h-1.5 rounded-full bg-zinc-700"></div>
+<span class="text-[11px] text-zinc-600 uppercase font-medium">Item Grid 01</span>
+</div>
+<span class="mono-data text-[10px] text-zinc-700">WAITING</span>
+</div>
+<div class="flex items-center justify-between p-2 bg-surface-container opacity-50">
+<div class="flex items-center gap-3">
+<div class="w-1.5 h-1.5 rounded-full bg-zinc-700"></div>
+<span class="text-[11px] text-zinc-600 uppercase font-medium">Item Grid 02</span>
+</div>
+<span class="mono-data text-[10px] text-zinc-700">WAITING</span>
+</div>
+</div>
+</div>
+<!-- Confidence Score Box -->
+<div class="mt-8 p-4 bg-surface-container-lowest border border-white/5">
+<div class="flex justify-between items-center mb-3">
+<span class="text-[9px] font-bold text-zinc-500 uppercase tracking-widest">Overall Confidence</span>
+<span class="mono-data text-primary-fixed text-lg">94.8%</span>
+</div>
+<div class="w-full bg-zinc-900 h-1">
+<div class="bg-primary-fixed h-full" style="width: 94.8%"></div>
+</div>
+</div>
+</div>
+<!-- Inspector Panel -->
+<div class="h-48 border-t border-white/5 bg-surface-container-lowest p-4">
+<div class="flex items-center justify-between mb-4">
+<span class="text-[10px] font-bold text-primary-fixed uppercase tracking-widest">Extraction Log</span>
+<span class="material-symbols-outlined text-zinc-600 cursor-pointer" style="font-size: 14px;">open_in_new</span>
+</div>
+<div class="font-mono text-[9px] text-zinc-500 space-y-1 overflow-y-auto h-28">
+<p><span class="text-zinc-700">[14:22:01]</span> OCR Engine initiated...</p>
+<p><span class="text-zinc-700">[14:22:02]</span> Anchor ALPHA detected at {224, 118}</p>
+<p><span class="text-zinc-700">[14:22:03]</span> Normalizing perspective matrix...</p>
+<p><span class="text-zinc-700">[14:22:04]</span> Anchor BETA alignment in progress...</p>
+<p class="text-primary-fixed animate-pulse"><span class="text-zinc-700">[14:22:05]</span> Awaiting user field validation...</p>
+</div>
+</div>
+</section>
+</main>
+</body></html>

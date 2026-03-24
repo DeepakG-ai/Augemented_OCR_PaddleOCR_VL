@@ -1,0 +1,356 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Sovereign Terminal Design System ─────────────────────────────── */
+
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800&display=swap');
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  background-color: #0a0e17;
+  color: #e2e8f0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Typography ───────────────────────────────────────────────────── */
+
+.font-mono {
+  font-family: 'JetBrains Mono', 'Courier New', monospace;
+}
+
+.text-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: #64748b;
+}
+
+.text-value {
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 600;
+}
+
+/* ── Color Tokens ─────────────────────────────────────────────────── */
+
+:root {
+  --sov-bg-deepest: #060a12;
+  --sov-bg-deep: #0a0e17;
+  --sov-bg-panel: #0f1420;
+  --sov-bg-surface: #151b2b;
+  --sov-bg-elevated: #1a2235;
+  --sov-bg-hover: #1f2940;
+  --sov-border: rgba(51, 65, 85, 0.4);
+  --sov-border-light: rgba(71, 85, 105, 0.3);
+  --sov-text-primary: #e2e8f0;
+  --sov-text-secondary: #94a3b8;
+  --sov-text-muted: #64748b;
+  --sov-text-dim: #475569;
+  --sov-accent-blue: #3b82f6;
+  --sov-accent-cyan: #06b6d4;
+  --sov-accent-green: #10b981;
+  --sov-accent-amber: #f59e0b;
+  --sov-accent-red: #ef4444;
+  --sov-accent-purple: #8b5cf6;
+}
+
+/* ── Sovereign Panel ──────────────────────────────────────────────── */
+
+.sov-panel {
+  background: var(--sov-bg-panel);
+  border: 1px solid var(--sov-border);
+}
+
+.sov-panel-elevated {
+  background: var(--sov-bg-surface);
+  border: 1px solid var(--sov-border);
+}
+
+.sov-card {
+  background: var(--sov-bg-surface);
+  border: 1px solid var(--sov-border);
+  border-radius: 4px;
+  transition: all 0.15s ease;
+}
+
+.sov-card:hover {
+  border-color: rgba(59, 130, 246, 0.3);
+  background: var(--sov-bg-elevated);
+}
+
+.sov-card-active {
+  border-left: 3px solid var(--sov-accent-blue);
+  background: var(--sov-bg-elevated);
+}
+
+/* ── Buttons ──────────────────────────────────────────────────────── */
+
+.sov-btn-primary {
+  background: linear-gradient(135deg, #2563eb 0%, #3b82f6 100%);
+  color: white;
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 12px 24px;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.sov-btn-primary:hover {
+  background: linear-gradient(135deg, #3b82f6 0%, #60a5fa 100%);
+  box-shadow: 0 0 20px rgba(59, 130, 246, 0.3);
+}
+
+.sov-btn-primary:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+.sov-btn-danger {
+  background: linear-gradient(135deg, #dc2626 0%, #ef4444 100%);
+  color: white;
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 12px 24px;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.sov-btn-outline {
+  background: transparent;
+  color: var(--sov-text-secondary);
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 10px 20px;
+  border: 1px solid var(--sov-border);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.sov-btn-outline:hover {
+  color: white;
+  border-color: rgba(148, 163, 184, 0.5);
+  background: var(--sov-bg-hover);
+}
+
+/* ── Status Indicators ────────────────────────────────────────────── */
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.status-dot-active { background: var(--sov-accent-green); }
+.status-dot-pending { background: var(--sov-accent-amber); }
+.status-dot-idle { background: var(--sov-text-dim); }
+.status-dot-error { background: var(--sov-accent-red); }
+
+.status-dot-pulse {
+  animation: statusPulse 2s ease-in-out infinite;
+}
+
+@keyframes statusPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* ── Badge ────────────────────────────────────────────────────────── */
+
+.sov-badge {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border: 1px solid;
+}
+
+.sov-badge-green {
+  color: var(--sov-accent-green);
+  border-color: rgba(16, 185, 129, 0.3);
+  background: rgba(16, 185, 129, 0.08);
+}
+
+.sov-badge-amber {
+  color: var(--sov-accent-amber);
+  border-color: rgba(245, 158, 11, 0.3);
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.sov-badge-red {
+  color: var(--sov-accent-red);
+  border-color: rgba(239, 68, 68, 0.3);
+  background: rgba(239, 68, 68, 0.08);
+}
+
+.sov-badge-blue {
+  color: var(--sov-accent-blue);
+  border-color: rgba(59, 130, 246, 0.3);
+  background: rgba(59, 130, 246, 0.08);
+}
+
+.sov-badge-cyan {
+  color: var(--sov-accent-cyan);
+  border-color: rgba(6, 182, 212, 0.3);
+  background: rgba(6, 182, 212, 0.08);
+}
+
+/* ── Confidence Bar ───────────────────────────────────────────────── */
+
+.confidence-bar {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--sov-bg-elevated);
+  overflow: hidden;
+}
+
+.confidence-bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.5s ease;
+}
+
+/* ── Table ─────────────────────────────────────────────────────────── */
+
+.sov-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.sov-table th {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--sov-text-muted);
+  text-align: left;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--sov-border);
+}
+
+.sov-table td {
+  font-size: 13px;
+  padding: 12px 14px;
+  border-bottom: 1px solid rgba(51, 65, 85, 0.2);
+  color: var(--sov-text-primary);
+}
+
+.sov-table tr:hover td {
+  background: var(--sov-bg-hover);
+}
+
+.sov-table td.mono {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+}
+
+/* ── Scrollbar ───────────────────────────────────────────────────── */
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.15); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(148, 163, 184, 0.3); }
+
+/* ── Animations ──────────────────────────────────────────────────── */
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slideIn {
+  from { opacity: 0; transform: translateX(-12px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+.animate-in { animation: fadeIn 0.25s ease-out; }
+.animate-slide-in { animation: slideIn 0.25s ease-out; }
+
+/* ── Upload Zone ─────────────────────────────────────────────────── */
+
+.upload-zone {
+  border: 2px dashed rgba(59, 130, 246, 0.25);
+  transition: all 0.3s ease;
+  background: rgba(59, 130, 246, 0.03);
+}
+
+.upload-zone:hover {
+  border-color: rgba(59, 130, 246, 0.5);
+  background: rgba(59, 130, 246, 0.06);
+}
+
+/* ── Select dropdown ─────────────────────────────────────────────── */
+
+select option {
+  background: #1e293b;
+  color: #e2e8f0;
+}
+
+/* ── Nav Icon ─────────────────────────────────────────────────────── */
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  color: var(--sov-text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  border-left: 3px solid transparent;
+}
+
+.nav-item:hover {
+  color: var(--sov-text-primary);
+  background: var(--sov-bg-hover);
+}
+
+.nav-item-active {
+  color: white;
+  background: var(--sov-bg-elevated);
+  border-left-color: var(--sov-accent-blue);
+}
+
+/* ── Glass overlay for processing state ──────────────────────────── */
+
+.processing-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(10, 14, 23, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+}

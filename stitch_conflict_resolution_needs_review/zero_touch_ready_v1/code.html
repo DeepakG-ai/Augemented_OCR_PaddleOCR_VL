@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&amp;family=Berkeley+Mono&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<script id="tailwind-config">
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            colors: {
+              "surface-container-lowest": "#0e0e0e",
+              "inverse-on-surface": "#313030",
+              "background": "#131313",
+              "surface-container": "#201f1f",
+              "surface-bright": "#3a3939",
+              "on-primary": "#00174b",
+              "inverse-surface": "#e5e2e1",
+              "tertiary-fixed": "#0053db",
+              "on-secondary-container": "#e2e2e2",
+              "tertiary": "#dbe1ff",
+              "error-container": "#93000a",
+              "error": "#ffb4ab",
+              "on-error": "#690005",
+              "surface-tint": "#b4c5ff",
+              "surface-container-high": "#2a2a2a",
+              "surface-dim": "#131313",
+              "secondary-fixed": "#c6c6c7",
+              "on-primary-fixed-variant": "#dbe1ff",
+              "on-primary-fixed": "#ffffff",
+              "secondary-fixed-dim": "#aaabab",
+              "secondary": "#c6c6c7",
+              "primary-container": "#c7d3ff",
+              "on-tertiary-container": "#000000",
+              "on-surface-variant": "#c6c6c6",
+              "on-secondary-fixed": "#1a1c1c",
+              "on-error-container": "#ffdad6",
+              "outline": "#919191",
+              "inverse-primary": "#0053db",
+              "tertiary-fixed-dim": "#003ea8",
+              "outline-variant": "#474747",
+              "surface-container-low": "#1c1b1b",
+              "on-tertiary": "#00174b",
+              "surface": "#131313",
+              "primary-fixed-dim": "#003ea8",
+              "on-secondary-fixed-variant": "#3a3c3c",
+              "on-secondary": "#1a1c1c",
+              "surface-container-highest": "#353534",
+              "secondary-container": "#454747",
+              "on-primary-container": "#000000",
+              "primary-fixed": "#0053db",
+              "tertiary-container": "#618bff",
+              "on-surface": "#e5e2e1",
+              "primary": "#ffffff",
+              "on-tertiary-fixed-variant": "#dbe1ff",
+              "surface-variant": "#353534",
+              "on-background": "#e5e2e1"
+            },
+            fontFamily: {
+              "headline": ["Inter"],
+              "body": ["Inter"],
+              "label": ["Inter"],
+              "mono": ["Berkeley Mono"]
+            },
+            borderRadius: {"DEFAULT": "0px", "lg": "0px", "xl": "0px", "full": "9999px"},
+          },
+        },
+      }
+    </script>
+<style>
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+            font-size: 18px;
+        }
+        body {
+            background-color: #131313;
+            color: #e5e2e1;
+            font-family: 'Inter', sans-serif;
+        }
+        .mono-data {
+            font-family: 'Berkeley Mono', monospace;
+        }
+        .ghost-border {
+            border: 1px solid rgba(71, 71, 71, 0.2);
+        }
+    </style>
+</head>
+<body class="overflow-hidden">
+<!-- TopNavBar -->
+<header class="flex justify-between items-center w-full px-4 h-12 bg-[#131313] z-50 fixed top-0 border-b border-white/10">
+<div class="flex items-center gap-8">
+<span class="text-sm font-black tracking-[0.2em] text-[#0053db] drop-shadow-[0_0_8px_rgba(0,83,219,0.3)] uppercase">AUGMENTED OCR</span>
+<nav class="hidden md:flex gap-6">
+<a class="font-['Inter'] font-bold tracking-tight text-sm uppercase text-white" href="#">Extraction</a>
+<a class="font-['Inter'] font-bold tracking-tight text-sm uppercase text-zinc-500 hover:bg-zinc-800/50 transition-colors px-2 py-1" href="#">Validation</a>
+<a class="font-['Inter'] font-bold tracking-tight text-sm uppercase text-zinc-500 hover:bg-zinc-800/50 transition-colors px-2 py-1" href="#">Network</a>
+</nav>
+</div>
+<div class="flex items-center gap-4">
+<span class="font-['Inter'] font-bold tracking-tight text-[10px] uppercase text-[#0053db]">System Status: Optimal</span>
+<div class="flex gap-2">
+<button class="p-1 hover:bg-zinc-800/50 transition-colors cursor-pointer active:opacity-80">
+<span class="material-symbols-outlined text-zinc-500">notifications</span>
+</button>
+<button class="p-1 hover:bg-zinc-800/50 transition-colors cursor-pointer active:opacity-80">
+<span class="material-symbols-outlined text-zinc-500">settings</span>
+</button>
+</div>
+</div>
+</header>
+<!-- SideNavBar -->
+<aside class="fixed left-0 top-12 bottom-0 w-64 flex flex-col py-4 z-40 bg-[#1c1b1b] border-r border-white/5">
+<div class="px-6 mb-8">
+<div class="text-[10px] font-mono tracking-widest text-[#0053db] mb-1">SOVEREIGN</div>
+<div class="text-[9px] font-mono text-zinc-600 uppercase">Terminal v1.0.4</div>
+</div>
+<nav class="flex-1 space-y-1">
+<a class="flex items-center gap-3 px-6 py-2 bg-[#2a2a2a] text-white border-l-2 border-[#0053db] font-['Inter'] text-[11px] uppercase tracking-wider font-semibold transition-all duration-150 ease-in-out" href="#">
+<span class="material-symbols-outlined" data-icon="factory">factory</span>
+                Vendors
+            </a>
+<a class="flex items-center gap-3 px-6 py-2 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/30 font-['Inter'] text-[11px] uppercase tracking-wider font-semibold transition-all duration-150 ease-in-out" href="#">
+<span class="material-symbols-outlined" data-icon="grid_view">grid_view</span>
+                Field Palette
+            </a>
+<a class="flex items-center gap-3 px-6 py-2 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/30 font-['Inter'] text-[11px] uppercase tracking-wider font-semibold transition-all duration-150 ease-in-out" href="#">
+<span class="material-symbols-outlined" data-icon="analytics" style="font-variation-settings: 'FILL' 1;">analytics</span>
+                Extraction
+            </a>
+<a class="flex items-center gap-3 px-6 py-2 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/30 font-['Inter'] text-[11px] uppercase tracking-wider font-semibold transition-all duration-150 ease-in-out" href="#">
+<span class="material-symbols-outlined" data-icon="history_edu">history_edu</span>
+                Logs
+            </a>
+<a class="flex items-center gap-3 px-6 py-2 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/30 font-['Inter'] text-[11px] uppercase tracking-wider font-semibold transition-all duration-150 ease-in-out" href="#">
+<span class="material-symbols-outlined" data-icon="inventory_2">inventory_2</span>
+                Archive
+            </a>
+</nav>
+<div class="mt-auto px-6 space-y-1">
+<a class="flex items-center gap-3 py-2 text-zinc-500 hover:text-zinc-300 font-['Inter'] text-[11px] uppercase tracking-wider font-semibold transition-all duration-150 ease-in-out" href="#">
+<span class="material-symbols-outlined" data-icon="settings">settings</span>
+                Settings
+            </a>
+<a class="flex items-center gap-3 py-2 text-zinc-500 hover:text-zinc-300 font-['Inter'] text-[11px] uppercase tracking-wider font-semibold transition-all duration-150 ease-in-out" href="#">
+<span class="material-symbols-outlined" data-icon="help_outline">help_outline</span>
+                Support
+            </a>
+</div>
+</aside>
+<!-- Main Workspace -->
+<main class="ml-64 mt-12 h-[calc(100vh-3rem)] grid grid-cols-12 bg-surface">
+<!-- Center Canvas: Blank / Waiting State -->
+<section class="col-span-8 relative flex items-center justify-center border-r border-white/5 bg-surface-container-lowest">
+<div class="absolute inset-0 opacity-10 pointer-events-none" style="background-image: radial-gradient(#ffffff 0.5px, transparent 0.5px); background-size: 24px 24px;"></div>
+<div class="text-center z-10 max-w-sm">
+<div class="w-16 h-16 border border-[#0053db]/30 mx-auto flex items-center justify-center mb-6">
+<span class="material-symbols-outlined text-[#0053db] !text-4xl animate-pulse">file_open</span>
+</div>
+<h2 class="font-headline font-bold text-lg text-on-surface mb-2 uppercase tracking-tight">System Ready</h2>
+<p class="font-body text-xs text-on-surface-variant leading-relaxed">Select a document or drop a high-resolution PDF to begin extraction using the Sovereign model.</p>
+</div>
+<!-- Coordinate Overlays (Precision Detail) -->
+<div class="absolute top-4 left-4 font-mono text-[9px] text-[#0053db]/50">Y: 0.0000<br/>X: 0.0000</div>
+<div class="absolute bottom-4 right-4 font-mono text-[9px] text-[#0053db]/50">GRID: 24PX<br/>VIEW: ACTIVE</div>
+</section>
+<!-- Right Panel: Zero-Touch Ready -->
+<aside class="col-span-4 bg-surface-container-low flex flex-col overflow-y-auto">
+<!-- Vendor Selection Card -->
+<div class="p-6 border-b border-white/5 bg-surface-container">
+<div class="flex justify-between items-start mb-4">
+<div>
+<span class="block text-[10px] uppercase font-mono text-[#0053db] mb-1">Active Entity</span>
+<h3 class="text-xl font-headline font-black text-white leading-none">GLOBAL LOGISTICS CORP.</h3>
+</div>
+<div class="px-2 py-0.5 border border-emerald-500/50 bg-emerald-500/10 text-emerald-400 font-mono text-[9px] font-bold tracking-tighter">ZERO-TOUCH</div>
+</div>
+<div class="grid grid-cols-2 gap-4 mt-6">
+<div>
+<div class="text-[9px] uppercase text-zinc-500 font-bold mb-1">Entity ID</div>
+<div class="mono-data text-xs text-on-surface">GLC-992-TX</div>
+</div>
+<div>
+<div class="text-[9px] uppercase text-zinc-500 font-bold mb-1">Confidence Score</div>
+<div class="mono-data text-xs text-emerald-400">99.82%</div>
+</div>
+</div>
+</div>
+<!-- Zero-Touch Notice -->
+<div class="p-6">
+<div class="bg-emerald-500/5 border border-emerald-500/20 p-4 mb-6">
+<div class="flex gap-3">
+<span class="material-symbols-outlined text-emerald-500" data-icon="verified_user" style="font-variation-settings: 'FILL' 1;">verified_user</span>
+<div>
+<div class="text-[11px] font-bold text-emerald-400 uppercase tracking-wide">ZERO-TOUCH READY</div>
+<p class="text-[10px] text-emerald-400/70 mt-1 leading-normal font-medium">
+                                This vendor is fully mapped. Auto-extraction will bypass manual verification and route directly to ERP.
+                            </p>
+</div>
+</div>
+</div>
+<!-- Action Button -->
+<button class="w-full bg-primary-fixed text-white font-headline font-bold text-xs uppercase tracking-[0.15em] py-4 transition-all hover:bg-tertiary-fixed active:opacity-90 mb-8">
+                    AUTO-EXTRACT
+                </button>
+<!-- Configuration Details (High Density) -->
+<div class="space-y-4">
+<div class="flex justify-between items-center border-b border-white/5 pb-2">
+<span class="text-[10px] uppercase font-bold text-zinc-500">Extraction Logic</span>
+<span class="mono-data text-[10px] text-on-surface">V-STRICT-MAP</span>
+</div>
+<div class="flex justify-between items-center border-b border-white/5 pb-2">
+<span class="text-[10px] uppercase font-bold text-zinc-500">Output Format</span>
+<span class="mono-data text-[10px] text-on-surface">JSON (v4)</span>
+</div>
+<div class="flex justify-between items-center border-b border-white/5 pb-2">
+<span class="text-[10px] uppercase font-bold text-zinc-500">Field Matches</span>
+<span class="mono-data text-[10px] text-on-surface">42 / 42</span>
+</div>
+<div class="flex justify-between items-center border-b border-white/5 pb-2">
+<span class="text-[10px] uppercase font-bold text-zinc-500">Last Audit</span>
+<span class="mono-data text-[10px] text-on-surface">14.OCT.2023</span>
+</div>
+</div>
+<!-- Field Summary Grid -->
+<div class="mt-8">
+<h4 class="text-[10px] uppercase font-black text-white mb-4 tracking-widest border-l-2 border-[#0053db] pl-2">ACTIVE FIELDS</h4>
+<div class="grid grid-cols-1 gap-1">
+<div class="flex justify-between p-2 bg-surface-container-high/50 hover:bg-surface-container-high transition-colors">
+<span class="mono-data text-[10px] text-zinc-400"># INVOICE_NUMBER</span>
+<span class="material-symbols-outlined text-emerald-500 !text-sm" style="font-variation-settings: 'FILL' 1;">check_circle</span>
+</div>
+<div class="flex justify-between p-2 bg-surface-container-high/50 hover:bg-surface-container-high transition-colors">
+<span class="mono-data text-[10px] text-zinc-400"># TAX_IDENTIFIER</span>
+<span class="material-symbols-outlined text-emerald-500 !text-sm" style="font-variation-settings: 'FILL' 1;">check_circle</span>
+</div>
+<div class="flex justify-between p-2 bg-surface-container-high/50 hover:bg-surface-container-high transition-colors">
+<span class="mono-data text-[10px] text-zinc-400"># LINE_ITEM_ARRAY</span>
+<span class="material-symbols-outlined text-emerald-500 !text-sm" style="font-variation-settings: 'FILL' 1;">check_circle</span>
+</div>
+<div class="flex justify-between p-2 bg-surface-container-high/50 hover:bg-surface-container-high transition-colors">
+<span class="mono-data text-[10px] text-zinc-400"># CURRENCY_ISO</span>
+<span class="material-symbols-outlined text-emerald-500 !text-sm" style="font-variation-settings: 'FILL' 1;">check_circle</span>
+</div>
+</div>
+</div>
+</div>
+<!-- Footer Meta -->
+<div class="mt-auto p-4 border-t border-white/5 bg-surface-container-lowest">
+<div class="flex justify-between items-center">
+<span class="text-[9px] font-mono text-zinc-600 uppercase">Engine: Sovereign-9</span>
+<span class="text-[9px] font-mono text-[#0053db] uppercase">Latency: 14ms</span>
+</div>
+</div>
+</aside>
+</main>
+<!-- Visual Enhancements: Subtle Grid Layout Helper -->
+<div class="fixed inset-0 pointer-events-none z-0 overflow-hidden mix-blend-overlay opacity-5">
+<div class="absolute inset-0 border border-white/10 grid grid-cols-12 pointer-events-none">
+<div class="border-r border-white/10 h-full"></div>
+<div class="border-r border-white/10 h-full"></div>
+<div class="border-r border-white/10 h-full"></div>
+<div class="border-r border-white/10 h-full"></div>
+<div class="border-r border-white/10 h-full"></div>
+<div class="border-r border-white/10 h-full"></div>
+<div class="border-r border-white/10 h-full"></div>
+<div class="border-r border-white/10 h-full"></div>
+<div class="border-r border-white/10 h-full"></div>
+<div class="border-r border-white/10 h-full"></div>
+<div class="border-r border-white/10 h-full"></div>
+<div class="h-full"></div>
+</div>
+</div>
+</body></html>
