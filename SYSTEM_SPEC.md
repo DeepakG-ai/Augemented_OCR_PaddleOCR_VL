@@ -697,10 +697,8 @@ Page 3: "Grand Total: $1,234.56" → candidate {value: "$1,234.56", page_index: 
 
 ### Human Review Flow
 
-1. Frontend detects `status = "needs_review"` and renders `candidates` as selectable buttons
-2. Human clicks the correct candidate (e.g., "Page 3: $1,234.56")
-3. Frontend calls `POST /api/templates/confirm` with `confirmed_page_index`
-4. Template's `page_index` is updated → future zero-touch extractions go directly to page 3
+1. Frontend detects `status = "needs_review"` and renders candidates in the conflict section
+2. Human can retry extraction or save the current result manually
 
 ---
 
@@ -753,10 +751,7 @@ docker compose up --build
 
 | Service | URL |
 |---------|-----|
-| Frontend | http://localhost:5173 |
-| API Docs (Swagger) | http://localhost:8000/docs |
-| Flower (Celery Monitor) | http://localhost:5555 |
-| MinIO Console | http://localhost:9001 |
+| Frontend + API | http://localhost:8000 |
 
 ### Step 4: Verify Connectivity
 

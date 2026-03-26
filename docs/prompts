@@ -1,0 +1,56 @@
+print("""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ FINAL RESULT ASSEMBLY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  merged["line_items"] = all_items   ← inject the deduped list
+  return merged
+
+  Final dict =
+  {
+    "po_number": "PO31461",         ← header keys (page 1 only)
+    "document_date": "3 June 2025",
+    ...
+    "line_items": [                  ← combined from all pages
+      row1, row2, ...unique rows...
+    ]
+  }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ VISUAL SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  page_results[0]           page_results[1]         page_results[2]
+  ┌─────────────────┐       ┌──────────────────┐    ┌──────────────────┐
+  │ po_number       │       │                  │    │                  │
+  │ document_date   │──────▶│  (no header)     │    │  (no header)     │
+  │ supplier_name   │  ✅   │                  │    │                  │
+  │ deliver_to      │       │                  │    │                  │
+  ├─────────────────┤       ├──────────────────┤    ├──────────────────┤
+  │ line_items:     │       │ line_items:      │    │ line_items:      │
+  │  row A          │  ✅   │  row A (repeat?) │    │  row G           │
+  │  row B          │  ✅   │  row D  (new)    │    │  row H  (new)    │
+  │  row C          │  ✅   │  row E  (new)    │    │  row I  (new)    │
+  └─────────────────┘       └──────────────────┘    └──────────────────┘
+        │                         │                        │
+        ▼                         ▼                        ▼
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  merged output                                                   │
+  │  header: po_number, document_date, supplier, deliver_to ...      │
+  │  line_items: [A, B, C, D, E, G, H, I]                           │
+  │              (row A from page2 was DEDUPED — same key as page1)  │
+  └──────────────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ THE ONE RULE TO REMEMBER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  This merge ONLY works correctly when all pages are from the SAME PO.
+
+  ✅ Same PO, page 2 repeats row A → dedup removes it → CORRECT
+  ❌ Different PO has row A with different qty → dedup removes it → DATA LOSS
+
+  Your new extraction rules (variant = single word, description starts
+  with P-Wave) fix the hallucination before merge even runs.
+  Clean model output → clean dedup keys → correct final result.
+""")

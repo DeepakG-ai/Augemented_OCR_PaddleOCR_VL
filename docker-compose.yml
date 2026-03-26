@@ -1,125 +1,32 @@
 services:
 
-  # ── Infrastructure (official images, no Dockerfiles) ───────────────
-
+  # ── PostgreSQL ─────────────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: ocrdb
-      POSTGRES_USER: ocr
-      POSTGRES_PASSWORD: ocr
+      POSTGRES_DB: augocr
+      POSTGRES_USER: augocr
+      POSTGRES_PASSWORD: augocr
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
       - "5432:5432"
     healthcheck:
-      test: [ "CMD", "pg_isready", "-U", "ocr", "-d", "ocrdb" ]
+      test: ["CMD", "pg_isready", "-U", "augocr", "-d", "augocr"]
       interval: 5s
       timeout: 5s
       retries: 10
 
+  # ── Redis ──────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
-    command: redis-server --maxmemory 2gb --maxmemory-policy allkeys-lru
-
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    volumes:
-      - miniodata:/data
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-
-  # ── Application (shared Dockerfile: backend/) ─────────────────────
-
-  api:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-    ports:
-      - "8000:8000"
-    env_file: .env
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    volumes:
-      - ./backend:/app
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_started
-      minio:
-        condition: service_started
-
-  worker:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    command: celery -A worker.celery_app worker --loglevel=info --concurrency=4 -Q ocr
-    env_file: .env
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    volumes:
-      - ./backend:/app
-    depends_on:
-      - redis
-      - postgres
-      - minio
-
-  flower:
-    image: mher/flower:2.0
-    command: celery --broker=redis://redis:6379/0 flower --port=5555
-    ports:
-      - "5555:5555"
-    depends_on:
-      - redis
-
-  # ── Frontend ───────────────────────────────────────────────────────
-
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    command: npm run dev -- --host 0.0.0.0
-    ports:
-      - "5173:5173"
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
-
-  # ── vLLM GPU server ───────────────────────────────────────────────
-  # DISABLED: Running locally on WSL2 instead of Docker.
-  # Start vLLM manually in WSL2 terminal with:
-  #   source ~/vllm_env/bin/activate
-  #   python3 -m vllm.entrypoints.openai.api_server \
-  #     --model PaddlePaddle/PaddleOCR-VL-1.5 --port 8001 --dtype float16 \
-  #     --max-model-len 2048 --gpu-memory-utilization 0.80 --max-num-seqs 4 \
-  #     --trust-remote-code
-  #
-  # vllm-server:
-  #   image: vllm/vllm-openai:latest
-  #   command: >
-  #     --model PaddlePaddle/PaddleOCR-VL-1.5 --port 8001 --dtype float16
-  #     --max-model-len 2048 --gpu-memory-utilization 0.80 --max-num-seqs 4
-  #     --trust-remote-code
-  #   ports:
-  #     - "8001:8001"
-  #   ipc: host
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - driver: nvidia
-  #             count: 1
-  #             capabilities: [ gpu ]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
 volumes:
   pgdata:
-  miniodata:
