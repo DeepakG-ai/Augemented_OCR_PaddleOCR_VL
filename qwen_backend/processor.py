@@ -32,6 +32,7 @@ def _render_pdf_sync(file_bytes: bytes, dpi: int) -> list[dict]:
             results.append({
                 "page_number": i + 1,
                 "image_b64": b64,
+                "mime_type": "image/png",
                 "width": pix.width,
                 "height": pix.height,
             })
@@ -52,16 +53,28 @@ async def pdf_to_images(file_bytes: bytes, dpi: int = 150) -> list[dict]:
     return await loop.run_in_executor(_executor, _render_pdf_sync, file_bytes, dpi)
 
 
-async def image_file_to_b64(file_bytes: bytes) -> list[dict]:
+async def image_file_to_b64(file_bytes: bytes, filename: str = "") -> list[dict]:
     """
-    For JPEG/PNG uploads — wrap a single image as page 1.
-    No rendering needed; just base64-encode the raw bytes.
+    For JPEG/PNG/WebP uploads — wrap a single image as page 1.
+    Detects MIME type from file header or filename extension.
     """
     b64 = base64.b64encode(file_bytes).decode("ascii")
-    # We don't know dimensions without parsing; set 0 (frontend can read from img tag)
+    # Detect MIME type from magic bytes
+    mime = "image/png"  # default
+    if file_bytes[:2] == b'\xff\xd8':
+        mime = "image/jpeg"
+    elif file_bytes[:4] == b'\x89PNG':
+        mime = "image/png"
+    elif file_bytes[:4] == b'RIFF' and file_bytes[8:12] == b'WEBP':
+        mime = "image/webp"
+    elif file_bytes[:2] in (b'BM',):
+        mime = "image/bmp"
+    elif file_bytes[:4] in (b'II\x2a\x00', b'MM\x00\x2a'):
+        mime = "image/tiff"
     return [{
         "page_number": 1,
         "image_b64": b64,
+        "mime_type": mime,
         "width": 0,
         "height": 0,
     }]

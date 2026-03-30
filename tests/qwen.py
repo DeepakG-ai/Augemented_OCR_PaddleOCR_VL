@@ -53,11 +53,12 @@ except json.JSONDecodeError:
     print("\n=== RAW OUTPUT (parse failed) ===")
     print(raw)
 
-"""C:\llama-cpp>llama-server ^
-More?   --model "Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf" ^
-More?   --mmproj "mmproj-F16.gguf" ^
-More?   --host 0.0.0.0 ^
-More?   --port 8001 ^
-More?   --n-gpu-layers 999 ^
-More?   --ctx-size 4096 ^
-More?   --threads 8"""
+"""llama-server ^
+  --model Qwen3-VL-8B-Instruct-UD-Q4KXL.gguf ^
+  --mmproj mmproj-F16.gguf ^
+  --host 0.0.0.0 --port 8001 ^
+  --n-gpu-layers 999 ^
+  --ctx-size 8192 ^
+  --threads 8 ^
+  --parallel 2 ^
+  --flash-attn"""

@@ -28,5 +28,22 @@ services:
       timeout: 3s
       retries: 5
 
+  # ── Arize Phoenix (LLM Observability) ──────────────────────────────
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    ports:
+      - "6006:6006"    # Phoenix UI + OTLP HTTP collector
+      - "4317:4317"    # OTLP gRPC collector
+    environment:
+      - PHOENIX_WORKING_DIR=/phoenix
+    volumes:
+      - phoenixdata:/phoenix
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:6006/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   pgdata:
+  phoenixdata:

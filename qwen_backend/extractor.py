@@ -1,11 +1,15 @@
 """
-extractor.py -- Core prompt builder, LLM calls, result merger, prompt caching.
+extractor.py -- Core LLM extraction, prompt building, result merging, prompt caching.
 
-Fields are fully dynamic: users define header_fields and line_item_fields
-freely in the UI. No hardcoded field registry.
+Two modes:
+  - Auto Extract: no fields → generic extraction, model returns everything
+  - Extract Fields: user-defined fields dynamically injected into user message
+
+Same prompt for every page. Merger takes header from page 1, line_items from all pages.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -19,7 +23,7 @@ import db as db_mod
 
 logger = logging.getLogger("extractor")
 
-# ── Prompt Builder ───────────────────────────────────────────────────
+# ── Format Descriptions ─────────────────────────────────────────────
 
 _FORMAT_DESCRIPTIONS: dict[str, str] = {
     "single_po_multipage": (
@@ -37,6 +41,8 @@ _FORMAT_DESCRIPTIONS: dict[str, str] = {
 }
 
 
+# ── System Prompt (built once, stored in DB + Redis) ─────────────────
+
 def build_system_prompt(
     header_fields: list[str],
     line_item_fields: list[str],
@@ -44,167 +50,161 @@ def build_system_prompt(
     rules: list[str],
     format_type: str,
 ) -> str:
-    """
-    Assemble the full reusable system prompt. Stored in DB and Redis.
-    The user message (field list + JSON template) is injected per-call, NOT here.
-    """
-    parts: list[str] = []
+    """Build the reusable system prompt. Stored in DB and cached in Redis."""
 
-    # 1. Role declaration
-    parts.append(
-        "You are a highly accurate document data extraction assistant. "
-        "Extract ONLY what is explicitly visible in the document image. "
-        "Never guess or fabricate data. If a field is not visible, set it to null."
-    )
+    fmt_desc = _FORMAT_DESCRIPTIONS.get(format_type, _FORMAT_DESCRIPTIONS["single_page"])
 
-    # 2. Document context (user-supplied layout hints)
+    context_section = ""
     if instructions and instructions.strip():
-        parts.append(f"\nDOCUMENT CONTEXT:\n{instructions.strip()}")
+        context_section = f"""
+<document_context>
+{instructions.strip()}
+</document_context>"""
 
-    # 3. Extraction rules
+    rules_section = ""
     if rules:
         numbered = "\n".join(f"  {i}. {rule}" for i, rule in enumerate(rules, 1))
-        parts.append(f"\nEXTRACTION RULES:\n{numbered}")
+        rules_section = f"""
+<extraction_rules>
+{numbered}
+</extraction_rules>"""
 
-    # 4. Format description
-    fmt_desc = _FORMAT_DESCRIPTIONS.get(format_type, _FORMAT_DESCRIPTIONS["single_page"])
-    parts.append(f"\nDOCUMENT FORMAT:\n{fmt_desc}")
+    return f"""You are a highly accurate document data extraction assistant.
+Extract ONLY what is explicitly visible in the document image.
+Never guess or fabricate data. If a field is not visible, set it to null.
+{context_section}
+{rules_section}
+<document_format>
+{fmt_desc}
+</document_format>
 
-    # 5. Output rules
-    parts.append(
-        "\nOUTPUT RULES:\n"
-        "  - Return ONLY valid JSON. No markdown fences, no explanation, no extra text.\n"
-        "  - Use null for missing fields, never omit them.\n"
-        "  - For line_items, return an array even if only one item exists.\n"
-        "  - Numbers should be numeric (not strings) when possible.\n"
-        "  - Dates should be in the format they appear in the document."
-    )
+<critical>
+Count the number of rows in the line items table FIRST, then extract that exact number of items.
+</critical>
 
-    return "\n".join(parts)
+<output_rules>
+- Return ONLY valid JSON. No markdown fences, no explanation, no extra text.
+- Use null for missing fields, never omit them.
+- For line_items, return an array even if only one item exists.
+- Numbers should be numeric (not strings) when possible.
+- Dates should be in the format they appear in the document.
+</output_rules>"""
 
 
-def _build_json_template(
-    header_fields: list[str],
-    line_item_fields: list[str],
-    page_num: int,
-    total_pages: int,
-    include_header: bool,
-) -> dict[str, Any]:
-    """Build the JSON template dict that the model should fill."""
-    template: dict[str, Any] = {}
-
-    if include_header:
-        for f in header_fields:
-            template[f] = None
-
-    if line_item_fields:
-        template["line_items"] = [{col: "" for col in line_item_fields}]
-
-    template["_page"] = page_num
-    template["_total_pages"] = total_pages
-    return template
-
+# ── User Message (per-call, same for every page) ────────────────────
 
 def build_user_message(
     header_fields: list[str],
     line_item_fields: list[str],
     page_num: int,
     total_pages: int,
-    mode: str,
 ) -> str:
     """
-    Per-call user message injected at runtime. NOT stored in DB.
-    mode: 'header_and_items' | 'items_only' | 'full'
+    Build the user message for a single page.
+    Same message for every page. Two modes based on whether fields are provided.
     """
-    parts: list[str] = []
 
-    # Page context
-    if total_pages == 1:
-        parts.append("This is a single-page document.")
-    elif mode == "items_only":
-        parts.append(
-            f"You are processing page {page_num} of {total_pages} "
-            f"(continuation page -- header already extracted from page 1)."
-        )
-    else:
-        parts.append(f"You are processing page {page_num} of {total_pages}.")
-
-    # Mode hint
-    if mode == "header_and_items":
-        parts.append("Extract all header fields AND line items from this page.")
-    elif mode == "items_only":
-        parts.append(
-            "Extract ONLY the line_items table rows from this page. "
-            "Do NOT repeat header fields."
-        )
-    else:
-        parts.append("Extract all requested fields from this page.")
-
-    # Field lists
-    include_header = mode != "items_only"
-
-    if include_header and header_fields:
-        parts.append("\nHeader fields to extract:")
+    if header_fields or line_item_fields:
+        # ── Extract Fields mode ──
+        template: dict[str, Any] = {}
         for f in header_fields:
-            parts.append(f"  - {f}")
+            template[f] = None
+        if line_item_fields:
+            template["line_items"] = [{col: "" for col in line_item_fields}]
 
-    if line_item_fields:
-        parts.append("\nLine item columns to extract (each row):")
-        for f in line_item_fields:
-            parts.append(f"  - {f}")
+        header_section = ""
+        if header_fields:
+            header_list = "\n".join(f"  - {f}" for f in header_fields)
+            header_section = f"""
+<header_fields>
+{header_list}
+</header_fields>"""
 
-    # JSON template
-    template = _build_json_template(
-        header_fields, line_item_fields, page_num, total_pages, include_header
-    )
-    parts.append(f"\nReturn JSON matching this structure:\n{json.dumps(template, indent=2)}")
+        line_section = ""
+        if line_item_fields:
+            line_list = "\n".join(f"  - {f}" for f in line_item_fields)
+            line_section = f"""
+<line_item_columns>
+{line_list}
+</line_item_columns>"""
 
-    return "\n".join(parts)
+        return f"""Extract the header fields AND all visible line item rows from this purchase order page (page {page_num} of {total_pages}).
+If any field is empty or not visible, return null in the JSON object.
+{header_section}
+{line_section}
+
+<json_template>
+{json.dumps(template, indent=2)}
+</json_template>
+
+<rules>
+- Empty or missing cells → null.
+- Numbers (qty, unit_cost, amount, unit_price, etc.) must be numbers, not strings.
+- Extract every visible line item row.
+</rules>
+
+Return ONLY valid JSON matching EXACTLY the structure above."""
+
+    else:
+        # ── Auto Extract mode ──
+        return f"""Extract ALL data from this invoice/purchase order document (page {page_num} of {total_pages}).
+
+<critical>
+Count the number of rows in the line items table FIRST, then extract that exact number of items.
+</critical>
+
+<output_format>
+Return JSON with:
+- Header fields: extract all visible header fields (po_number, order_date, vendor, bill_to, ship_to, etc.)
+- Line items: extract all visible line item rows with all their columns
+</output_format>
+
+<accuracy>
+- Before extraction: Count total rows in the table visually.
+- After extraction: Verify your line_items array has that many items.
+- Double-check you didn't skip rows at page breaks or table headers.
+- Extract ONLY what is explicitly visible in the document image.
+- Never guess or fabricate values.
+</accuracy>
+
+Return ONLY valid JSON. No markdown fences, no explanation, no extra text."""
 
 
-# ── Prompt Hash ──────────────────────────────────────────────────────
+# ── Prompt Hash & Cache ─────────────────────────────────────────────
 
 def compute_prompt_hash(
     header_fields: list[str],
     line_item_fields: list[str],
     instructions: str | None,
     rules: list[str],
+    format_type: str = "single_page",
 ) -> str:
-    """SHA256 of all config inputs. Used for cache invalidation."""
     payload = json.dumps({
         "header_fields": sorted(header_fields),
         "line_item_fields": sorted(line_item_fields),
         "instructions": instructions or "",
         "rules": sorted(rules),
+        "format_type": format_type,
     }, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-# ── Prompt Cache Cascade: Redis -> DB -> Build ───────────────────────
-
 async def get_or_build_system_prompt(
-    pool,
-    redis_client,
-    vendor_id: str,
-    header_fields: list[str],
-    line_item_fields: list[str],
-    instructions: str | None,
-    rules: list[str],
-    format_type: str,
+    pool, redis_client, vendor_id: str,
+    header_fields: list[str], line_item_fields: list[str],
+    instructions: str | None, rules: list[str], format_type: str,
 ) -> tuple[str, str]:
-    """
-    Returns (system_prompt, prompt_hash).
-    Cache lookup: Redis -> DB -> build -> cache in both.
-    """
-    prompt_hash = compute_prompt_hash(header_fields, line_item_fields, instructions, rules)
+    """Returns (system_prompt, prompt_hash). Cache: Redis → DB → build."""
 
-    # 1. Redis check
+    prompt_hash = compute_prompt_hash(header_fields, line_item_fields, instructions, rules, format_type)
+
+    # 1. Redis
     cached = await cache_mod.get_cached_prompt(redis_client, vendor_id, prompt_hash)
     if cached:
         logger.info("Prompt cache HIT (Redis) vendor=%s hash=%s", vendor_id, prompt_hash[:12])
         return cached, prompt_hash
 
-    # 2. DB check
+    # 2. DB
     tmpl = await db_mod.get_template(pool, vendor_id)
     if tmpl and tmpl.get("prompt_hash") == prompt_hash and tmpl.get("system_prompt"):
         logger.info("Prompt cache HIT (DB) vendor=%s hash=%s", vendor_id, prompt_hash[:12])
@@ -212,19 +212,14 @@ async def get_or_build_system_prompt(
         return tmpl["system_prompt"], prompt_hash
 
     # 3. Build fresh
-    logger.info("Prompt cache MISS -- building vendor=%s hash=%s", vendor_id, prompt_hash[:12])
-    system_prompt = build_system_prompt(
-        header_fields, line_item_fields, instructions, rules, format_type
-    )
+    logger.info("Prompt cache MISS — building vendor=%s hash=%s", vendor_id, prompt_hash[:12])
+    system_prompt = build_system_prompt(header_fields, line_item_fields, instructions, rules, format_type)
 
-    # Upsert to DB
     await db_mod.upsert_template(
         pool, vendor_id, format_type,
         header_fields, line_item_fields,
         instructions, rules, system_prompt, prompt_hash,
     )
-
-    # Set in Redis
     await cache_mod.set_cached_prompt(redis_client, vendor_id, prompt_hash, system_prompt)
 
     return system_prompt, prompt_hash
@@ -234,21 +229,14 @@ async def get_or_build_system_prompt(
 
 _JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?", re.MULTILINE)
 _FENCE_END_RE = re.compile(r"\n?```\s*$", re.MULTILINE)
-_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
 async def call_llm(
-    image_b64: str,
-    system_prompt: str,
-    user_message: str,
-    llm_url: str,
-    model: str,
+    image_b64: str, system_prompt: str, user_message: str,
+    llm_url: str, model: str, mime_type: str = "image/png",
 ) -> dict:
-    """
-    POST to LLM with OpenAI-compatible payload (vision).
-    Strips markdown fences and think blocks from response.
-    Returns parsed dict or raises ValueError on parse failure.
-    """
+    """POST to LLM, strip markdown fences, return parsed JSON dict."""
+
     payload = {
         "model": model,
         "messages": [
@@ -258,14 +246,17 @@ async def call_llm(
                 "content": [
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                        "image_url": {"url": f"data:{mime_type};base64,{image_b64}"},
                     },
                     {"type": "text", "text": user_message},
                 ],
             },
         ],
-        "temperature": 0.0,
-        "max_tokens": 4096,
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "presence_penalty": 1.5,
+        "top_k": 20,
+        "max_tokens": 6000,
     }
 
     async with httpx.AsyncClient(timeout=180.0) as client:
@@ -273,11 +264,6 @@ async def call_llm(
         resp.raise_for_status()
 
     raw: str = resp.json()["choices"][0]["message"]["content"].strip()
-
-    # Strip <think>...</think> blocks (Qwen reasoning)
-    raw = _THINK_RE.sub("", raw).strip()
-
-    # Strip markdown fences
     raw = _JSON_FENCE_RE.sub("", raw)
     raw = _FENCE_END_RE.sub("", raw)
     raw = raw.strip()
@@ -299,99 +285,123 @@ async def extract_document(
     format_type: str,
     llm_url: str,
     model: str,
-    on_page_done: Callable[[int, int], Awaitable[None]] | None = None,
+    on_page_done: Callable[[int, int, dict | None], Awaitable[None]] | None = None,
+    cancel_event: asyncio.Event | None = None,
+    start_from_page: int = 1,
+    existing_page_results: list[dict] | None = None,
 ) -> dict:
     """
-    Orchestrate extraction based on format_type.
-    Calls are sequential -- local LLM cannot handle concurrent VRAM load.
-
-    on_page_done(page_num, total_pages) is the SSE progress callback.
-    Returns {"result": ..., "page_results": [...]}.
+    Process pages in parallel batches of 2 (matches --parallel 2 on llama-server).
+    
+    Ordering guarantees:
+    - asyncio.gather returns results in INPUT order (page 1 before page 2)
+    - Pages already successful in existing_page_results are skipped on retry
+    - If any page in a batch fails, processing stops (no further batches)
+    - merge_results always receives pages in page_number order
+    
+    Returns {"result": ..., "page_results": [...], "cancelled": bool, "last_completed_page": int}.
     """
+    PARALLEL_BATCH = 2  # Match llama-server --parallel value
+
     total = len(pages)
-    page_results: list[dict] = []
+    page_results: list[dict] = list(existing_page_results or [])
+    cancelled = False
+    batch_had_failure = False
 
     if total == 0:
-        logger.warning("No pages found in document for extraction.")
         return {"result": None, "page_results": []}
 
-    if format_type == "single_po_multipage":
-        for i, page in enumerate(pages):
-            page_num = page["page_number"]
-            if i == 0:
-                mode = "header_and_items"
-            else:
-                mode = "items_only"
+    # Build set of already-successful page numbers (from previous runs)
+    # so we skip them on retry instead of re-processing
+    already_done: set[int] = {
+        pr["_page"] for pr in page_results if "_error" not in pr
+    }
 
-            user_msg = build_user_message(
-                header_fields, line_item_fields, page_num, total, mode
-            )
-            try:
-                result = await call_llm(
-                    page["image_b64"], system_prompt, user_msg, llm_url, model
-                )
-                result["_page"] = page_num
-                result["_total_pages"] = total
-                page_results.append(result)
-            except (ValueError, httpx.HTTPError) as exc:
-                logger.error("Page %d extraction failed: %s", page_num, exc)
-                page_results.append({
-                    "_page": page_num, "_total_pages": total, "_error": str(exc),
-                })
+    # Remove any ERROR results from existing_page_results — they'll be retried
+    page_results = [pr for pr in page_results if "_error" not in pr]
 
-            if on_page_done:
-                await on_page_done(page_num, total)
+    # Pages that still need processing (not yet successful)
+    pending_pages = [
+        p for p in pages
+        if p["page_number"] >= start_from_page and p["page_number"] not in already_done
+    ]
 
-        merged = merge_results(page_results, header_fields, line_item_fields)
-        return {"result": merged, "page_results": page_results}
+    logger.info("Parallel extraction: %d pages pending, %d already done, batch_size=%d",
+                len(pending_pages), len(already_done), PARALLEL_BATCH)
 
-    elif format_type == "po_per_page":
-        for page in pages:
-            page_num = page["page_number"]
-            user_msg = build_user_message(
-                header_fields, line_item_fields, page_num, total, "full"
-            )
-            try:
-                result = await call_llm(
-                    page["image_b64"], system_prompt, user_msg, llm_url, model
-                )
-                result["_page"] = page_num
-                result["_total_pages"] = total
-                page_results.append(result)
-            except (ValueError, httpx.HTTPError) as exc:
-                logger.error("Page %d extraction failed: %s", page_num, exc)
-                page_results.append({
-                    "_page": page_num, "_total_pages": total, "_error": str(exc),
-                })
-
-            if on_page_done:
-                await on_page_done(page_num, total)
-
-        return {"result": page_results, "page_results": page_results}
-
-    else:  # single_page
-        page = pages[0]
-        user_msg = build_user_message(
-            header_fields, line_item_fields, 1, 1, "full"
-        )
+    # Helper — runs inside asyncio.gather, never raises
+    async def _process_page(page: dict) -> dict:
+        page_num = page["page_number"]
+        user_msg = build_user_message(header_fields, line_item_fields, page_num, total)
         try:
             result = await call_llm(
-                page["image_b64"], system_prompt, user_msg, llm_url, model
+                page["image_b64"], system_prompt, user_msg, llm_url, model,
+                mime_type=page.get("mime_type", "image/png"),
             )
-            result["_page"] = 1
-            result["_total_pages"] = 1
-            page_results.append(result)
+            result["_page"] = page_num
+            result["_total_pages"] = total
+            logger.info("Page %d/%d done — %d line item(s)",
+                        page_num, total, len(result.get("line_items") or []))
+            return result
         except (ValueError, httpx.HTTPError) as exc:
-            logger.error("Page 1 extraction failed: %s", exc)
-            page_results.append({
-                "_page": 1, "_total_pages": 1, "_error": str(exc),
-            })
-            result = None
+            logger.error("Page %d extraction failed: %s", page_num, exc)
+            return {"_page": page_num, "_total_pages": total, "_error": str(exc)}
 
-        if on_page_done:
-            await on_page_done(1, 1)
+    # Process in batches of PARALLEL_BATCH
+    for batch_start in range(0, len(pending_pages), PARALLEL_BATCH):
+        batch = pending_pages[batch_start : batch_start + PARALLEL_BATCH]
 
-        return {"result": result, "page_results": page_results}
+        # Check cancellation before each batch
+        if cancel_event and cancel_event.is_set():
+            cancelled = True
+            logger.info("Extraction cancelled before batch starting page %d", batch[0]["page_number"])
+            break
+
+        # Fire all pages in this batch concurrently — results come back in INPUT order
+        batch_results = await asyncio.gather(*[_process_page(p) for p in batch])
+
+        # Collect results and notify frontend (always in page order)
+        for page_result in batch_results:
+            page_results.append(page_result)
+            if on_page_done:
+                await on_page_done(page_result["_page"], total, page_result)
+
+        # If ANY page in the batch failed, stop processing further batches
+        if any("_error" in r for r in batch_results):
+            batch_had_failure = True
+            logger.warning("Batch had failures — stopping extraction. Failed pages: %s",
+                           [r["_page"] for r in batch_results if "_error" in r])
+            break
+
+    # Sort all page_results by page number for correct merge order
+    page_results.sort(key=lambda pr: pr.get("_page", 0))
+
+    # Compute last_completed_page = highest page with all pages before it also successful
+    # e.g., pages [1✓, 2✗, 3✓] → last_completed_page = 1 (not 3)
+    last_completed_page = 0
+    for pn in range(1, total + 1):
+        pr = next((r for r in page_results if r.get("_page") == pn), None)
+        if pr and "_error" not in pr:
+            last_completed_page = pn
+        else:
+            break  # Gap found — stop counting
+
+    # ── Build final result based on format ──
+    if format_type == "po_per_page":
+        final = page_results
+    elif format_type == "single_page" and len(page_results) == 1:
+        final = page_results[0] if "_error" not in page_results[0] else None
+    else:
+        # single_po_multipage — merge header from page 1 + line_items from all
+        # merge_results already filters out _error pages internally
+        final = merge_results(page_results, header_fields, line_item_fields)
+
+    return {
+        "result": final,
+        "page_results": page_results,
+        "cancelled": cancelled or batch_had_failure,
+        "last_completed_page": last_completed_page,
+    }
 
 
 # ── Result Merger ────────────────────────────────────────────────────
@@ -402,45 +412,51 @@ def merge_results(
     line_item_fields: list[str],
 ) -> dict:
     """
-    Merge multi-page extraction results:
-      - Header fields: first non-null, non-empty value wins.
-      - line_items: extend across all pages, deduplicate by first 3 columns.
-      - _page / _total_pages / _error metadata is excluded because those
-        keys are never in the user's field lists.
+    Header from page 1. Line items concatenated from all pages with dedup.
+    Works for both auto-extract and extract-fields mode.
     """
+    valid_pages = [pr for pr in page_results if "_error" not in pr]
+    if not valid_pages:
+        return {}
+
     merged: dict[str, Any] = {}
+    _meta_keys = {"_page", "_total_pages", "_error", "line_items"}
 
-    # Header fields -- first non-null wins
-    for f in header_fields:
-        for pr in page_results:
-            if "_error" in pr:
-                continue
-            val = pr.get(f)
-            if val is not None and val != "" and val != []:
-                merged[f] = val
-                break
-        else:
-            merged[f] = None
+    # ── Header: from page 1 only ──
+    first_page = valid_pages[0]
+    if header_fields:
+        for f in header_fields:
+            merged[f] = first_page.get(f)
+    else:
+        # Auto-extract: take all non-metadata, non-list keys from page 1
+        for key, val in first_page.items():
+            if key not in _meta_keys:
+                merged[key] = val
 
-    # Merge line_items with deduplication
+    # ── Line items: concat from all pages, deduplicate ──
+    all_items: list[dict] = []
+    seen: set[tuple] = set()
+
+    # Determine dedup key columns
     if line_item_fields:
-        all_items: list[dict] = []
-        seen_keys: set[tuple] = set()
-        # Use the first 3 columns (or fewer) as dedup key
         dedup_cols = line_item_fields[:3]
-        for pr in page_results:
-            if "_error" in pr:
-                continue
+    else:
+        dedup_cols = []
+        for pr in valid_pages:
             items = pr.get("line_items")
-            if not isinstance(items, list):
-                continue
-            for item in items:
-                dedup_key = tuple(
-                    str(item.get(col, "")).strip().lower() for col in dedup_cols
-                )
-                if dedup_key not in seen_keys:
-                    seen_keys.add(dedup_key)
-                    all_items.append(item)
-        merged["line_items"] = all_items
+            if isinstance(items, list) and items:
+                dedup_cols = list(items[0].keys())[:3]
+                break
 
+    for pr in valid_pages:
+        items = pr.get("line_items")
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            key = tuple(str(item.get(col, "")).strip().lower() for col in dedup_cols)
+            if key not in seen:
+                seen.add(key)
+                all_items.append(item)
+
+    merged["line_items"] = all_items
     return merged

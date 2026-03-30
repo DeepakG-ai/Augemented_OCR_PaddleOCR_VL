@@ -82,6 +82,7 @@ class ExtractionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
     vendor_id: str
+    vendor_name: str | None = None
     template_id: int | None
     filename: str | None
     total_pages: int | None
@@ -101,6 +102,22 @@ class ExtractionStartResponse(BaseModel):
     result: Any | None
     total_pages: int
     duration_ms: int
+
+
+class TemplateListOut(BaseModel):
+    """Template with vendor_name for the saved-templates page."""
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    vendor_id: str
+    vendor_name: str
+    format_type: str
+    header_fields: list[str]
+    line_item_fields: list[str]
+    prompt_instructions: str | None
+    extraction_rules: list[str]
+    prompt_hash: str | None
+    created_at: datetime
+    updated_at: datetime
 
 
 # -- Health ----------------------------------------------------------------

@@ -10,3 +10,9 @@ pydantic
 redis
 aiofiles
 websockets
+arize-phoenix[evals]
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-exporter-otlp
+openinference-instrumentation-openai
+openinference-instrumentation-langchain

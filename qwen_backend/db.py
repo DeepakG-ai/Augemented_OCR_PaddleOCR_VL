@@ -128,6 +128,13 @@ async def upsert_vendor(pool: asyncpg.Pool, vendor_id: str, name: str) -> dict:
         return dict(row)
 
 
+async def delete_vendor(pool: asyncpg.Pool, vendor_id: str) -> bool:
+    """Delete a vendor. CASCADE handles templates/extractions."""
+    async with pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM vendors WHERE id = $1", vendor_id)
+        return result == "DELETE 1"
+
+
 # -- Template queries ------------------------------------------------------
 
 _TEMPLATE_COLS = """
@@ -189,6 +196,27 @@ async def upsert_template(
         return d
 
 
+async def list_all_templates(pool: asyncpg.Pool) -> list[dict]:
+    """Return all templates joined with vendor name for the saved-templates page."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT t.id, t.vendor_id, v.name AS vendor_name, t.format_type,
+                   t.header_fields, t.line_item_fields, t.prompt_instructions,
+                   t.extraction_rules, t.prompt_hash, t.created_at, t.updated_at
+            FROM templates t
+            JOIN vendors v ON v.id = t.vendor_id
+            ORDER BY t.updated_at DESC
+            """
+        )
+        results = []
+        for r in rows:
+            d = dict(r)
+            _parse_jsonb(d, "header_fields", "line_item_fields", "extraction_rules")
+            results.append(d)
+        return results
+
+
 # -- Extraction queries ----------------------------------------------------
 
 _EXTRACTION_COLS = """
@@ -201,7 +229,7 @@ _EXTRACTION_COLS = """
 async def create_extraction(
     pool: asyncpg.Pool,
     vendor_id: str,
-    template_id: int,
+    template_id: int | None,
     filename: str,
     total_pages: int,
     format_type: str,
@@ -233,23 +261,39 @@ async def update_extraction_result(
     status: str,
     duration_ms: int,
     error: str | None = None,
+    page_results_partial: list[dict] | None = None,
 ) -> None:
     async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE extractions
-            SET result       = $2::jsonb,
-                page_results = $3::jsonb,
-                status       = $4,
-                duration_ms  = $5,
-                error        = $6
-            WHERE id = $1
-            """,
-            extraction_id,
-            json.dumps(result) if result is not None else None,
-            json.dumps(page_results) if page_results is not None else None,
-            status, duration_ms, error,
-        )
+        if page_results_partial:
+            # Incremental append: add page results to existing array
+            for pr in page_results_partial:
+                await conn.execute(
+                    """
+                    UPDATE extractions
+                    SET page_results = COALESCE(page_results, '[]'::jsonb) || $2::jsonb,
+                        status       = $3
+                    WHERE id = $1
+                    """,
+                    extraction_id,
+                    json.dumps([pr]),
+                    status,
+                )
+        else:
+            await conn.execute(
+                """
+                UPDATE extractions
+                SET result       = $2::jsonb,
+                    page_results = $3::jsonb,
+                    status       = $4,
+                    duration_ms  = $5,
+                    error        = $6
+                WHERE id = $1
+                """,
+                extraction_id,
+                json.dumps(result) if result is not None else None,
+                json.dumps(page_results) if page_results is not None else None,
+                status, duration_ms, error,
+            )
 
 
 async def list_extractions(pool: asyncpg.Pool, vendor_id: str, limit: int = 20) -> list[dict]:
@@ -262,6 +306,29 @@ async def list_extractions(pool: asyncpg.Pool, vendor_id: str, limit: int = 20) 
             ORDER BY created_at DESC LIMIT $2
             """,
             vendor_id, limit,
+        )
+        results = []
+        for r in rows:
+            d = dict(r)
+            _parse_jsonb(d, "header_fields", "line_item_fields", "result", "page_results")
+            results.append(d)
+        return results
+
+
+async def list_all_extractions(pool: asyncpg.Pool, limit: int = 50) -> list[dict]:
+    """Global extraction history with vendor_name joined."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT e.id, e.vendor_id, v.name AS vendor_name, e.template_id,
+                   e.filename, e.total_pages, e.format_type,
+                   e.header_fields, e.line_item_fields, e.result, e.page_results,
+                   e.status, e.error, e.duration_ms, e.created_at
+            FROM extractions e
+            LEFT JOIN vendors v ON v.id = e.vendor_id
+            ORDER BY e.created_at DESC LIMIT $1
+            """,
+            limit,
         )
         results = []
         for r in rows:

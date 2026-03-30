@@ -31,11 +31,14 @@ import cache as cache_mod
 import db as db_mod
 import extractor
 import processor
+from logging_config import configure_logging
+from phoenix_tracing import setup_phoenix
 from models import (
     ExtractionOut,
     HealthOut,
     TemplateSaveResponse,
     TemplateCreate,
+    TemplateListOut,
     TemplateOut,
     VendorCreate,
     VendorOut,
@@ -43,12 +46,9 @@ from models import (
 
 load_dotenv()
 
+# ── Centralized logging (replaces inline basicConfig) ───────────────
+configure_logging()
 logger = logging.getLogger("main")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 
 # -- Config from env --------------------------------------------------------
 
@@ -56,6 +56,9 @@ LLM_URL = os.getenv("LLM_URL", "http://localhost:8001/v1/chat/completions")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen3vl")
 RATE_LIMIT = os.getenv("RATE_LIMIT_PER_MINUTE", "30")
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "50")) * 1024 * 1024
+
+# Track active extractions for cancellation: {extraction_id: asyncio.Event}
+_active_extractions: dict[int, asyncio.Event] = {}
 
 
 # -- Rate limiter -----------------------------------------------------------
@@ -83,12 +86,13 @@ class MaxUploadSizeMiddleware(BaseHTTPMiddleware):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: create DB pool + Redis. Shutdown: close both."""
+    """Startup: create DB pool + Redis + Phoenix. Shutdown: close both."""
     logger.info("Starting up -- creating DB pool and Redis client")
     app.state.pool = await db_mod.create_pool()
     await db_mod.init(app.state.pool)
     app.state.redis = await cache_mod.get_redis()
-    logger.info("DB pool and Redis ready")
+    setup_phoenix()
+    logger.info("DB pool, Redis, and Phoenix ready")
     yield
     logger.info("Shutting down -- closing connections")
     await app.state.pool.close()
@@ -163,6 +167,19 @@ async def create_vendor(request: Request, body: VendorCreate):
     return VendorOut(**row)
 
 
+@app.delete("/vendors/{vendor_id}")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def delete_vendor(request: Request, vendor_id: str):
+    pool = request.app.state.pool
+    redis_client = request.app.state.redis
+    # Invalidate cache
+    await cache_mod.invalidate_vendor_cache(redis_client, vendor_id)
+    deleted = await db_mod.delete_vendor(pool, vendor_id)
+    if not deleted:
+        raise HTTPException(404, detail="Vendor not found")
+    return {"status": "deleted", "vendor_id": vendor_id}
+
+
 # -- Templates --------------------------------------------------------------
 
 @app.get("/vendors/{vendor_id}/template", response_model=TemplateOut)
@@ -233,19 +250,24 @@ async def extract(
     pool = request.app.state.pool
     redis_client = request.app.state.redis
 
-    # 1. Load vendor template
+    # 1. Load vendor template (may not exist for auto-extract)
     tmpl = await db_mod.get_template(pool, vendor_id)
-    if not tmpl:
-        raise HTTPException(400, detail="Configure vendor template first via POST /vendors/{vendor_id}/template")
-
-    system_prompt = tmpl["system_prompt"]
-    if not system_prompt:
-        raise HTTPException(400, detail="Template has no system prompt -- re-save template to rebuild")
 
     # Resolve fields and format_type (form overrides template)
-    req_header: list[str] = json.loads(header_fields) if header_fields else tmpl["header_fields"]
-    req_items: list[str] = json.loads(line_item_fields) if line_item_fields else tmpl["line_item_fields"]
-    req_format: str = format_type or tmpl["format_type"]
+    req_header: list[str] = json.loads(header_fields) if header_fields else (tmpl["header_fields"] if tmpl else [])
+    req_items: list[str] = json.loads(line_item_fields) if line_item_fields else (tmpl["line_item_fields"] if tmpl else [])
+    req_format: str = format_type or (tmpl["format_type"] if tmpl else "single_po_multipage")
+
+    # Build or retrieve system prompt
+    if tmpl and tmpl.get("system_prompt"):
+        system_prompt = tmpl["system_prompt"]
+    else:
+        # Build a fresh system prompt (auto-extract or no template saved yet)
+        instructions = tmpl["prompt_instructions"] if tmpl else None
+        rules = tmpl["extraction_rules"] if tmpl else []
+        system_prompt = extractor.build_system_prompt(
+            req_header, req_items, instructions, rules, req_format
+        )
 
     # 2. Read + convert file to pages
     file_bytes = await file.read()
@@ -259,8 +281,9 @@ async def extract(
         raise HTTPException(400, detail=f"Unsupported file type: {filename}")
 
     # 3. Create extraction record
+    template_id = tmpl["id"] if tmpl else None
     extraction_rec = await db_mod.create_extraction(
-        pool, vendor_id, tmpl["id"], filename, len(pages),
+        pool, vendor_id, template_id, filename, len(pages),
         req_format, req_header, req_items,
     )
     extraction_id = extraction_rec["id"]
@@ -269,20 +292,35 @@ async def extract(
     await db_mod.save_pages(pool, extraction_id, pages)
 
     # 5. SSE streaming response
+    cancel_event = asyncio.Event()
+    _active_extractions[extraction_id] = cancel_event
+
     async def event_stream() -> AsyncGenerator[str, None]:
         start = time.perf_counter()
         error_msg: str | None = None
         final_result = None
         page_results = None
+        was_cancelled = False
+        last_completed_page = 0
 
-        async def on_page_done(page_num: int, total_pages: int) -> None:
-            """SSE callback -- fires after each page is processed."""
+        async def on_page_done(page_num: int, total_pages: int, page_result: dict | None) -> None:
+            """SSE callback -- fires after each page is processed. Saves incrementally."""
             progress_events.append({
                 "event": "progress",
                 "status": "processing",
+                "extraction_id": extraction_id,
                 "page": page_num,
                 "total_pages": total_pages,
             })
+            # Save page result incrementally to DB
+            if page_result is not None:
+                try:
+                    await db_mod.update_extraction_result(
+                        pool, extraction_id, None, None, "processing", 0,
+                        page_results_partial=[page_result],
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to save incremental page result: %s", exc)
 
         progress_events: list[dict] = []
 
@@ -297,6 +335,7 @@ async def extract(
                     llm_url=LLM_URL,
                     model=LLM_MODEL,
                     on_page_done=on_page_done,
+                    cancel_event=cancel_event,
                 )
             )
 
@@ -312,6 +351,8 @@ async def extract(
             output = await extract_task
             final_result = output["result"]
             page_results = output["page_results"]
+            was_cancelled = output.get("cancelled", False)
+            last_completed_page = output.get("last_completed_page", 0)
 
             # Flush remaining progress events
             while last_sent < len(progress_events):
@@ -325,11 +366,20 @@ async def extract(
 
         elapsed_ms = int((time.perf_counter() - start) * 1000)
 
+        # Clean up active tracking
+        _active_extractions.pop(extraction_id, None)
+
         if error_msg:
             await db_mod.update_extraction_result(
                 pool, extraction_id, None, None, "failed", elapsed_ms, error=error_msg
             )
             yield f"data: {json.dumps({'event': 'error', 'status': 'failed', 'error': error_msg})}\n\n"
+        elif was_cancelled:
+            status = "partial" if page_results else "cancelled"
+            await db_mod.update_extraction_result(
+                pool, extraction_id, final_result, page_results, status, elapsed_ms
+            )
+            yield f"data: {json.dumps({'event': 'cancelled', 'status': status, 'extraction_id': extraction_id, 'result': final_result, 'page_results': page_results, 'last_completed_page': last_completed_page, 'total_pages': len(pages), 'duration_ms': elapsed_ms})}\n\n"
         else:
             await db_mod.update_extraction_result(
                 pool, extraction_id, final_result, page_results, "done", elapsed_ms
@@ -351,6 +401,161 @@ async def extract(
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+# -- Cancel / Resume --------------------------------------------------------
+
+@app.post("/extract/cancel/{extraction_id}")
+async def cancel_extraction(extraction_id: int):
+    """Set the cancellation flag for a running extraction."""
+    cancel_event = _active_extractions.get(extraction_id)
+    if not cancel_event:
+        raise HTTPException(404, detail="No active extraction with that ID")
+    cancel_event.set()
+    return {"status": "cancelling", "extraction_id": extraction_id}
+
+
+@app.post("/extract/resume/{extraction_id}")
+@limiter.limit("10/minute")
+async def resume_extraction(request: Request, extraction_id: int):
+    """Resume an extraction from the last completed page."""
+    pool = request.app.state.pool
+    redis_client = request.app.state.redis
+
+    # 1. Load existing extraction record
+    extraction = await db_mod.get_extraction(pool, extraction_id)
+    if not extraction:
+        raise HTTPException(404, detail="Extraction not found")
+
+    if extraction["status"] not in ("partial", "cancelled", "failed"):
+        raise HTTPException(400, detail=f"Cannot resume extraction with status '{extraction['status']}'")
+
+    vendor_id = extraction["vendor_id"]
+    filename = extraction["filename"]
+
+    # 2. Load template and existing data
+    tmpl = await db_mod.get_template(pool, vendor_id)
+
+    req_header = extraction.get("header_fields") or (tmpl["header_fields"] if tmpl else [])
+    req_items = extraction.get("line_item_fields") or (tmpl["line_item_fields"] if tmpl else [])
+    req_format = extraction.get("format_type") or (tmpl["format_type"] if tmpl else "single_po_multipage")
+
+    # Get system prompt from template, or build fresh from extraction's saved fields
+    if tmpl and tmpl.get("system_prompt"):
+        system_prompt = tmpl["system_prompt"]
+    else:
+        instructions = tmpl["prompt_instructions"] if tmpl else None
+        rules = tmpl["extraction_rules"] if tmpl else []
+        system_prompt = extractor.build_system_prompt(
+            req_header, req_items, instructions, rules, req_format
+        )
+
+    # 3. Get page images and existing results
+    pages = await db_mod.get_pages(pool, extraction_id)
+    if not pages:
+        raise HTTPException(400, detail="No page images found for this extraction")
+
+    existing_page_results = extraction.get("page_results") or []
+    # Find pages that succeeded (no _error)
+    completed_page_nums = {pr["_page"] for pr in existing_page_results if "_error" not in pr}
+    # Find the first page that still needs work (failed or never attempted)
+    all_page_nums = {p["page_number"] for p in pages}
+    missing_pages = sorted(all_page_nums - completed_page_nums)
+    start_from = missing_pages[0] if missing_pages else len(pages) + 1
+
+    # 4. SSE streaming response for resume
+    cancel_event = asyncio.Event()
+    _active_extractions[extraction_id] = cancel_event
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        start = time.perf_counter()
+        error_msg: str | None = None
+        final_result = None
+        page_results = None
+        was_cancelled = False
+        last_completed_page = start_from - 1
+
+        yield f"data: {json.dumps({'event': 'resume', 'status': 'resuming', 'start_from_page': start_from, 'total_pages': len(pages)})}\n\n"
+
+        async def on_page_done(page_num: int, total_pages: int, page_result: dict | None) -> None:
+            progress_events.append({
+                "event": "progress", "status": "processing",
+                "page": page_num, "total_pages": total_pages,
+            })
+            if page_result is not None:
+                try:
+                    await db_mod.update_extraction_result(
+                        pool, extraction_id, None, None, "processing", 0,
+                        page_results_partial=[page_result],
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to save incremental page result: %s", exc)
+
+        progress_events: list[dict] = []
+
+        try:
+            extract_task = asyncio.create_task(
+                extractor.extract_document(
+                    pages=pages,
+                    header_fields=req_header,
+                    line_item_fields=req_items,
+                    system_prompt=system_prompt,
+                    format_type=req_format,
+                    llm_url=LLM_URL,
+                    model=LLM_MODEL,
+                    on_page_done=on_page_done,
+                    cancel_event=cancel_event,
+                    start_from_page=start_from,
+                    existing_page_results=existing_page_results,
+                )
+            )
+
+            last_sent = 0
+            while not extract_task.done():
+                await asyncio.sleep(0.3)
+                while last_sent < len(progress_events):
+                    yield f"data: {json.dumps(progress_events[last_sent])}\n\n"
+                    last_sent += 1
+
+            output = await extract_task
+            final_result = output["result"]
+            page_results = output["page_results"]
+            was_cancelled = output.get("cancelled", False)
+            last_completed_page = output.get("last_completed_page", 0)
+
+            while last_sent < len(progress_events):
+                yield f"data: {json.dumps(progress_events[last_sent])}\n\n"
+                last_sent += 1
+
+        except Exception as exc:
+            error_msg = str(exc)
+            logger.error("Resume extraction %d failed: %s", extraction_id, error_msg)
+
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        _active_extractions.pop(extraction_id, None)
+
+        if error_msg:
+            await db_mod.update_extraction_result(
+                pool, extraction_id, None, None, "failed", elapsed_ms, error=error_msg
+            )
+            yield f"data: {json.dumps({'event': 'error', 'status': 'failed', 'error': error_msg})}\n\n"
+        elif was_cancelled:
+            status = "partial" if page_results else "cancelled"
+            await db_mod.update_extraction_result(
+                pool, extraction_id, final_result, page_results, status, elapsed_ms
+            )
+            yield f"data: {json.dumps({'event': 'cancelled', 'status': status, 'extraction_id': extraction_id, 'result': final_result, 'page_results': page_results, 'last_completed_page': last_completed_page, 'total_pages': len(pages), 'duration_ms': elapsed_ms})}\n\n"
+        else:
+            await db_mod.update_extraction_result(
+                pool, extraction_id, final_result, page_results, "done", elapsed_ms
+            )
+            yield f"data: {json.dumps({'event': 'done', 'status': 'done', 'extraction_id': extraction_id, 'result': final_result, 'total_pages': len(pages), 'duration_ms': elapsed_ms})}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
 
 
@@ -391,6 +596,49 @@ async def get_extraction_pages(request: Request, extraction_id: int):
 async def list_vendor_extractions(request: Request, vendor_id: str, limit: int = 20):
     rows = await db_mod.list_extractions(request.app.state.pool, vendor_id, limit)
     return [ExtractionOut(**r) for r in rows]
+
+
+# -- All Templates ----------------------------------------------------------
+
+@app.get("/templates", response_model=list[TemplateListOut])
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def list_all_templates(request: Request):
+    rows = await db_mod.list_all_templates(request.app.state.pool)
+    return [TemplateListOut(**r) for r in rows]
+
+
+# -- Global Extraction History -----------------------------------------------
+
+@app.get("/extractions", response_model=list[ExtractionOut])
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def list_all_extractions(request: Request, limit: int = 50):
+    rows = await db_mod.list_all_extractions(request.app.state.pool, limit)
+    return [ExtractionOut(**r) for r in rows]
+
+
+# -- Upload Preview (pre-extraction page rendering) --------------------------
+
+@app.post("/upload-preview")
+@limiter.limit("10/minute")
+async def upload_preview(
+    request: Request,
+    file: UploadFile = File(...),
+):
+    """
+    Upload a PDF/image and get rendered page images back for preview.
+    No extraction or LLM call. Just page rendering.
+    """
+    file_bytes = await file.read()
+    filename = file.filename or "unknown"
+
+    if filename.lower().endswith(".pdf"):
+        pages = await processor.pdf_to_images(file_bytes)
+    elif filename.lower().endswith((".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".webp")):
+        pages = await processor.image_file_to_b64(file_bytes)
+    else:
+        raise HTTPException(400, detail=f"Unsupported file type: {filename}")
+
+    return {"filename": filename, "total_pages": len(pages), "pages": pages}
 
 
 # -- Static Frontend --------------------------------------------------------

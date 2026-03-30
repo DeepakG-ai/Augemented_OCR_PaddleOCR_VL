@@ -1,19 +1,17 @@
 # Prompt Examples
 
-This document shows the exact prompts the LLM model receives for all 3 format
-types. Fields are fully dynamic -- users define header and line item column
+This document shows the exact prompts the LLM model receives for all extraction
+modes. Fields are fully dynamic — users define header and line item column
 names in the UI.
-
-## Example Configuration
-
-- **Header fields**: `supplier`, `bill_to`, `date`, `po_number`, `phone_number`
-- **Line item columns**: `no`, `variant`, `description`, `qty`, `uom`, `unit_cost`, `amount`
-- **Instructions**: "Supplier is in top-left block. PO number is labelled Purchase Order No."
-- **Rules**: ["PO number: PO followed by 5 digits", "Amount = Qty x Unit Cost"]
 
 ---
 
-## System Prompt (shared across all formats, cached in DB + Redis)
+## Mode 1: Auto Extract (no fields selected)
+
+The system prompt is built from the user's template configuration (instructions,
+rules, format_type). No specific fields are injected.
+
+### System Prompt
 
 ```
 You are a highly accurate document data extraction assistant. Extract ONLY what is explicitly visible in the document image. Never guess or fabricate data. If a field is not visible, set it to null.
@@ -28,6 +26,8 @@ EXTRACTION RULES:
 DOCUMENT FORMAT:
 This document is a single purchase order that spans multiple pages. Header fields appear on page 1; line items may continue across subsequent pages.
 
+CRITICAL: Count the number of rows in the line items table FIRST, then extract that exact number of items.
+
 OUTPUT RULES:
   - Return ONLY valid JSON. No markdown fences, no explanation, no extra text.
   - Use null for missing fields, never omit them.
@@ -36,15 +36,44 @@ OUTPUT RULES:
   - Dates should be in the format they appear in the document.
 ```
 
----
-
-## Format 1: `single_po_multipage` (4-page PO)
-
-### Page 1 -- User Message
+### User Message (same for every page)
 
 ```
-You are processing page 1 of 4.
-Extract all header fields AND line items from this page.
+Extract ALL data from this invoice/purchase order document (page 1 of 4).
+
+CRITICAL: Count the number of rows in the line items table FIRST, then extract that exact number of items.
+
+Return in this JSON format:
+- Header fields: extract all visible header fields (po_number, order_date, vendor, bill_to, ship_to, etc.)
+- Line items: extract all visible line item rows with all columns
+
+Strictly return in JSON format. Do NOT include markdown fences, explanations, or any extra text. Return ONLY valid JSON.
+
+ACCURACY REQUIREMENTS:
+- Before extraction: Count total rows in the table visually.
+- After extraction: Verify your line_items array has that many items.
+- Double-check you didn't skip rows at page breaks or table headers.
+- Extract ONLY what is explicitly visible in the document image.
+- Never guess or fabricate values.
+```
+
+---
+
+## Mode 2: Extract Fields (specific fields selected)
+
+The system prompt is the same as above. The user message dynamically injects
+the selected header_fields and line_item_fields.
+
+### Example Configuration
+
+- **Header fields**: `supplier`, `bill_to`, `date`, `po_number`, `phone_number`
+- **Line item columns**: `no`, `variant`, `description`, `qty`, `uom`, `unit_cost`, `amount`
+
+### User Message (same for EVERY page — rj_schinner approach)
+
+```
+Extract the header fields AND all visible line item rows from this purchase order page (page 1 of 4).
+If any field is empty or not visible, return null in the JSON object.
 
 Header fields to extract:
   - supplier
@@ -62,7 +91,7 @@ Line item columns to extract (each row):
   - unit_cost
   - amount
 
-Return JSON matching this structure:
+Return ONLY valid JSON matching EXACTLY this structure:
 {
   "supplier": null,
   "bill_to": null,
@@ -79,139 +108,40 @@ Return JSON matching this structure:
       "unit_cost": "",
       "amount": ""
     }
-  ],
-  "_page": 1,
-  "_total_pages": 4
+  ]
 }
-```
 
-### Pages 2-4 -- User Message (continuation)
-
-```
-You are processing page 2 of 4 (continuation page -- header already extracted from page 1).
-Extract ONLY the line_items table rows from this page. Do NOT repeat header fields.
-
-Line item columns to extract (each row):
-  - no
-  - variant
-  - description
-  - qty
-  - uom
-  - unit_cost
-  - amount
-
-Return JSON matching this structure:
-{
-  "line_items": [
-    {
-      "no": "",
-      "variant": "",
-      "description": "",
-      "qty": "",
-      "uom": "",
-      "unit_cost": "",
-      "amount": ""
-    }
-  ],
-  "_page": 2,
-  "_total_pages": 4
-}
+Rules:
+- Empty or missing cells → null.
+- Numbers (qty, unit_cost, amount, unit_price, etc.) must be numbers, not strings.
+- Extract every visible line item row.
 ```
 
 ---
 
-## Format 2: `po_per_page` (5 independent POs)
+## Merging Logic (single_po_multipage)
 
-### Any page (e.g. page 3) -- User Message
+Every page gets the **same prompt** (rj_schinner approach). The merger handles
+combining results:
+
+1. **Header fields**: First non-null value from page 1 wins
+2. **Line items**: Concatenated from all pages with deduplication
+3. **Dedup key**: First 3 line item columns (e.g., `no`, `variant`, `description`)
 
 ```
-You are processing page 3 of 5.
-Extract all requested fields from this page.
-
-Header fields to extract:
-  - supplier
-  - bill_to
-  - date
-  - po_number
-  - phone_number
-
-Line item columns to extract (each row):
-  - no
-  - variant
-  - description
-  - qty
-  - uom
-  - unit_cost
-  - amount
-
-Return JSON matching this structure:
-{
-  "supplier": null,
-  "bill_to": null,
-  "date": null,
-  "po_number": null,
-  "phone_number": null,
-  "line_items": [
-    {
-      "no": "",
-      "variant": "",
-      "description": "",
-      "qty": "",
-      "uom": "",
-      "unit_cost": "",
-      "amount": ""
-    }
-  ],
-  "_page": 3,
-  "_total_pages": 5
-}
+Page 1 → header fields + 5 line items
+Page 2 → header fields (ignored by merger) + 3 line items
+Page 3 → header fields (ignored by merger) + 2 line items
+─────────────────────────────────────────────
+Merged → header from page 1 + 10 line items (deduped)
 ```
 
 ---
 
-## Format 3: `single_page`
+## Format Types
 
-### User Message
-
-```
-This is a single-page document.
-Extract all requested fields from this page.
-
-Header fields to extract:
-  - supplier
-  - bill_to
-  - date
-  - po_number
-  - phone_number
-
-Line item columns to extract (each row):
-  - no
-  - variant
-  - description
-  - qty
-  - uom
-  - unit_cost
-  - amount
-
-Return JSON matching this structure:
-{
-  "supplier": null,
-  "bill_to": null,
-  "date": null,
-  "po_number": null,
-  "phone_number": null,
-  "line_items": [
-    {
-      "no": "",
-      "variant": "",
-      "description": "",
-      "qty": "",
-      "uom": "",
-      "unit_cost": "",
-      "amount": ""
-    }
-  ],
-  "_page": 1,
-  "_total_pages": 1
-}
-```
+| Format | Behavior |
+|--------|----------|
+| `single_po_multipage` | Same prompt every page. Merger: header from pg 1, concat line_items. |
+| `po_per_page` | Same prompt every page. Each page returned as independent record. |
+| `single_page` | Single page. No merging needed. |
