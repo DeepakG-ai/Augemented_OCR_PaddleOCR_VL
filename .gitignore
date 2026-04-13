@@ -73,3 +73,5 @@ celerybeat-schedule
 
 # MinIO data (if running locally)
 minio_data/
+.local_object_store/
+qwen_backend/.local_object_store/

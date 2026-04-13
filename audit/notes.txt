@@ -1,0 +1,20 @@
+2. The Advanced Fix: ONNX Runtime
+If you are strictly stuck on a CPU and must drop speeds to 20 seconds, we have to rip out the native PaddleOCR library completely. We would use a tool called paddle2onnx to convert the Chinese v5_mobile models into ONNX graph files, and use Microsoft's onnxruntime library in Python to run them. ONNX Runtime is heavily optimized for Windows CPUs and would drastically speed up inference compared to standard Paddle binaries.
+
+3. in ui, showing "bill to": [object Object] because qwen3vl returned "vendor": {
+    "name": "FEL-DEL VALLE, TX #987",
+    "email": "APINVOICES@FERGUSON.COM",
+    "phone": "512-770-8974",
+    "address": "NEWPORT NEWS VA 23602-0000"
+  },
+  "bill_to": {
+    "fax": "800-359-8454",
+    "name": "FRESH PRODUCTS LLC",
+    "phone": "800-331-1657",
+    "address": "30600 OREGON RD\nPERRYSBURG, OH 43551-4544"
+  },
+  "ship_to": {
+    "name": "FEL-DEL VALLE #987",
+    "address": "6807 ELROY RD\nUNIT 100\nDEL VALLE, TX 7861
+
+  }

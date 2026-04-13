@@ -27,8 +27,12 @@
     --bg: #eff3f8; --bg1: #ffffff; --bg2: #f8fafc; --bg3: #f1f5f9;
     --border: #e2e8f0; --border2: #cbd5e1;
     --blue: #2563eb; --blue-dim: #1d4ed8;
+    --blue-bg: rgba(37, 99, 235, 0.08);
     --green: #16a34a; --green-dim: #15803d;
+    --green-bg: rgba(22, 163, 74, 0.08);
     --amber: #d97706; --red: #dc2626;
+    --amber-bg: rgba(217, 119, 6, 0.08);
+    --red-bg: rgba(220, 38, 38, 0.08);
     --text: #0f172a; --text-dim: #475569; --text-mid: #334155;
 }
 
@@ -252,6 +256,23 @@ html, body {
     object-fit: contain;
 }
 
+/* Review page: image fills available height dynamically */
+.app.review-layout .doc-frame {
+    width: auto;
+    max-width: 100%;
+}
+.app.review-layout .mapping-container {
+    display: block;
+    line-height: 0; /* remove inline-block baseline gap */
+}
+.app.review-layout .doc-img {
+    width: auto;
+    height: auto;
+    max-height: calc(100vh - 140px);
+    max-width: 100%;
+    pointer-events: none;
+}
+
 .no-doc {
     flex: 1; display: flex; flex-direction: column;
     align-items: center; justify-content: center; gap: 8px; color: var(--text-dim);
@@ -423,6 +444,30 @@ html, body {
 .status-success, .status-done { color: var(--green); }
 .status-error, .status-failed { color: var(--red); }
 .status-processing { color: var(--amber); }
+.status-partial { color: var(--amber); }
+.status-cancelled { color: var(--text-dim); }
+
+/* ── History Latency Badge ──────────────────────────────────────────── */
+.history-latency {
+    display: flex; align-items: center; gap: 4px;
+    padding: 4px 10px; border-radius: 3px;
+    background: var(--blue-bg); border: 1px solid var(--blue-dim);
+    color: var(--blue); font-family: var(--mono);
+    white-space: nowrap; flex-shrink: 0;
+    transition: all 0.15s;
+}
+.history-latency-icon { font-size: 12px; }
+.history-latency-value {
+    font-size: 12px; font-weight: 700; letter-spacing: 0.06em;
+}
+.history-latency.no-data {
+    background: var(--bg3); border-color: var(--border);
+    color: var(--text-dim);
+}
+.history-item:hover .history-latency:not(.no-data) {
+    background: rgba(59, 130, 246, 0.15);
+    box-shadow: 0 0 10px rgba(59, 130, 246, 0.2);
+}
 
 /* ── PAGE-LEVEL CARDS ────────────────────────────────────────────────── */
 .page-title {
@@ -528,3 +573,427 @@ html, body {
     cursor: pointer; font-style: normal;
 }
 .rule-example:hover { background: var(--blue-bg); }
+
+/* ══════════════════════════════════════════════════════════════════════ */
+/* REVIEW PAGE                                                          */
+/* ══════════════════════════════════════════════════════════════════════ */
+
+.app.review-layout {
+    grid-template-columns: 22% 56% 22%;
+}
+.app.review-layout .bottom-bar { grid-column: 1/-1; grid-row: 3; justify-content: center; }
+
+/* ── Review Field Panel (left) ────────────────────────────────────── */
+.review-field-panel {
+    padding: 0;
+    overflow-y: auto;
+}
+.review-field-panel .section-title {
+    padding: 10px 14px 6px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--border);
+}
+
+.review-field-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 14px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    transition: background 0.15s;
+}
+.review-field-item:hover,
+.review-field-item.active {
+    background: var(--blue-bg);
+}
+.review-field-item.active {
+    border-left: 2px solid var(--blue);
+    padding-left: 12px;
+}
+
+.review-field-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+.review-field-dot.found-high { background: var(--green); }
+.review-field-dot.found-low  { background: var(--amber); }
+.review-field-dot.manual      { background: var(--blue); }
+.review-field-dot.missing     { background: var(--text-dim); }
+
+/* Selection-mode indicator on the active field */
+.review-field-item.selecting {
+    background: var(--blue-bg);
+    border-left: 3px solid var(--blue);
+    padding-left: 11px;
+    animation: selecting-pulse 1.2s ease-in-out infinite;
+}
+@keyframes selecting-pulse {
+    0%, 100% { border-left-color: var(--blue); }
+    50% { border-left-color: transparent; }
+}
+.review-field-item .rv-draw-btn {
+    flex-shrink: 0;
+    width: 18px; height: 18px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    background: var(--bg3);
+    color: var(--text-dim);
+    font-size: 10px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s;
+    padding: 0;
+}
+.review-field-item .rv-draw-btn:hover {
+    border-color: var(--blue);
+    color: var(--blue);
+    background: var(--blue-bg);
+}
+
+/* ── Selection box drawn on PDF (crosshair mode) ─────────────────── */
+.rv-selection-active .mapping-container {
+    cursor: crosshair !important;
+}
+.rv-selection-active .mapping-container * {
+    cursor: crosshair !important;
+}
+.rv-selection-box {
+    position: absolute;
+    border: 2px solid var(--blue);
+    background: rgba(59, 130, 246, 0.12);
+    z-index: 20;
+    pointer-events: none;
+}
+
+/* ── OCR word overlay (ALT key) ──────────────────────────────────── */
+.ocr-word-overlay {
+    position: absolute;
+    border: 1px solid rgba(59, 130, 246, 0.3);
+    background: rgba(59, 130, 246, 0.04);
+    pointer-events: none;
+    z-index: 8;
+    transition: background 0.1s;
+}
+.ocr-word-overlay.highlighted {
+    background: rgba(59, 130, 246, 0.20);
+    border-color: var(--blue);
+}
+
+.review-field-label {
+    font-size: 8px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    flex-shrink: 0;
+    min-width: 60px;
+}
+
+.review-field-input {
+    flex: 1;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 3px 6px;
+    border-radius: 2px;
+    outline: none;
+    min-width: 0;
+}
+.review-field-input:focus {
+    border-color: var(--blue);
+    box-shadow: 0 0 0 1px var(--blue-bg);
+}
+
+/* ── Review Line Items Table ──────────────────────────────────────── */
+.review-line-items {
+    width: 100%;
+    font-size: 10px;
+    border-collapse: collapse;
+    margin-top: 4px;
+}
+.review-line-items th {
+    background: var(--bg3);
+    padding: 4px 6px;
+    text-align: left;
+    font-size: 8px;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--border2);
+    position: sticky;
+    top: 0;
+}
+.review-line-items td {
+    padding: 3px 6px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text);
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+    position: relative;
+    transition: all 0.15s;
+}
+.review-line-items td:hover {
+    background: var(--blue-bg);
+    color: var(--blue);
+}
+.review-line-items td.cell-matched {
+    border-left: 2px solid var(--green);
+}
+.review-line-items td.cell-manual {
+    border-left: 2px solid var(--blue);
+}
+.review-line-items td.cell-selecting {
+    background: var(--blue-bg);
+    outline: 1px dashed var(--blue);
+    animation: selecting-pulse 1.2s ease-in-out infinite;
+}
+.review-line-items tr:hover td {
+    background: var(--bg3);
+}
+
+/* ── Mapping Rectangles (blue dotted boxes on PDF) ────────────────── */
+.mapping-container {
+    position: relative;
+    display: inline-block;
+}
+
+.mapping-rect {
+    position: absolute;
+    border: 1px dashed rgba(59, 130, 246, 0.4);
+    background: transparent;
+    border-radius: 2px;
+    pointer-events: auto;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    z-index: 10;
+}
+.mapping-rect:hover,
+.mapping-rect.active {
+    border: 2px solid #60a5fa;
+    background: rgba(59, 130, 246, 0.18);
+    box-shadow: 0 0 14px rgba(59, 130, 246, 0.5);
+    z-index: 12;
+}
+.mapping-rect-label {
+    position: absolute;
+    bottom: calc(100% + 2px); 
+    top: auto;
+    left: -2px;
+    font-family: var(--mono);
+    font-size: 8px;
+    line-height: 1.2;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    background: var(--blue);
+    color: #fff;
+    padding: 2px 6px;
+    border-radius: 3px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+    z-index: 1000;
+    white-space: nowrap;
+    text-transform: uppercase;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+.mapping-rect:hover .mapping-rect-label,
+.mapping-rect.active .mapping-rect-label {
+    opacity: 1;
+}
+
+/* ── SVG Connection Lines ─────────────────────────────────────────── */
+.mapping-svg {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw; height: 100vh;
+    pointer-events: none;
+    z-index: 15;
+}
+.mapping-line {
+    stroke: var(--blue);
+    stroke-width: 1.5;
+    stroke-dasharray: 6 4;
+    fill: none;
+    opacity: 0;
+    transition: opacity 0.15s, stroke-width 0.15s;
+}
+.mapping-line.active {
+    stroke-width: 2.5;
+    opacity: 0.9;
+    animation: mapping-dash-flow 0.8s linear infinite;
+}
+@keyframes mapping-dash-flow {
+    to { stroke-dashoffset: -20; }
+}
+
+/* ── Review JSON Panel (right) ────────────────────────────────────── */
+.review-json-panel {
+    padding: 0;
+    overflow-y: auto;
+}
+.review-json-panel .section-title {
+    padding: 10px 14px 6px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--border);
+}
+.review-json-pre {
+    padding: 10px;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text);
+    white-space: pre-wrap;
+    word-break: break-all;
+    line-height: 1.6;
+}
+
+/* ── Review Bottom Bar Buttons ────────────────────────────────────── */
+.review-btn {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    padding: 8px 20px;
+    border: 1px solid var(--border2);
+    border-radius: 3px;
+    cursor: pointer;
+    transition: all 0.15s;
+    text-transform: uppercase;
+}
+.review-btn.confirm {
+    background: var(--green);
+    color: #fff;
+    border-color: var(--green);
+}
+.review-btn.confirm:hover {
+    background: var(--green-dim);
+}
+.review-btn.secondary {
+    background: transparent;
+    color: var(--text-mid);
+}
+.review-btn.secondary:hover {
+    background: var(--bg3);
+    color: var(--text);
+}
+
+/* ── Review Stats Bar ─────────────────────────────────────────────── */
+.review-stats {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    font-size: 9px;
+    color: var(--text-dim);
+    letter-spacing: 0.08em;
+}
+.review-stats .stat-matched { color: var(--green); }
+.review-stats .stat-missed { color: var(--amber); }
+
+/* ── Accept/Reject Selection Preview Bar ─────────────────────────── */
+.rv-selection-preview {
+    position: fixed;
+    bottom: 60px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 9999;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 18px;
+    background: rgba(15, 17, 25, 0.95);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(12px);
+    font-family: 'Inter', sans-serif;
+    animation: rvPreviewSlideUp 0.2s ease-out;
+}
+@keyframes rvPreviewSlideUp {
+    from { transform: translateX(-50%) translateY(20px); opacity: 0; }
+    to   { transform: translateX(-50%) translateY(0);    opacity: 1; }
+}
+.rv-preview-label {
+    font-size: 10px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    white-space: nowrap;
+}
+.rv-preview-text {
+    font-size: 12px;
+    color: var(--text);
+    max-width: 300px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.rv-preview-accept {
+    padding: 5px 14px;
+    font-size: 11px;
+    font-weight: 600;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    background: var(--green);
+    color: #000;
+    transition: transform 0.1s;
+}
+.rv-preview-accept:hover { transform: scale(1.05); }
+.rv-preview-reject {
+    padding: 5px 14px;
+    font-size: 11px;
+    font-weight: 600;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    cursor: pointer;
+    background: transparent;
+    color: var(--text-mid);
+    transition: all 0.15s;
+}
+.rv-preview-reject:hover {
+    border-color: #ef4444;
+    color: #ef4444;
+}
+
+/* ── Reset Button (per-field) ────────────────────────────────────── */
+.rv-reset-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--amber);
+    font-size: 12px;
+    width: 22px;
+    height: 22px;
+    border-radius: 4px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: all 0.15s;
+}
+.rv-reset-btn:hover {
+    border-color: var(--amber);
+    background: rgba(245, 158, 11, 0.1);
+}
+
+/* ── Changed Field Indicator ─────────────────────────────────────── */
+.review-field-item.rv-changed {
+    border-left: 2px solid var(--blue);
+    padding-left: 6px;
+}

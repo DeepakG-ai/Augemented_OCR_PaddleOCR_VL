@@ -1,0 +1,73 @@
+================================================================================
+  PyMuPDF Text Extraction Test
+  PDF: RJ SCHINNER 563773.pdf
+================================================================================
+
+File size: 230,827 bytes
+
+------------------------------------------------------------
+  STEP 1: PyMuPDF Text Extraction (page by page)
+------------------------------------------------------------
+
+  PAGE 1
+     Dimensions: 612.0 x 792.0 points
+     Total text spans: 0
+     --------------------------------------------------
+
+  PAGE 2
+     Dimensions: 612.0 x 792.0 points
+     Total text spans: 0
+     --------------------------------------------------
+
+  PAGE 3
+     Dimensions: 612.0 x 792.0 points
+     Total text spans: 0
+     --------------------------------------------------
+
+
+------------------------------------------------------------
+  STEP 2: Text Matching Demo
+  (Simulating Qwen VL extraction result)
+------------------------------------------------------------
+
+
+------------------------------------------------------------
+  STEP 3: Full JSON Output (field_locations)
+------------------------------------------------------------
+{
+  "pdf_file": "RJ SCHINNER 563773.pdf",
+  "total_pages": 3,
+  "pages_summary": [
+    {
+      "page_number": 1,
+      "page_width": 612.0,
+      "page_height": 792.0,
+      "total_spans": 0
+    },
+    {
+      "page_number": 2,
+      "page_width": 612.0,
+      "page_height": 792.0,
+      "total_spans": 0
+    },
+    {
+      "page_number": 3,
+      "page_width": 612.0,
+      "page_height": 792.0,
+      "total_spans": 0
+    }
+  ],
+  "simulated_extraction": {
+    "vendor_name": "RJ SCHINNER",
+    "po_number": "563773",
+    "purchase_order_no": "563773"
+  },
+  "field_locations": {}
+}
+
+  Full text extraction saved to:
+     C:\Users\aigroup5\PycharmProjects\Augemented_OCR_PaddleOCR_VL\tests\review\text_extraction_output.json
+
+================================================================================
+  Done!
+================================================================================

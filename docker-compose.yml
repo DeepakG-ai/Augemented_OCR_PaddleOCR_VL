@@ -28,7 +28,154 @@ services:
       timeout: 3s
       retries: 5
 
-  # ── Arize Phoenix (LLM Observability) ──────────────────────────────
+  # ── MinIO (Object Storage) ──────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - miniodata:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "test -d /data"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "uvicorn", "qwen_backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      DATABASE_URL: postgresql://augocr:augocr@postgres:5432/augocr
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_SECURE: "false"
+      PHOENIX_COLLECTOR_ENDPOINT: http://phoenix:4317
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./:/app
+
+  normalize-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "qwen_backend.worker", "--stage", "normalize", "--name", "normalize-worker"]
+    environment:
+      DATABASE_URL: postgresql://augocr:augocr@postgres:5432/augocr
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_SECURE: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+
+  ocr-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "qwen_backend.worker", "--stage", "ocr", "--name", "ocr-worker"]
+    environment:
+      DATABASE_URL: postgresql://augocr:augocr@postgres:5432/augocr
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_SECURE: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+
+  llm-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "qwen_backend.worker", "--stage", "llm", "--name", "llm-worker"]
+    environment:
+      DATABASE_URL: postgresql://augocr:augocr@postgres:5432/augocr
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_SECURE: "false"
+      LLM_URL: http://host.docker.internal:8001/v1/chat/completions
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./:/app
+
+  postprocess-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "qwen_backend.worker", "--stage", "postprocess", "--name", "postprocess-worker"]
+    environment:
+      DATABASE_URL: postgresql://augocr:augocr@postgres:5432/augocr
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_SECURE: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+
+  outbound-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "qwen_backend.worker", "--stage", "outbound", "--name", "outbound-worker"]
+    environment:
+      DATABASE_URL: postgresql://augocr:augocr@postgres:5432/augocr
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_SECURE: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+
   phoenix:
     image: arizephoenix/phoenix:latest
     ports:
@@ -39,7 +186,7 @@ services:
     volumes:
       - phoenixdata:/phoenix
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:6006/healthz"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:6006/healthz')"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -47,3 +194,4 @@ services:
 volumes:
   pgdata:
   phoenixdata:
+  miniodata:

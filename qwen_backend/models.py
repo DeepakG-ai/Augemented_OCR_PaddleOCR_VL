@@ -81,6 +81,7 @@ class TemplateSaveResponse(BaseModel):
 class ExtractionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
+    document_id: int | None = None
     vendor_id: str
     vendor_name: str | None = None
     template_id: int | None
@@ -91,10 +92,18 @@ class ExtractionOut(BaseModel):
     line_item_fields: list[str] | None
     result: Any | None
     page_results: Any | None
+    field_locations: Any | None = None
+    ocr_data: Any | None = None
+    corrected_result: Any | None = None
+    correction_meta: Any | None = None
+    export_object_key: str | None = None
+    progress: Any | None = None
+    cancel_requested: bool = False
     status: str
     error: str | None
     duration_ms: int | None
     created_at: datetime
+    updated_at: datetime | None = None
 
 
 class ExtractionStartResponse(BaseModel):
@@ -125,3 +134,34 @@ class TemplateListOut(BaseModel):
 class HealthOut(BaseModel):
     status: str
     db: str
+
+
+class JobOut(BaseModel):
+    id: int
+    extraction_id: int | None = None
+    document_id: int | None = None
+    job_type: str
+    status: str
+    payload: Any | None = None
+    progress: Any | None = None
+    attempts: int
+    max_attempts: int
+    priority: int
+    locked_by: str | None = None
+    locked_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    error: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class JobStatusOut(BaseModel):
+    job: JobOut
+    extraction: ExtractionOut | None = None
+
+
+class ExtractionJobStartOut(BaseModel):
+    job_id: int
+    extraction_id: int
+    status: str

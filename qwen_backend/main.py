@@ -8,41 +8,72 @@ No hardcoded field registry.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import mimetypes
 import os
 import time
 import traceback
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import AsyncGenerator
+from uuid import uuid4
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import Response
 
-import cache as cache_mod
-import db as db_mod
-import extractor
-import processor
-from logging_config import configure_logging
-from phoenix_tracing import setup_phoenix
-from models import (
-    ExtractionOut,
-    HealthOut,
-    TemplateSaveResponse,
-    TemplateCreate,
-    TemplateListOut,
-    TemplateOut,
-    VendorCreate,
-    VendorOut,
-)
+try:
+    from . import cache as cache_mod
+    from . import db as db_mod
+    from . import extractor
+    from . import processor
+    from .contracts import build_purchase_order_contract
+    from .logging_config import configure_logging
+    from .models import (
+        ExtractionJobStartOut,
+        ExtractionOut,
+        HealthOut,
+        JobOut,
+        JobStatusOut,
+        TemplateSaveResponse,
+        TemplateCreate,
+        TemplateListOut,
+        TemplateOut,
+        VendorCreate,
+        VendorOut,
+    )
+    from .object_store import ARTIFACTS_BUCKET, DOCUMENTS_BUCKET, EXPORTS_BUCKET, get_store
+    from .phoenix_tracing import setup_phoenix
+except ImportError:
+    import cache as cache_mod
+    import db as db_mod
+    import extractor
+    import processor
+    from contracts import build_purchase_order_contract
+    from logging_config import configure_logging
+    from models import (
+        ExtractionJobStartOut,
+        ExtractionOut,
+        HealthOut,
+        JobOut,
+        JobStatusOut,
+        TemplateSaveResponse,
+        TemplateCreate,
+        TemplateListOut,
+        TemplateOut,
+        VendorCreate,
+        VendorOut,
+    )
+    from object_store import ARTIFACTS_BUCKET, DOCUMENTS_BUCKET, EXPORTS_BUCKET, get_store
+    from phoenix_tracing import setup_phoenix
 
 load_dotenv()
 
@@ -57,13 +88,12 @@ LLM_MODEL = os.getenv("LLM_MODEL", "qwen3vl")
 RATE_LIMIT = os.getenv("RATE_LIMIT_PER_MINUTE", "30")
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "50")) * 1024 * 1024
 
-# Track active extractions for cancellation: {extraction_id: asyncio.Event}
-_active_extractions: dict[int, asyncio.Event] = {}
-
-
 # -- Rate limiter -----------------------------------------------------------
 
 limiter = Limiter(key_func=get_remote_address, default_limits=[f"{RATE_LIMIT}/minute"])
+
+# -- Active extractions tracking for cancel/resume --------------------------
+_active_extractions: dict[str, asyncio.Event] = {}
 
 
 # -- Upload size middleware -------------------------------------------------
@@ -91,12 +121,95 @@ async def lifespan(app: FastAPI):
     app.state.pool = await db_mod.create_pool()
     await db_mod.init(app.state.pool)
     app.state.redis = await cache_mod.get_redis()
+    app.state.store = get_store()
     setup_phoenix()
-    logger.info("DB pool, Redis, and Phoenix ready")
+    logger.info("DB pool, Redis, object store, and Phoenix ready")
     yield
     logger.info("Shutting down -- closing connections")
     await app.state.pool.close()
     await app.state.redis.close()
+
+
+def _guess_mime_type(filename: str) -> str:
+    guessed, _ = mimetypes.guess_type(filename)
+    return guessed or "application/octet-stream"
+
+
+async def _load_page_payloads(pool, extraction_id: int) -> list[dict]:
+    store = get_store()
+    pages = await db_mod.get_pages(pool, extraction_id)
+    payloads = []
+    for page in pages:
+        raw = store.get_bytes(ARTIFACTS_BUCKET, page["object_key"])
+        payloads.append(
+            {
+                "page_number": page["page_number"],
+                "image_b64": base64.b64encode(raw).decode("ascii"),
+                "mime_type": page.get("mime_type", "image/jpeg"),
+                "width": page.get("width"),
+                "height": page.get("height"),
+            }
+        )
+    return payloads
+
+
+async def _submit_ingestion_job(
+    pool,
+    store,
+    *,
+    file_bytes: bytes,
+    filename: str,
+    vendor_id: str,
+    format_type: str,
+    header_fields: list[str],
+    line_item_fields: list[str],
+    source_type: str,
+    source_ref: str | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    object_key = f"documents/{vendor_id}/{uuid4().hex}_{filename}"
+    mime_type = _guess_mime_type(filename)
+    store.put_bytes(DOCUMENTS_BUCKET, object_key, file_bytes, mime_type)
+
+    document = await db_mod.create_document(
+        pool,
+        vendor_id=vendor_id,
+        filename=filename,
+        mime_type=mime_type,
+        size_bytes=len(file_bytes),
+        object_key=object_key,
+        source_type=source_type,
+        source_ref=source_ref,
+        metadata=metadata,
+    )
+
+    tmpl = await db_mod.get_template(pool, vendor_id)
+    template_id = tmpl["id"] if tmpl else None
+    extraction = await db_mod.create_extraction(
+        pool,
+        vendor_id=vendor_id,
+        template_id=template_id,
+        filename=filename,
+        total_pages=0,
+        format_type=format_type,
+        header_fields=header_fields,
+        line_item_fields=line_item_fields,
+        document_id=document["id"],
+    )
+    job = await db_mod.enqueue_job(
+        pool,
+        extraction_id=extraction["id"],
+        document_id=document["id"],
+        job_type="normalize",
+        payload={"extraction_id": extraction["id"], "document_id": document["id"]},
+    )
+    await db_mod.set_extraction_status(
+        pool,
+        extraction["id"],
+        "queued",
+        progress={"stage": "queued", "message": "Queued for background processing"},
+    )
+    return {"job": job, "extraction": extraction}
 
 
 # -- App --------------------------------------------------------------------
@@ -247,6 +360,11 @@ async def extract(
     Upload a PDF/image, extract fields via LLM.
     Returns SSE stream with page-by-page progress + final result.
     """
+    raise HTTPException(
+        status_code=410,
+        detail="The SSE /extract endpoint is deprecated. Use POST /ingest/ui then GET /jobs/{job_id}/stream for real-time progress.",
+    )
+
     pool = request.app.state.pool
     redis_client = request.app.state.redis
 
@@ -258,27 +376,39 @@ async def extract(
     req_items: list[str] = json.loads(line_item_fields) if line_item_fields else (tmpl["line_item_fields"] if tmpl else [])
     req_format: str = format_type or (tmpl["format_type"] if tmpl else "single_po_multipage")
 
-    # Build or retrieve system prompt
-    if tmpl and tmpl.get("system_prompt"):
-        system_prompt = tmpl["system_prompt"]
-    else:
-        # Build a fresh system prompt (auto-extract or no template saved yet)
-        instructions = tmpl["prompt_instructions"] if tmpl else None
-        rules = tmpl["extraction_rules"] if tmpl else []
-        system_prompt = extractor.build_system_prompt(
-            req_header, req_items, instructions, rules, req_format
-        )
+    # ── Trace: Prompt building / cache lookup ──
+    with trace_prompt_building(vendor_id) as prompt_ctx:
+        if tmpl and tmpl.get("system_prompt"):
+            system_prompt = tmpl["system_prompt"]
+            prompt_ctx["cache_hit"] = "template_db"
+            prompt_ctx["system_prompt"] = system_prompt
+        else:
+            instructions = tmpl["prompt_instructions"] if tmpl else None
+            rules = tmpl["extraction_rules"] if tmpl else []
+            system_prompt = extractor.build_system_prompt(
+                req_header, req_items, instructions, rules, req_format
+            )
+            prompt_ctx["cache_hit"] = "built_fresh"
+            prompt_ctx["system_prompt"] = system_prompt
 
     # 2. Read + convert file to pages
     file_bytes = await file.read()
     filename = file.filename or "unknown"
+    file_type = "pdf" if filename.lower().endswith(".pdf") else "image"
 
-    if filename.lower().endswith(".pdf"):
-        pages = await processor.pdf_to_images(file_bytes)
-    elif filename.lower().endswith((".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".webp")):
-        pages = await processor.image_file_to_b64(file_bytes)
-    else:
-        raise HTTPException(400, detail=f"Unsupported file type: {filename}")
+    # ── Trace: File upload ──
+    with trace_file_upload(filename, len(file_bytes), file_type):
+        pass  # file_bytes already read above
+
+    # ── Trace: PDF to images ──
+    with trace_pdf_rendering(filename) as render_ctx:
+        if filename.lower().endswith(".pdf"):
+            pages = await processor.pdf_to_images(file_bytes)
+        elif filename.lower().endswith((".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".webp")):
+            pages = await processor.image_file_to_b64(file_bytes)
+        else:
+            raise HTTPException(400, detail=f"Unsupported file type: {filename}")
+        render_ctx["pages_rendered"] = len(pages)
 
     # 3. Create extraction record
     template_id = tmpl["id"] if tmpl else None
@@ -295,103 +425,165 @@ async def extract(
     cancel_event = asyncio.Event()
     _active_extractions[extraction_id] = cancel_event
 
+    # Capture current OTel context so the SSE generator (which runs in a
+    # different async task) can attach to the same parent trace.
+    parent_otel_ctx = get_current_context()
+
     async def event_stream() -> AsyncGenerator[str, None]:
-        start = time.perf_counter()
-        error_msg: str | None = None
-        final_result = None
-        page_results = None
-        was_cancelled = False
-        last_completed_page = 0
-
-        async def on_page_done(page_num: int, total_pages: int, page_result: dict | None) -> None:
-            """SSE callback -- fires after each page is processed. Saves incrementally."""
-            progress_events.append({
-                "event": "progress",
-                "status": "processing",
-                "extraction_id": extraction_id,
-                "page": page_num,
-                "total_pages": total_pages,
-            })
-            # Save page result incrementally to DB
-            if page_result is not None:
-                try:
-                    await db_mod.update_extraction_result(
-                        pool, extraction_id, None, None, "processing", 0,
-                        page_results_partial=[page_result],
-                    )
-                except Exception as exc:
-                    logger.warning("Failed to save incremental page result: %s", exc)
-
-        progress_events: list[dict] = []
+        # Re-attach the parent OTel context so all spans nest under
+        # the same root trace that was started in the request handler.
+        ctx_token = attach_context(parent_otel_ctx)
 
         try:
-            extract_task = asyncio.create_task(
-                extractor.extract_document(
-                    pages=pages,
-                    header_fields=req_header,
-                    line_item_fields=req_items,
-                    system_prompt=system_prompt,
-                    format_type=req_format,
-                    llm_url=LLM_URL,
-                    model=LLM_MODEL,
-                    on_page_done=on_page_done,
-                    cancel_event=cancel_event,
-                )
-            )
+          with trace_extraction_pipeline(
+            extraction_id, vendor_id, filename, len(pages),
+            req_format, req_header, req_items,
+          ) as pipeline:
+            start = time.perf_counter()
+            error_msg: str | None = None
+            final_result = None
+            page_results = None
+            was_cancelled = False
+            last_completed_page = 0
 
-            # Poll for progress events while extraction runs
-            last_sent = 0
-            while not extract_task.done():
-                await asyncio.sleep(0.3)
+            async def on_page_done(page_num: int, total_pages: int, page_result: dict | None) -> None:
+                """SSE callback -- fires after each page is processed. Saves incrementally."""
+                progress_events.append({
+                    "event": "progress",
+                    "status": "processing",
+                    "extraction_id": extraction_id,
+                    "page": page_num,
+                    "total_pages": total_pages,
+                })
+                # Save page result incrementally to DB
+                if page_result is not None:
+                    try:
+                        await db_mod.update_extraction_result(
+                            pool, extraction_id, None, None, "processing", 0,
+                            page_results_partial=[page_result],
+                        )
+                    except Exception as exc:
+                        logger.warning("Failed to save incremental page result: %s", exc)
+
+            progress_events: list[dict] = []
+
+            try:
+                extract_task = asyncio.create_task(
+                    extractor.extract_document(
+                        pages=pages,
+                        header_fields=req_header,
+                        line_item_fields=req_items,
+                        system_prompt=system_prompt,
+                        format_type=req_format,
+                        llm_url=LLM_URL,
+                        model=LLM_MODEL,
+                        on_page_done=on_page_done,
+                        cancel_event=cancel_event,
+                    )
+                )
+
+                # Poll for progress events while extraction runs
+                last_sent = 0
+                while not extract_task.done():
+                    await asyncio.sleep(0.3)
+                    while last_sent < len(progress_events):
+                        evt = progress_events[last_sent]
+                        yield f"data: {json.dumps(evt)}\n\n"
+                        last_sent += 1
+
+                output = await extract_task
+                final_result = output["result"]
+                page_results = output["page_results"]
+                was_cancelled = output.get("cancelled", False)
+                last_completed_page = output.get("last_completed_page", 0)
+
+                # Flush remaining progress events
                 while last_sent < len(progress_events):
                     evt = progress_events[last_sent]
                     yield f"data: {json.dumps(evt)}\n\n"
                     last_sent += 1
 
-            output = await extract_task
-            final_result = output["result"]
-            page_results = output["page_results"]
-            was_cancelled = output.get("cancelled", False)
-            last_completed_page = output.get("last_completed_page", 0)
+            except Exception as exc:
+                error_msg = str(exc)
+                logger.error("Extraction %d failed: %s", extraction_id, error_msg)
 
-            # Flush remaining progress events
-            while last_sent < len(progress_events):
-                evt = progress_events[last_sent]
-                yield f"data: {json.dumps(evt)}\n\n"
-                last_sent += 1
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
 
-        except Exception as exc:
-            error_msg = str(exc)
-            logger.error("Extraction %d failed: %s", extraction_id, error_msg)
+            # Clean up active tracking
+            _active_extractions.pop(extraction_id, None)
 
-        elapsed_ms = int((time.perf_counter() - start) * 1000)
+            if error_msg:
+                pipeline["status"] = "failed"
+                pipeline["error"] = error_msg
+                await db_mod.update_extraction_result(
+                    pool, extraction_id, None, None, "failed", elapsed_ms, error=error_msg
+                )
+                yield f"data: {json.dumps({'event': 'error', 'status': 'failed', 'error': error_msg})}\n\n"
+            elif was_cancelled:
+                status = "partial" if page_results else "cancelled"
+                pipeline["status"] = status
+                pipeline["result"] = final_result
+                await db_mod.update_extraction_result(
+                    pool, extraction_id, final_result, page_results, status, elapsed_ms
+                )
+                yield f"data: {json.dumps({'event': 'cancelled', 'status': status, 'extraction_id': extraction_id, 'result': final_result, 'page_results': page_results, 'last_completed_page': last_completed_page, 'total_pages': len(pages), 'duration_ms': elapsed_ms})}\n\n"
+            else:
+                # ── Trace: PaddleOCR + text_matcher for field mapping ──
+                field_locations = {}
+                try:
+                    with trace_paddle_ocr(len(pages)) as ocr_ctx:
+                        ocr_pages = await ocr_runner.run_ocr_on_pages(pages)
+                        ocr_ctx["pages_processed"] = len(ocr_pages)
+                        ocr_ctx["total_words"] = sum(len(p.get("words", [])) for p in ocr_pages)
 
-        # Clean up active tracking
-        _active_extractions.pop(extraction_id, None)
+                    if ocr_pages and final_result:
+                        # Count header fields for tracing
+                        matchable_fields = len([
+                            k for k, v in final_result.items()
+                            if k != "line_items" and v is not None
+                        ]) if isinstance(final_result, dict) else 0
 
-        if error_msg:
-            await db_mod.update_extraction_result(
-                pool, extraction_id, None, None, "failed", elapsed_ms, error=error_msg
-            )
-            yield f"data: {json.dumps({'event': 'error', 'status': 'failed', 'error': error_msg})}\n\n"
-        elif was_cancelled:
-            status = "partial" if page_results else "cancelled"
-            await db_mod.update_extraction_result(
-                pool, extraction_id, final_result, page_results, status, elapsed_ms
-            )
-            yield f"data: {json.dumps({'event': 'cancelled', 'status': status, 'extraction_id': extraction_id, 'result': final_result, 'page_results': page_results, 'last_completed_page': last_completed_page, 'total_pages': len(pages), 'duration_ms': elapsed_ms})}\n\n"
-        else:
-            await db_mod.update_extraction_result(
-                pool, extraction_id, final_result, page_results, "done", elapsed_ms
-            )
-            await cache_mod.set_cached_extraction(redis_client, extraction_id, {
-                "id": extraction_id,
-                "result": final_result,
-                "page_results": page_results,
-                "status": "done",
-                "duration_ms": elapsed_ms,
-            })
-            yield f"data: {json.dumps({'event': 'done', 'status': 'done', 'extraction_id': extraction_id, 'result': final_result, 'total_pages': len(pages), 'duration_ms': elapsed_ms})}\n\n"
+                        with trace_text_matching(matchable_fields) as match_ctx:
+                            field_locations = text_matcher.compute_field_locations(
+                                final_result, ocr_pages, page_results=page_results
+                            )
+                            match_ctx["matched"] = len(field_locations)
+                            match_ctx["missed"] = matchable_fields - len(field_locations)
+                            # Count strategies used
+                            strategies: dict[str, int] = {}
+                            for loc in field_locations.values():
+                                strat = loc.get("strategy", "unknown")
+                                strategies[strat] = strategies.get(strat, 0) + 1
+                            match_ctx["strategies"] = strategies
+
+                    # ── Trace: DB persist ──
+                    with trace_db_persist(extraction_id, "persist_ocr"):
+                        await db_mod.save_ocr_data(pool, extraction_id, ocr_pages)
+                        await db_mod.save_field_locations(pool, extraction_id, field_locations)
+
+                except Exception as ocr_exc:
+                    logger.warning("OCR/matching failed for extraction %d: %s", extraction_id, ocr_exc)
+
+                # ── Trace: Final DB persist ──
+                with trace_db_persist(extraction_id, "persist_result"):
+                    await db_mod.update_extraction_result(
+                        pool, extraction_id, final_result, page_results, "done", elapsed_ms
+                    )
+                    await cache_mod.set_cached_extraction(redis_client, extraction_id, {
+                        "id": extraction_id,
+                        "result": final_result,
+                        "page_results": page_results,
+                        "field_locations": field_locations,
+                        "status": "done",
+                        "duration_ms": elapsed_ms,
+                    })
+
+                pipeline["status"] = "done"
+                pipeline["result"] = final_result
+                yield f"data: {json.dumps({'event': 'done', 'status': 'done', 'extraction_id': extraction_id, 'result': final_result, 'field_locations': field_locations, 'total_pages': len(pages), 'duration_ms': elapsed_ms})}\n\n"
+
+        finally:
+            detach_context(ctx_token)
 
     return StreamingResponse(
         event_stream(),
@@ -409,6 +601,11 @@ async def extract(
 @app.post("/extract/cancel/{extraction_id}")
 async def cancel_extraction(extraction_id: int):
     """Set the cancellation flag for a running extraction."""
+    raise HTTPException(
+        status_code=410,
+        detail="The legacy /extract/cancel endpoint is deprecated. Use /jobs/extractions/{extraction_id}/cancel.",
+    )
+
     cancel_event = _active_extractions.get(extraction_id)
     if not cancel_event:
         raise HTTPException(404, detail="No active extraction with that ID")
@@ -420,6 +617,11 @@ async def cancel_extraction(extraction_id: int):
 @limiter.limit("10/minute")
 async def resume_extraction(request: Request, extraction_id: int):
     """Resume an extraction from the last completed page."""
+    raise HTTPException(
+        status_code=410,
+        detail="The legacy /extract/resume endpoint is deprecated. Use /jobs/extractions/{extraction_id}/resume.",
+    )
+
     pool = request.app.state.pool
     redis_client = request.app.state.redis
 
@@ -468,95 +670,375 @@ async def resume_extraction(request: Request, extraction_id: int):
     cancel_event = asyncio.Event()
     _active_extractions[extraction_id] = cancel_event
 
+    # Capture OTel context for SSE generator
+    parent_otel_ctx = get_current_context()
+
     async def event_stream() -> AsyncGenerator[str, None]:
-        start = time.perf_counter()
-        error_msg: str | None = None
-        final_result = None
-        page_results = None
-        was_cancelled = False
-        last_completed_page = start_from - 1
-
-        yield f"data: {json.dumps({'event': 'resume', 'status': 'resuming', 'start_from_page': start_from, 'total_pages': len(pages)})}\n\n"
-
-        async def on_page_done(page_num: int, total_pages: int, page_result: dict | None) -> None:
-            progress_events.append({
-                "event": "progress", "status": "processing",
-                "page": page_num, "total_pages": total_pages,
-            })
-            if page_result is not None:
-                try:
-                    await db_mod.update_extraction_result(
-                        pool, extraction_id, None, None, "processing", 0,
-                        page_results_partial=[page_result],
-                    )
-                except Exception as exc:
-                    logger.warning("Failed to save incremental page result: %s", exc)
-
-        progress_events: list[dict] = []
+        ctx_token = attach_context(parent_otel_ctx)
 
         try:
-            extract_task = asyncio.create_task(
-                extractor.extract_document(
-                    pages=pages,
-                    header_fields=req_header,
-                    line_item_fields=req_items,
-                    system_prompt=system_prompt,
-                    format_type=req_format,
-                    llm_url=LLM_URL,
-                    model=LLM_MODEL,
-                    on_page_done=on_page_done,
-                    cancel_event=cancel_event,
-                    start_from_page=start_from,
-                    existing_page_results=existing_page_results,
-                )
-            )
+          with trace_extraction_pipeline(
+            extraction_id, vendor_id, filename, len(pages),
+            req_format, req_header, req_items,
+          ) as pipeline:
+            start = time.perf_counter()
+            error_msg: str | None = None
+            final_result = None
+            page_results = None
+            was_cancelled = False
+            last_completed_page = start_from - 1
 
-            last_sent = 0
-            while not extract_task.done():
-                await asyncio.sleep(0.3)
+            yield f"data: {json.dumps({'event': 'resume', 'status': 'resuming', 'start_from_page': start_from, 'total_pages': len(pages)})}\n\n"
+
+            async def on_page_done(page_num: int, total_pages: int, page_result: dict | None) -> None:
+                progress_events.append({
+                    "event": "progress", "status": "processing",
+                    "extraction_id": extraction_id,
+                    "page": page_num, "total_pages": total_pages,
+                })
+                if page_result is not None:
+                    try:
+                        await db_mod.update_extraction_result(
+                            pool, extraction_id, None, None, "processing", 0,
+                            page_results_partial=[page_result],
+                        )
+                    except Exception as exc:
+                        logger.warning("Failed to save incremental page result: %s", exc)
+
+            progress_events: list[dict] = []
+
+            try:
+                extract_task = asyncio.create_task(
+                    extractor.extract_document(
+                        pages=pages,
+                        header_fields=req_header,
+                        line_item_fields=req_items,
+                        system_prompt=system_prompt,
+                        format_type=req_format,
+                        llm_url=LLM_URL,
+                        model=LLM_MODEL,
+                        on_page_done=on_page_done,
+                        cancel_event=cancel_event,
+                        start_from_page=start_from,
+                        existing_page_results=existing_page_results,
+                    )
+                )
+
+                last_sent = 0
+                while not extract_task.done():
+                    await asyncio.sleep(0.3)
+                    while last_sent < len(progress_events):
+                        yield f"data: {json.dumps(progress_events[last_sent])}\n\n"
+                        last_sent += 1
+
+                output = await extract_task
+                final_result = output["result"]
+                page_results = output["page_results"]
+                was_cancelled = output.get("cancelled", False)
+                last_completed_page = output.get("last_completed_page", 0)
+
                 while last_sent < len(progress_events):
                     yield f"data: {json.dumps(progress_events[last_sent])}\n\n"
                     last_sent += 1
 
-            output = await extract_task
-            final_result = output["result"]
-            page_results = output["page_results"]
-            was_cancelled = output.get("cancelled", False)
-            last_completed_page = output.get("last_completed_page", 0)
+            except Exception as exc:
+                error_msg = str(exc)
+                logger.error("Resume extraction %d failed: %s", extraction_id, error_msg)
 
-            while last_sent < len(progress_events):
-                yield f"data: {json.dumps(progress_events[last_sent])}\n\n"
-                last_sent += 1
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            _active_extractions.pop(extraction_id, None)
 
-        except Exception as exc:
-            error_msg = str(exc)
-            logger.error("Resume extraction %d failed: %s", extraction_id, error_msg)
+            if error_msg:
+                pipeline["status"] = "failed"
+                pipeline["error"] = error_msg
+                await db_mod.update_extraction_result(
+                    pool, extraction_id, None, None, "failed", elapsed_ms, error=error_msg
+                )
+                yield f"data: {json.dumps({'event': 'error', 'status': 'failed', 'error': error_msg})}\n\n"
+            elif was_cancelled:
+                status = "partial" if page_results else "cancelled"
+                pipeline["status"] = status
+                pipeline["result"] = final_result
+                await db_mod.update_extraction_result(
+                    pool, extraction_id, final_result, page_results, status, elapsed_ms
+                )
+                yield f"data: {json.dumps({'event': 'cancelled', 'status': status, 'extraction_id': extraction_id, 'result': final_result, 'page_results': page_results, 'last_completed_page': last_completed_page, 'total_pages': len(pages), 'duration_ms': elapsed_ms})}\n\n"
+            else:
+                # ── Trace: PaddleOCR + text_matcher for field mapping ──
+                field_locations = {}
+                try:
+                    with trace_paddle_ocr(len(pages)) as ocr_ctx:
+                        ocr_pages = await ocr_runner.run_ocr_on_pages(pages)
+                        ocr_ctx["pages_processed"] = len(ocr_pages)
+                        ocr_ctx["total_words"] = sum(len(p.get("words", [])) for p in ocr_pages)
 
-        elapsed_ms = int((time.perf_counter() - start) * 1000)
-        _active_extractions.pop(extraction_id, None)
+                    if ocr_pages and final_result:
+                        matchable_fields = len([
+                            k for k, v in final_result.items()
+                            if k != "line_items" and v is not None
+                        ]) if isinstance(final_result, dict) else 0
 
-        if error_msg:
-            await db_mod.update_extraction_result(
-                pool, extraction_id, None, None, "failed", elapsed_ms, error=error_msg
-            )
-            yield f"data: {json.dumps({'event': 'error', 'status': 'failed', 'error': error_msg})}\n\n"
-        elif was_cancelled:
-            status = "partial" if page_results else "cancelled"
-            await db_mod.update_extraction_result(
-                pool, extraction_id, final_result, page_results, status, elapsed_ms
-            )
-            yield f"data: {json.dumps({'event': 'cancelled', 'status': status, 'extraction_id': extraction_id, 'result': final_result, 'page_results': page_results, 'last_completed_page': last_completed_page, 'total_pages': len(pages), 'duration_ms': elapsed_ms})}\n\n"
-        else:
-            await db_mod.update_extraction_result(
-                pool, extraction_id, final_result, page_results, "done", elapsed_ms
-            )
-            yield f"data: {json.dumps({'event': 'done', 'status': 'done', 'extraction_id': extraction_id, 'result': final_result, 'total_pages': len(pages), 'duration_ms': elapsed_ms})}\n\n"
+                        with trace_text_matching(matchable_fields) as match_ctx:
+                            field_locations = text_matcher.compute_field_locations(
+                                final_result, ocr_pages, page_results=page_results
+                            )
+                            match_ctx["matched"] = len(field_locations)
+                            match_ctx["missed"] = matchable_fields - len(field_locations)
+                            strategies: dict[str, int] = {}
+                            for loc in field_locations.values():
+                                strat = loc.get("strategy", "unknown")
+                                strategies[strat] = strategies.get(strat, 0) + 1
+                            match_ctx["strategies"] = strategies
+
+                    with trace_db_persist(extraction_id, "persist_ocr"):
+                        await db_mod.save_ocr_data(pool, extraction_id, ocr_pages)
+                        await db_mod.save_field_locations(pool, extraction_id, field_locations)
+
+                except Exception as ocr_exc:
+                    logger.warning("OCR/matching failed for resume %d: %s", extraction_id, ocr_exc)
+
+                # ── Trace: Final DB persist ──
+                with trace_db_persist(extraction_id, "persist_result"):
+                    await db_mod.update_extraction_result(
+                        pool, extraction_id, final_result, page_results, "done", elapsed_ms
+                    )
+
+                pipeline["status"] = "done"
+                pipeline["result"] = final_result
+                yield f"data: {json.dumps({'event': 'done', 'status': 'done', 'extraction_id': extraction_id, 'result': final_result, 'field_locations': field_locations, 'total_pages': len(pages), 'duration_ms': elapsed_ms})}\n\n"
+
+        finally:
+            detach_context(ctx_token)
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
+
+
+# -- Durable Job APIs -------------------------------------------------------
+
+@app.post("/ingest/{source_type}", response_model=ExtractionJobStartOut)
+@limiter.limit("10/minute")
+async def ingest_document(
+    request: Request,
+    source_type: str,
+    file: UploadFile = File(...),
+    vendor_id: str = Form(...),
+    format_type: str = Form("single_po_multipage"),
+    header_fields: str = Form(None),
+    line_item_fields: str = Form(None),
+    source_ref: str = Form(None),
+):
+    if source_type not in {"ui", "rest", "email", "s3", "sftp", "partner"}:
+        raise HTTPException(400, detail=f"Unsupported source_type '{source_type}'")
+
+    submitted = await _submit_ingestion_job(
+        request.app.state.pool,
+        request.app.state.store,
+        file_bytes=await file.read(),
+        filename=file.filename or "unknown",
+        vendor_id=vendor_id,
+        format_type=format_type,
+        header_fields=json.loads(header_fields) if header_fields else [],
+        line_item_fields=json.loads(line_item_fields) if line_item_fields else [],
+        source_type=source_type,
+        source_ref=source_ref,
+    )
+    return ExtractionJobStartOut(
+        job_id=submitted["job"]["id"],
+        extraction_id=submitted["extraction"]["id"],
+        status=submitted["job"]["status"],
+    )
+
+
+@app.get("/jobs/{job_id}", response_model=JobStatusOut)
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_job_status(request: Request, job_id: int):
+    pool = request.app.state.pool
+    job = await db_mod.get_job(pool, job_id)
+    if not job:
+        raise HTTPException(404, detail="Job not found")
+    extraction = await db_mod.get_extraction(pool, job["extraction_id"]) if job.get("extraction_id") else None
+    if extraction and extraction.get("status") not in {"done", "failed", "partial", "cancelled"}:
+        latest_job = await db_mod.get_latest_job_for_extraction(pool, extraction["id"])
+        if latest_job:
+            job = latest_job
+    return JobStatusOut(
+        job=JobOut(**job),
+        extraction=ExtractionOut(**extraction) if extraction else None,
+    )
+
+
+@app.get("/jobs/{job_id}/stream")
+async def stream_job_status_sse(request: Request, job_id: int):
+    """SSE stream for real-time job progress.
+
+    One persistent connection replaces client-side polling.
+    The server checks the DB every ~1 second and pushes changes
+    as SSE events. Heavy JSONB fields (result, ocr_data, …) are
+    only included in the terminal event to keep progress messages tiny.
+
+    No rate limiter — this is one long-lived connection, not repeated requests.
+    """
+    pool = request.app.state.pool
+    job = await db_mod.get_job(pool, job_id)
+    if not job:
+        raise HTTPException(404, detail="Job not found")
+
+    _HEAVY_KEYS = frozenset({
+        "result", "page_results", "ocr_data", "field_locations",
+        "corrected_result", "correction_meta",
+    })
+
+    def _serialize(obj):
+        """JSON serializer for datetime and other non-serializable types."""
+        if hasattr(obj, "isoformat"):
+            return obj.isoformat()
+        return str(obj)
+
+    def _slim(ext):
+        """Strip heavy JSONB fields for progress events."""
+        if not ext:
+            return None
+        return {k: v for k, v in ext.items() if k not in _HEAVY_KEYS}
+
+    async def _generate():
+        last_fingerprint = None
+
+        while True:
+            if await request.is_disconnected():
+                break
+
+            current_job = await db_mod.get_job(pool, job_id)
+            if not current_job:
+                yield f"data: {json.dumps({'event': 'error', 'error': 'Job not found'})}\n\n"
+                break
+
+            extraction = None
+            if current_job.get("extraction_id"):
+                extraction = await db_mod.get_extraction(pool, current_job["extraction_id"])
+                
+                # Fetch the latest job for this extraction because the pipeline
+                # creates new sequential jobs for ocr, llm, and postprocess.
+                if extraction and extraction.get("status") not in {"done", "failed", "partial", "cancelled"}:
+                    latest_job = await db_mod.get_latest_job_for_extraction(pool, extraction["id"])
+                    if latest_job:
+                        current_job = latest_job
+
+            ext_status = extraction["status"] if extraction else None
+            job_status = current_job["status"]
+            
+            # If this job belongs to an extraction pipeline, only the extraction's
+            # status determines if we are done. Otherwise, use the job's status.
+            if extraction:
+                is_terminal = ext_status in ("done", "failed", "partial", "cancelled")
+            else:
+                is_terminal = job_status in ("done", "failed", "cancelled")
+
+            # Cheap fingerprint to detect state changes
+            ext_progress = extraction.get("progress") if extraction else ""
+            fingerprint = f"{job_status}|{ext_status}|{ext_progress}"
+
+            if fingerprint != last_fingerprint or is_terminal:
+                if is_terminal:
+                    if ext_status == "failed" or job_status == "failed":
+                        etype = "failed"
+                    elif ext_status == "done":
+                        etype = "done"
+                    else:
+                        etype = "partial"
+                    payload = {"event": etype, "job": current_job, "extraction": extraction}
+                else:
+                    payload = {
+                        "event": "progress",
+                        "job": {k: v for k, v in current_job.items() if k != "payload"},
+                        "extraction": _slim(extraction),
+                    }
+
+                yield f"data: {json.dumps(payload, default=_serialize)}\n\n"
+                last_fingerprint = fingerprint
+
+            if is_terminal:
+                break
+
+            await asyncio.sleep(1.0)
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/jobs/extractions/{extraction_id}/cancel")
+@limiter.limit("10/minute")
+async def request_job_cancel(request: Request, extraction_id: int):
+    pool = request.app.state.pool
+    extraction = await db_mod.get_extraction(pool, extraction_id)
+    if not extraction:
+        raise HTTPException(404, detail="Extraction not found")
+    await db_mod.set_cancel_requested(pool, extraction_id, True)
+    await db_mod.cancel_jobs_for_extraction(pool, extraction_id)
+    await db_mod.set_extraction_status(
+        pool,
+        extraction_id,
+        "cancelling",
+        progress={"stage": "cancel", "message": "Cancellation requested"},
+    )
+    latest_job = await db_mod.get_latest_job_for_extraction(pool, extraction_id)
+    return {"status": "cancelling", "extraction_id": extraction_id, "job_id": latest_job["id"] if latest_job else None}
+
+
+@app.post("/jobs/extractions/{extraction_id}/resume", response_model=ExtractionJobStartOut)
+@limiter.limit("10/minute")
+async def queue_resume_extraction(request: Request, extraction_id: int):
+    pool = request.app.state.pool
+    extraction = await db_mod.get_extraction(pool, extraction_id)
+    if not extraction:
+        raise HTTPException(404, detail="Extraction not found")
+    if extraction["status"] not in ("partial", "cancelled", "failed", "cancelling"):
+        raise HTTPException(400, detail=f"Cannot resume extraction with status '{extraction['status']}'")
+
+    jobs = await db_mod.list_jobs_for_extraction(pool, extraction_id)
+    inflight_jobs = [job for job in jobs if job["status"] in ("queued", "running", "cancelling")]
+    if inflight_jobs:
+        raise HTTPException(409, detail="Cannot resume while prior jobs are still draining")
+
+    pages = await db_mod.get_pages(pool, extraction_id)
+    if not pages:
+        raise HTTPException(400, detail="No rendered pages available for this extraction")
+
+    existing_page_results = extraction.get("page_results") or []
+    completed_page_nums = {pr["_page"] for pr in existing_page_results if "_error" not in pr}
+    all_page_nums = {p["page_number"] for p in pages}
+    missing_pages = sorted(all_page_nums - completed_page_nums)
+    start_from = missing_pages[0] if missing_pages else len(pages) + 1
+
+    await db_mod.set_cancel_requested(pool, extraction_id, False)
+    job = await db_mod.enqueue_job(
+        pool,
+        extraction_id=extraction_id,
+        document_id=extraction.get("document_id"),
+        job_type="llm",
+        payload={
+            "extraction_id": extraction_id,
+            "start_from_page": start_from,
+            "existing_page_results": existing_page_results,
+        },
+    )
+    await db_mod.set_extraction_status(
+        pool,
+        extraction_id,
+        "queued",
+        progress={"stage": "resume", "message": f"Queued resume from page {start_from}"},
+    )
+    return ExtractionJobStartOut(job_id=job["id"], extraction_id=extraction_id, status=job["status"])
 
 
 # -- Extraction queries -----------------------------------------------------
@@ -587,8 +1069,7 @@ async def get_extraction_pages(request: Request, extraction_id: int):
     if not extraction:
         raise HTTPException(404, detail="Extraction not found")
 
-    pages = await db_mod.get_pages(pool, extraction_id)
-    return pages
+    return await _load_page_payloads(pool, extraction_id)
 
 
 @app.get("/vendors/{vendor_id}/extractions", response_model=list[ExtractionOut])
@@ -639,6 +1120,195 @@ async def upload_preview(
         raise HTTPException(400, detail=f"Unsupported file type: {filename}")
 
     return {"filename": filename, "total_pages": len(pages), "pages": pages}
+
+
+# -- Review: OCR Data for Click-to-Select -----------------------------------
+
+@app.get("/extractions/{extraction_id}/ocr")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_extraction_ocr(request: Request, extraction_id: int):
+    """Return PaddleOCR word data for the click-to-select correction UI."""
+    ocr_data = await db_mod.get_ocr_data(request.app.state.pool, extraction_id)
+    if ocr_data is None:
+        raise HTTPException(404, detail="No OCR data found for this extraction")
+    return {"extraction_id": extraction_id, "ocr_pages": ocr_data}
+
+
+# -- Review: Save Corrections -----------------------------------------------
+
+def _compute_correction_diff(original: dict, corrected: dict) -> dict:
+    """Compute which fields changed between original and corrected results.
+
+    Returns a dict of {field_name: {"original": ..., "corrected": ...}} for
+    changed fields only. Line items are compared as a whole array.
+    """
+    diff: dict = {}
+    all_keys = set(list(original.keys()) + list(corrected.keys()))
+    for key in all_keys:
+        orig_val = original.get(key)
+        corr_val = corrected.get(key)
+        if orig_val != corr_val:
+            diff[key] = {"original": orig_val, "corrected": corr_val}
+    return diff
+
+@app.put("/extractions/{extraction_id}/corrections")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def save_extraction_corrections(request: Request, extraction_id: int):
+    """Persist user corrections from the Review page.
+
+    Saves to corrected_result (original result stays immutable).
+    Auto-creates a gold example for this vendor if fields were changed.
+    Invalidates prompt cache so next extraction uses the gold example.
+    """
+    body = await request.json()
+    corrected_result = body.get("corrected_result")
+    field_locations = body.get("field_locations", {})
+    actor = body.get("actor") or "ui"
+    reason_code = body.get("reason_code") or "manual_review"
+    note = body.get("note")
+
+    if corrected_result is None:
+        raise HTTPException(400, detail="corrected_result is required")
+
+    pool = request.app.state.pool
+
+    # Get original extraction to compare and create gold example
+    extraction = await db_mod.get_extraction(pool, extraction_id)
+    if not extraction:
+        raise HTTPException(404, detail=f"Extraction {extraction_id} not found")
+
+    original_result = extraction.get("result") or {}
+
+    # Compute correction diff
+    correction_diff = _compute_correction_diff(original_result, corrected_result)
+
+    correction_meta = {
+        "corrected_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "fields_changed": list(correction_diff.keys()) if correction_diff else [],
+        "reason_code": reason_code,
+        "actor": actor,
+    }
+
+    updated = await db_mod.save_corrections(
+        pool,
+        extraction_id,
+        corrected_result,
+        field_locations,
+        correction_meta=correction_meta,
+    )
+    if not updated:
+        raise HTTPException(404, detail=f"Extraction {extraction_id} not found")
+
+    review_event_id = await db_mod.create_review_event(
+        pool,
+        extraction_id=extraction_id,
+        actor=actor,
+        reason_code=reason_code,
+        note=note,
+        before_result=original_result,
+        after_result=corrected_result,
+        before_locations=extraction.get("field_locations") or {},
+        after_locations=field_locations,
+        diff=correction_diff,
+    )
+
+    # Auto-create gold example if any fields were actually changed
+    gold_id = None
+    vendor_id = extraction.get("vendor_id")
+    if correction_diff and vendor_id:
+        try:
+            gold_id = await db_mod.save_gold_example(
+                pool, vendor_id, extraction_id,
+                original_result, corrected_result,
+                correction_diff=correction_diff,
+            )
+            logger.info("Gold example %d created for vendor=%s extraction=%d (changed: %s)",
+                        gold_id, vendor_id, extraction_id, ", ".join(correction_diff.keys()))
+
+            # Invalidate prompt cache — next extraction will rebuild with gold example
+            redis = getattr(request.app.state, "redis", None)
+            if redis is not None:
+                await cache_mod.invalidate_vendor_cache(redis, vendor_id)
+                logger.info("Prompt cache invalidated for vendor=%s", vendor_id)
+        except Exception as exc:
+            logger.warning("Failed to create gold example for extraction %d: %s", extraction_id, exc)
+
+    await db_mod.ensure_job(
+        pool,
+        extraction_id=extraction_id,
+        document_id=extraction.get("document_id"),
+        job_type="outbound",
+        payload={"extraction_id": extraction_id, "trigger": "review"},
+    )
+
+    return {
+        "status": "saved",
+        "extraction_id": extraction_id,
+        "fields_changed": list(correction_diff.keys()) if correction_diff else [],
+        "gold_example_id": gold_id,
+        "review_event_id": review_event_id,
+    }
+
+
+@app.get("/extractions/{extraction_id}/reviews")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_extraction_reviews(request: Request, extraction_id: int):
+    extraction = await db_mod.get_extraction(request.app.state.pool, extraction_id)
+    if not extraction:
+        raise HTTPException(404, detail="Extraction not found")
+    return {"extraction_id": extraction_id, "reviews": await db_mod.list_review_events(request.app.state.pool, extraction_id)}
+
+
+@app.get("/extractions/{extraction_id}/contract")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_extraction_contract(request: Request, extraction_id: int):
+    extraction = await db_mod.get_extraction(request.app.state.pool, extraction_id)
+    if not extraction:
+        raise HTTPException(404, detail="Extraction not found")
+    return build_purchase_order_contract(extraction)
+
+
+@app.get("/extractions/{extraction_id}/export.xlsx")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def download_extraction_excel(request: Request, extraction_id: int):
+    pool = request.app.state.pool
+    extraction = await db_mod.get_extraction(pool, extraction_id)
+    if not extraction:
+        raise HTTPException(404, detail="Extraction not found")
+    object_key = extraction.get("export_object_key")
+    if not object_key:
+        raise HTTPException(404, detail="Excel export not available yet")
+    payload = request.app.state.store.get_bytes(EXPORTS_BUCKET, object_key)
+    filename = f"extraction_{extraction_id}.xlsx"
+    return Response(
+        content=payload,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/extractions/{extraction_id}/export.csv")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def download_extraction_csv(request: Request, extraction_id: int):
+    pool = request.app.state.pool
+    extraction = await db_mod.get_extraction(pool, extraction_id)
+    if not extraction:
+        raise HTTPException(404, detail="Extraction not found")
+    xlsx_key = extraction.get("export_object_key")
+    if not xlsx_key:
+        raise HTTPException(404, detail="CSV export not available yet")
+    csv_key = xlsx_key.replace(".xlsx", ".csv")
+    try:
+        payload = request.app.state.store.get_bytes(EXPORTS_BUCKET, csv_key)
+    except Exception as exc:
+        raise HTTPException(404, detail="CSV export not available yet") from exc
+    filename = f"extraction_{extraction_id}.csv"
+    return Response(
+        content=payload,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
 
 
 # -- Static Frontend --------------------------------------------------------

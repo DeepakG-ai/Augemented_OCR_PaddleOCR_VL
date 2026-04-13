@@ -2,7 +2,8 @@ fastapi
 uvicorn[standard]
 asyncpg
 httpx
-pymupdf
+pypdfium2
+Pillow
 python-multipart
 slowapi
 python-dotenv
@@ -10,6 +11,10 @@ pydantic
 redis
 aiofiles
 websockets
+minio
+openpyxl
+paddlepaddle
+paddleocr
 arize-phoenix[evals]
 opentelemetry-api
 opentelemetry-sdk

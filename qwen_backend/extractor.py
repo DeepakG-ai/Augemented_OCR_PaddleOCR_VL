@@ -18,8 +18,24 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
-import cache as cache_mod
-import db as db_mod
+try:
+    from . import cache as cache_mod
+    from . import db as db_mod
+    from .phoenix_tracing import (
+        trace_llm_call,
+        trace_page_extraction,
+        trace_build_user_message,
+        trace_merge_results,
+    )
+except ImportError:
+    import cache as cache_mod
+    import db as db_mod
+    from phoenix_tracing import (
+        trace_llm_call,
+        trace_page_extraction,
+        trace_build_user_message,
+        trace_merge_results,
+    )
 
 logger = logging.getLogger("extractor")
 
@@ -49,8 +65,15 @@ def build_system_prompt(
     instructions: str | None,
     rules: list[str],
     format_type: str,
+    gold_examples: list[dict] | None = None,
 ) -> str:
-    """Build the reusable system prompt. Stored in DB and cached in Redis."""
+    """Build the reusable system prompt. Stored in DB and cached in Redis.
+
+    Args:
+        gold_examples: Optional list of human-verified correct extractions
+            for this vendor. Injected as few-shot examples so the LLM learns
+            from past corrections.
+    """
 
     fmt_desc = _FORMAT_DESCRIPTIONS.get(format_type, _FORMAT_DESCRIPTIONS["single_page"])
 
@@ -69,11 +92,27 @@ def build_system_prompt(
 {numbered}
 </extraction_rules>"""
 
+    # Few-shot gold examples from human corrections
+    gold_section = ""
+    if gold_examples:
+        examples_json = "\n---\n".join(
+            json.dumps(ex["corrected_result"], indent=2, ensure_ascii=False)
+            for ex in gold_examples[:2]  # max 2 to save context window
+        )
+        gold_section = f"""
+<verified_examples>
+The following are human-verified correct extractions for this vendor's documents.
+Use them as reference for field formatting, value style, and expected output structure:
+
+{examples_json}
+</verified_examples>"""
+
     return f"""You are a highly accurate document data extraction assistant.
 Extract ONLY what is explicitly visible in the document image.
 Never guess or fabricate data. If a field is not visible, set it to null.
 {context_section}
 {rules_section}
+{gold_section}
 <document_format>
 {fmt_desc}
 </document_format>
@@ -178,6 +217,7 @@ def compute_prompt_hash(
     instructions: str | None,
     rules: list[str],
     format_type: str = "single_page",
+    gold_examples: list[dict] | None = None,
 ) -> str:
     payload = json.dumps({
         "header_fields": sorted(header_fields),
@@ -185,6 +225,13 @@ def compute_prompt_hash(
         "instructions": instructions or "",
         "rules": sorted(rules),
         "format_type": format_type,
+        "gold_examples": [
+            {
+                "corrected_result": ex.get("corrected_result"),
+                "correction_diff": ex.get("correction_diff"),
+            }
+            for ex in (gold_examples or [])
+        ],
     }, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()
 
@@ -194,26 +241,38 @@ async def get_or_build_system_prompt(
     header_fields: list[str], line_item_fields: list[str],
     instructions: str | None, rules: list[str], format_type: str,
 ) -> tuple[str, str]:
-    """Returns (system_prompt, prompt_hash). Cache: Redis → DB → build."""
+    """Returns (system_prompt, prompt_hash). Cache: Redis → DB → build.
 
-    prompt_hash = compute_prompt_hash(header_fields, line_item_fields, instructions, rules, format_type)
+    Includes gold examples from past human corrections in the prompt.
+    """
+
+    # Fetch gold examples for this vendor (max 2)
+    gold_examples = await db_mod.get_gold_examples(pool, vendor_id, limit=2)
+
+    prompt_hash = compute_prompt_hash(
+        header_fields, line_item_fields, instructions, rules, format_type,
+        gold_examples=gold_examples,
+    )
 
     # 1. Redis
     cached = await cache_mod.get_cached_prompt(redis_client, vendor_id, prompt_hash)
     if cached:
-        logger.info("Prompt cache HIT (Redis) vendor=%s hash=%s", vendor_id, prompt_hash[:12])
+        logger.info("Prompt cache HIT (Redis) vendor=%s hash=%s gold=%d", vendor_id, prompt_hash[:12], len(gold_examples))
         return cached, prompt_hash
 
     # 2. DB
     tmpl = await db_mod.get_template(pool, vendor_id)
     if tmpl and tmpl.get("prompt_hash") == prompt_hash and tmpl.get("system_prompt"):
-        logger.info("Prompt cache HIT (DB) vendor=%s hash=%s", vendor_id, prompt_hash[:12])
+        logger.info("Prompt cache HIT (DB) vendor=%s hash=%s gold=%d", vendor_id, prompt_hash[:12], len(gold_examples))
         await cache_mod.set_cached_prompt(redis_client, vendor_id, prompt_hash, tmpl["system_prompt"])
         return tmpl["system_prompt"], prompt_hash
 
-    # 3. Build fresh
-    logger.info("Prompt cache MISS — building vendor=%s hash=%s", vendor_id, prompt_hash[:12])
-    system_prompt = build_system_prompt(header_fields, line_item_fields, instructions, rules, format_type)
+    # 3. Build fresh (includes gold examples)
+    logger.info("Prompt cache MISS — building vendor=%s hash=%s gold=%d", vendor_id, prompt_hash[:12], len(gold_examples))
+    system_prompt = build_system_prompt(
+        header_fields, line_item_fields, instructions, rules, format_type,
+        gold_examples=gold_examples,
+    )
 
     await db_mod.upsert_template(
         pool, vendor_id, format_type,
@@ -233,40 +292,53 @@ _FENCE_END_RE = re.compile(r"\n?```\s*$", re.MULTILINE)
 
 async def call_llm(
     image_b64: str, system_prompt: str, user_message: str,
-    llm_url: str, model: str, mime_type: str = "image/png",
+    llm_url: str, model: str, mime_type: str = "image/jpeg",
+    page_num: int = 0, total_pages: int = 0,
 ) -> dict:
     """POST to LLM, strip markdown fences, return parsed JSON dict."""
 
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{image_b64}"},
+                },
+                {"type": "text", "text": user_message},
+            ],
+        },
+    ]
+
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{mime_type};base64,{image_b64}"},
-                    },
-                    {"type": "text", "text": user_message},
-                ],
-            },
-        ],
+        "messages": messages,
         "temperature": 0.7,
         "top_p": 0.8,
         "presence_penalty": 1.5,
-        "top_k": 20,
         "max_tokens": 6000,
     }
 
-    async with httpx.AsyncClient(timeout=180.0) as client:
-        resp = await client.post(llm_url, json=payload)
-        resp.raise_for_status()
+    with trace_llm_call(model, messages, temperature=0.7, page_num=page_num, total_pages=total_pages) as trace_ctx:
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            resp = await client.post(llm_url, json=payload)
+            if resp.status_code != 200:
+                body = resp.text[:1000]
+                logger.error("LLM HTTP %d from %s — body: %s", resp.status_code, llm_url, body)
+            resp.raise_for_status()
 
-    raw: str = resp.json()["choices"][0]["message"]["content"].strip()
+        resp_json = resp.json()
+        trace_ctx["response"] = resp_json["choices"][0]["message"]["content"]
+        trace_ctx["usage"] = resp_json.get("usage", {})
+
+    raw: str = resp_json["choices"][0]["message"]["content"].strip()
     raw = _JSON_FENCE_RE.sub("", raw)
     raw = _FENCE_END_RE.sub("", raw)
     raw = raw.strip()
+
+    # Fix invalid JSON: numbers with leading zeros (e.g. 0070 -> "0070")
+    raw = re.sub(r'([\[:,]\s*)(-?0[0-9]+)(\s*[\]},])', r'\1"\2"\3', raw)
 
     try:
         return json.loads(raw)
@@ -332,20 +404,31 @@ async def extract_document(
     # Helper — runs inside asyncio.gather, never raises
     async def _process_page(page: dict) -> dict:
         page_num = page["page_number"]
-        user_msg = build_user_message(header_fields, line_item_fields, page_num, total)
-        try:
-            result = await call_llm(
-                page["image_b64"], system_prompt, user_msg, llm_url, model,
-                mime_type=page.get("mime_type", "image/png"),
-            )
-            result["_page"] = page_num
-            result["_total_pages"] = total
-            logger.info("Page %d/%d done — %d line item(s)",
-                        page_num, total, len(result.get("line_items") or []))
-            return result
-        except (ValueError, httpx.HTTPError) as exc:
-            logger.error("Page %d extraction failed: %s", page_num, exc)
-            return {"_page": page_num, "_total_pages": total, "_error": str(exc)}
+
+        with trace_page_extraction(page_num, total) as page_ctx:
+            # Build user message with tracing
+            with trace_build_user_message(page_num, total) as msg_ctx:
+                user_msg = build_user_message(header_fields, line_item_fields, page_num, total)
+                msg_ctx["user_message"] = user_msg
+
+            page_ctx["user_message"] = user_msg
+
+            try:
+                result = await call_llm(
+                    page["image_b64"], system_prompt, user_msg, llm_url, model,
+                    mime_type=page.get("mime_type", "image/jpeg"),
+                    page_num=page_num, total_pages=total,
+                )
+                result["_page"] = page_num
+                result["_total_pages"] = total
+                logger.info("Page %d/%d done — %d line item(s)",
+                            page_num, total, len(result.get("line_items") or []))
+                page_ctx["result"] = result
+                return result
+            except (ValueError, httpx.HTTPError) as exc:
+                logger.error("Page %d extraction failed: %s", page_num, exc)
+                page_ctx["error"] = str(exc)
+                return {"_page": page_num, "_total_pages": total, "_error": str(exc)}
 
     # Process in batches of PARALLEL_BATCH
     for batch_start in range(0, len(pending_pages), PARALLEL_BATCH):
@@ -394,7 +477,13 @@ async def extract_document(
     else:
         # single_po_multipage — merge header from page 1 + line_items from all
         # merge_results already filters out _error pages internally
-        final = merge_results(page_results, header_fields, line_item_fields)
+        with trace_merge_results(total, format_type) as merge_ctx:
+            final = merge_results(page_results, header_fields, line_item_fields)
+            if isinstance(final, dict):
+                merge_ctx["merged_line_items"] = len(final.get("line_items", []))
+                merge_ctx["merged_fields"] = len([
+                    k for k in final.keys() if k != "line_items"
+                ])
 
     return {
         "result": final,
@@ -412,7 +501,7 @@ def merge_results(
     line_item_fields: list[str],
 ) -> dict:
     """
-    Header from page 1. Line items concatenated from all pages with dedup.
+    Header from page 1. Line items concatenated from all pages.
     Works for both auto-extract and extract-fields mode.
     """
     valid_pages = [pr for pr in page_results if "_error" not in pr]
@@ -435,28 +524,13 @@ def merge_results(
 
     # ── Line items: concat from all pages, deduplicate ──
     all_items: list[dict] = []
-    seen: set[tuple] = set()
-
-    # Determine dedup key columns
-    if line_item_fields:
-        dedup_cols = line_item_fields[:3]
-    else:
-        dedup_cols = []
-        for pr in valid_pages:
-            items = pr.get("line_items")
-            if isinstance(items, list) and items:
-                dedup_cols = list(items[0].keys())[:3]
-                break
 
     for pr in valid_pages:
         items = pr.get("line_items")
         if not isinstance(items, list):
             continue
         for item in items:
-            key = tuple(str(item.get(col, "")).strip().lower() for col in dedup_cols)
-            if key not in seen:
-                seen.add(key)
-                all_items.append(item)
+            all_items.append(item)
 
     merged["line_items"] = all_items
     return merged
