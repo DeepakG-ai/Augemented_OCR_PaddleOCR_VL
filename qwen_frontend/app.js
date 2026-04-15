@@ -322,6 +322,19 @@ async function renderTemplatePage(app, vendorId) {
     const instructions = tmpl ? (tmpl.prompt_instructions || '') : '';
     const hash = tmpl ? (tmpl.prompt_hash || '') : '';
 
+    window.tplSysPrompt = tmpl && tmpl.system_prompt ? tmpl.system_prompt : 'No system prompt generated yet. Run an extraction.';
+    window.tplUsrPrompt = tmpl && tmpl.user_prompt ? tmpl.user_prompt : 'No user message available.';
+    window.tplShowPrompt = function (type) {
+        const el = document.getElementById('tplPromptPreview');
+        if (!el) return;
+        el.value = type === 'system' ? window.tplSysPrompt : window.tplUsrPrompt;
+        document.getElementById('btnSysPrompt').style = type === 'system' ? 'background:var(--blue-bg);color:var(--blue);border-color:var(--blue)' : '';
+        document.getElementById('btnUsrPrompt').style = type === 'user' ? 'background:var(--blue-bg);color:var(--blue);border-color:var(--blue)' : '';
+        document.getElementById('tplPromptDesc').textContent = type === 'system' ?
+            'This is the exact system prompt sent to Qwen3-VL.' :
+            'This is the dynamic user message sent for page 1.';
+    };
+
     app.innerHTML = headerHTML() + `
     <div class="page-content">
         <div class="page-title">⚙ Template — ${tplVendorName}</div>
@@ -353,16 +366,25 @@ async function renderTemplatePage(app, vendorId) {
                     <span class="rule-example" onclick="tplAddRuleText('Numbers must be numeric, not strings')">Numbers must be numeric</span>
                     <span class="rule-example" onclick="tplAddRuleText('Dates in DD/MM/YYYY format')">Dates DD/MM/YYYY</span>
                     <span class="rule-example" onclick="tplAddRuleText('Skip rows with empty description')">Skip empty rows</span>
-                </div>
-            </div>
         </div>
-        <button class="tpl-save-btn" onclick="saveTplConfig()">💾 Save Template</button>
+        <div class="tpl-panel" style="margin-top:16px; grid-column: 1 / -1;">
+            <div style="display:flex; gap:8px; margin-bottom:8px; align-items:center;">
+                <div class="tpl-panel-title" style="margin-bottom:0">Prompt Previews</div>
+                <div style="flex:1"></div>
+                <button id="btnSysPrompt" class="small-btn" onclick="tplShowPrompt('system')">System Prompt</button>
+                <button id="btnUsrPrompt" class="small-btn" onclick="tplShowPrompt('user')">User Message (Page 1)</button>
+            </div>
+            <textarea id="tplPromptPreview" class="prompt-area" style="min-height:400px;font-family:monospace;font-size:11px;background:var(--bg);color:var(--text);border:1px solid var(--border);" readonly></textarea>
+            <div id="tplPromptDesc" style="font-size:10px;color:var(--text-dim);margin-top:8px">This is the exact system prompt sent to Qwen3-VL.</div>
+        </div>
+        <button class="tpl-save-btn" style="margin-top:16px" onclick="saveTplConfig()">💾 Save Template</button>
     </div>
     <div class="bottom-bar">
         <span style="font-size:10px;color:var(--text-dim);letter-spacing:0.1em">VENDOR: ${tplVendorName} · ${headerFields.length} HEADER FIELDS · ${lineItemFields.length} LINE COLUMNS · ${extractionRules.length} RULES</span>
     </div>`;
 
     tplRenderHeaders(); tplRenderLines(); tplRenderRules(); updateTplFormatHint(); updateNavActive();
+    tplShowPrompt('system');
 }
 
 function tplAddHeader() {
@@ -805,6 +827,210 @@ function applyZoom() {
     if (info) info.textContent = `ZOOM: ${zoomLevel}% · DRAG TO PAN`;
 }
 
+// ── PIPELINE VISUALIZATION ─────────────────────────────────────────────
+let _pipelineStartTime = null;
+let _pipelineTimerInterval = null;
+
+const PIPELINE_STAGES = [
+    { id: 'upload',      label: 'Uploading',       detail: 'Data stream verified' },
+    { id: 'normalize',   label: 'Normalization',   detail: 'Page render engine' },
+    { id: 'ocr',         label: 'OCR Execution',   detail: 'PaddleOCR v5' },
+    { id: 'llm',         label: 'Qwen VL',         detail: 'Vision extraction' },
+    { id: 'postprocess', label: 'Post-Processing',  detail: 'Field mapping' },
+];
+
+function buildPipelineHTML() {
+    const stagesHTML = PIPELINE_STAGES.map(s => `
+        <div class="pipeline-stage" id="pipeStage_${s.id}" data-stage="${s.id}">
+            <div class="pipeline-dot"></div>
+            <div class="pipeline-stage-name">
+                <span>${escapeHtml(s.label)}</span>
+                <span class="pipeline-badge" id="pipeBadge_${s.id}"></span>
+            </div>
+            <div class="pipeline-stage-detail" id="pipeDetail_${s.id}">${escapeHtml(s.detail)}</div>
+            <div class="pipeline-progress-bar"><div class="pipeline-progress-fill indeterminate" id="pipeFill_${s.id}"></div></div>
+        </div>
+    `).join('');
+
+    return `
+        <div class="pipeline-panel" id="pipelinePanel">
+            <div class="pipeline-header">
+                <div class="pipeline-title">Pipeline Sequence</div>
+                <div class="pipeline-subtitle">Real-time extraction progress</div>
+            </div>
+            <div class="pipeline-stages">${stagesHTML}</div>
+            <div class="pipeline-elapsed" id="pipelineElapsed">
+                Elapsed: <span class="pipeline-elapsed-value" id="pipelineTimer">0.0s</span>
+            </div>
+        </div>
+    `;
+}
+
+function showPipelinePanel() {
+    const panel = document.getElementById('pipelinePanel');
+    if (!panel) {
+        // Inject pipeline HTML into the right panel
+        const rp = document.querySelector('.right-panel');
+        if (rp) rp.insertAdjacentHTML('beforeend', buildPipelineHTML());
+    }
+
+    // Hide config sections (format type, instructions, rules, result)
+    document.querySelectorAll('.right-panel > .rp-section').forEach(sec => {
+        // Keep the Active Entity section (first one) visible
+        const title = sec.querySelector('.rp-title');
+        if (title && title.textContent.trim() === 'Active Entity') return;
+        sec.style.display = 'none';
+    });
+
+    // Show pipeline
+    const pp = document.getElementById('pipelinePanel');
+    if (pp) pp.classList.add('active');
+
+    // Reset all stages to pending
+    PIPELINE_STAGES.forEach(s => {
+        const el = document.getElementById(`pipeStage_${s.id}`);
+        if (el) el.className = 'pipeline-stage';
+        const badge = document.getElementById(`pipeBadge_${s.id}`);
+        if (badge) { badge.className = 'pipeline-badge'; badge.textContent = ''; }
+        const detail = document.getElementById(`pipeDetail_${s.id}`);
+        if (detail) detail.textContent = s.detail;
+        const fill = document.getElementById(`pipeFill_${s.id}`);
+        if (fill) { fill.className = 'pipeline-progress-fill indeterminate'; fill.style.width = ''; }
+    });
+
+    // Mark upload as done immediately (file is already uploaded)
+    setPipelineStage('upload', 'done', 'Data stream verified');
+
+    // Start elapsed timer
+    _pipelineStartTime = Date.now();
+    if (_pipelineTimerInterval) clearInterval(_pipelineTimerInterval);
+    _pipelineTimerInterval = setInterval(() => {
+        const el = document.getElementById('pipelineTimer');
+        if (el && _pipelineStartTime) {
+            const elapsed = ((Date.now() - _pipelineStartTime) / 1000).toFixed(1);
+            el.textContent = `${elapsed}s`;
+        }
+    }, 100);
+}
+
+function hidePipelinePanel() {
+    // Stop timer
+    if (_pipelineTimerInterval) { clearInterval(_pipelineTimerInterval); _pipelineTimerInterval = null; }
+
+    // Hide pipeline
+    const pp = document.getElementById('pipelinePanel');
+    if (pp) pp.classList.remove('active');
+
+    // Restore config sections
+    document.querySelectorAll('.right-panel > .rp-section').forEach(sec => {
+        sec.style.display = '';
+    });
+}
+
+function setPipelineStage(stageId, state, detail) {
+    const el = document.getElementById(`pipeStage_${stageId}`);
+    if (!el) return;
+    el.className = `pipeline-stage ${state}`;
+
+    const badge = document.getElementById(`pipeBadge_${stageId}`);
+    if (badge) {
+        if (state === 'done') {
+            badge.className = 'pipeline-badge done';
+            badge.textContent = 'DONE';
+        } else if (state === 'active') {
+            badge.className = 'pipeline-badge active';
+            badge.textContent = '...';
+        } else if (state === 'failed') {
+            badge.className = 'pipeline-badge failed';
+            badge.textContent = 'FAIL';
+        } else {
+            badge.className = 'pipeline-badge';
+            badge.textContent = '';
+        }
+    }
+
+    if (detail) {
+        const det = document.getElementById(`pipeDetail_${stageId}`);
+        if (det) det.textContent = detail;
+    }
+}
+
+function setPipelineProgress(stageId, current, total) {
+    const badge = document.getElementById(`pipeBadge_${stageId}`);
+    const fill = document.getElementById(`pipeFill_${stageId}`);
+    if (total > 0 && current > 0) {
+        const pct = Math.round((current / total) * 100);
+        if (badge) badge.textContent = `${pct}%`;
+        if (fill) {
+            fill.className = 'pipeline-progress-fill';
+            fill.style.width = `${pct}%`;
+        }
+    }
+}
+
+// Track which stages we've seen as active so we can mark them done
+let _pipelineSeenStages = new Set();
+
+function updatePipelineFromSSE(jobState) {
+    const extraction = jobState.extraction || {};
+    const progress = extraction.progress || {};
+    const stage = progress.stage;
+    const message = progress.message || '';
+    const event = jobState.event;
+
+    if (!stage) return;
+
+    // Mark upload as done always
+    setPipelineStage('upload', 'done', 'Data stream verified');
+
+    // Define stage order for sequential markings
+    const stageOrder = ['upload', 'normalize', 'ocr', 'llm', 'postprocess'];
+    const currentIdx = stageOrder.indexOf(stage);
+
+    // Mark all stages before current as done
+    for (let i = 1; i < currentIdx; i++) {
+        const s = stageOrder[i];
+        const el = document.getElementById(`pipeStage_${s}`);
+        if (el && !el.classList.contains('done')) {
+            const stageInfo = PIPELINE_STAGES.find(p => p.id === s);
+            setPipelineStage(s, 'done', stageInfo ? stageInfo.detail + ' — complete' : 'Complete');
+        }
+    }
+
+    // Handle terminal events
+    if (event === 'done') {
+        stageOrder.forEach(s => {
+            setPipelineStage(s, 'done', null);
+        });
+        // Stop timer
+        if (_pipelineTimerInterval) { clearInterval(_pipelineTimerInterval); _pipelineTimerInterval = null; }
+        // Final elapsed
+        const el = document.getElementById('pipelineTimer');
+        if (el && _pipelineStartTime) {
+            const elapsed = ((Date.now() - _pipelineStartTime) / 1000).toFixed(1);
+            el.textContent = `${elapsed}s — COMPLETE`;
+        }
+        return;
+    }
+
+    if (event === 'failed') {
+        setPipelineStage(stage, 'failed', message);
+        if (_pipelineTimerInterval) { clearInterval(_pipelineTimerInterval); _pipelineTimerInterval = null; }
+        return;
+    }
+
+    // Set current stage as active
+    _pipelineSeenStages.add(stage);
+    const detail = message || PIPELINE_STAGES.find(p => p.id === stage)?.detail || '';
+    setPipelineStage(stage, 'active', detail);
+
+    // For LLM stage, show page progress
+    if (stage === 'llm' && progress.page && progress.total_pages) {
+        setPipelineProgress('llm', progress.page, progress.total_pages);
+        setPipelineStage('llm', 'active', `Page ${progress.page}/${progress.total_pages}`);
+    }
+}
+
 // ── EXTRACTION SSE ─────────────────────────────────────────────────────
 function showStopButton(buttonId = 'extractBtn') {
     activeExtractButtonId = buttonId;
@@ -821,6 +1047,8 @@ function showStopButton(buttonId = 'extractBtn') {
 function resetExtractButtons() {
     activeJobId = null;
     activeExtractButtonId = 'extractBtn';
+    _pipelineSeenStages = new Set();
+    hidePipelinePanel();
     renderBottomBar();
 }
 
@@ -850,6 +1078,9 @@ function applyJobStatus(jobState) {
     const progress = (job.progress || (extraction && extraction.progress) || {});
 
     if (extraction && extraction.id) activeExtractionId = extraction.id;
+
+    // Feed pipeline visualization
+    updatePipelineFromSSE(jobState);
 
     if (progress.total_pages && progress.page) {
         const activeBtn = document.getElementById(activeExtractButtonId);
@@ -994,6 +1225,7 @@ async function runExtract() {
     }
 
     showStopButton('extractBtn');
+    showPipelinePanel();
     const formData = new FormData();
     formData.append('file', loadedFile);
     formData.append('vendor_id', v.id);
@@ -1039,6 +1271,7 @@ async function autoExtract() {
     const rs = document.getElementById('resultSection'); if (rs) rs.style.display = 'none';
 
     showStopButton('autoExtractBtn');
+    showPipelinePanel();
     const formData = new FormData();
     formData.append('file', loadedFile);
     formData.append('vendor_id', v.id);
@@ -1139,16 +1372,16 @@ function downloadCsv() {
     const headerKeys = Object.keys(lastResult).filter(k => k !== 'line_items');
     const items = Array.isArray(lastResult.line_items) ? lastResult.line_items : [];
     const rows = items.length > 0 ? items : [{}];
-    
+
     const itemKeys = new Set();
     items.forEach(it => {
         if (it && typeof it === 'object') Object.keys(it).forEach(k => itemKeys.add(k));
     });
     const itemCols = Array.from(itemKeys);
     const allCols = [...headerKeys, ...itemCols];
-    
-    let csvStr = allCols.map(v => `"${(v||'').toString().replace(/"/g, '""')}"`).join(',') + '\n';
-    
+
+    let csvStr = allCols.map(v => `"${(v || '').toString().replace(/"/g, '""')}"`).join(',') + '\n';
+
     rows.forEach(item => {
         const rowData = allCols.map(col => {
             let val = headerKeys.includes(col) ? lastResult[col] : (item ? item[col] : '');
@@ -1161,7 +1394,7 @@ function downloadCsv() {
 
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([csvStr], { type: 'text/csv' }));
-    a.download = `extraction_${activeExtractionId || Date.now()}.csv`; 
+    a.download = `extraction_${activeExtractionId || Date.now()}.csv`;
     a.click();
 }
 

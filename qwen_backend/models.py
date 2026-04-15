@@ -65,6 +65,7 @@ class TemplateOut(BaseModel):
     prompt_instructions: str | None
     extraction_rules: list[str]
     system_prompt: str | None
+    user_prompt: str | None = None
     prompt_hash: str | None
     created_at: datetime
     updated_at: datetime

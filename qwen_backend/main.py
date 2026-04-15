@@ -298,9 +298,23 @@ async def delete_vendor(request: Request, vendor_id: str):
 @app.get("/vendors/{vendor_id}/template", response_model=TemplateOut)
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def get_template(request: Request, vendor_id: str):
-    tmpl = await db_mod.get_template(request.app.state.pool, vendor_id)
-    if not tmpl:
+    tmpl_row = await db_mod.get_template(request.app.state.pool, vendor_id)
+    if not tmpl_row:
         raise HTTPException(404, detail="No template configured for this vendor")
+        
+    tmpl = dict(tmpl_row)
+    try:
+        from . import extractor
+        tmpl["user_prompt"] = extractor.build_user_message(
+            tmpl.get("header_fields") or [],
+            tmpl.get("line_item_fields") or [],
+            page_num=1,
+            total_pages=1
+        )
+    except Exception as e:
+        logger.warning("Failed to build user prompt preview: %s", e)
+        tmpl["user_prompt"] = "Error building preview"
+        
     return TemplateOut(**tmpl)
 
 

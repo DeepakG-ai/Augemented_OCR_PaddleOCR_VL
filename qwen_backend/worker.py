@@ -76,10 +76,8 @@ async def _stop_if_cancelled(pool, extraction_id: int, stage: str, message: str)
 
 
 async def _maybe_enqueue_postprocess(pool, extraction_id: int, document_id: int | None) -> None:
-    extraction_row = await db_mod.get_extraction(pool, extraction_id)
-    if not extraction_row:
-        return
-    if extraction_row.get("result") is None or extraction_row.get("ocr_data") is None:
+    # Lightweight check — avoids loading massive JSONB blobs (result, ocr_data, etc.)
+    if not await db_mod.is_postprocess_ready(pool, extraction_id):
         return
     await db_mod.ensure_job(pool, extraction_id, document_id, "postprocess", {"extraction_id": extraction_id})
 
@@ -142,6 +140,7 @@ async def _process_normalize(pool, job: dict) -> None:
     await db_mod.update_document_status(pool, document["id"], "normalized")
     if await _stop_if_cancelled(pool, extraction_id, "normalize", "Cancelled during page rendering"):
         return
+    # Run OCR and LLM in parallel
     await db_mod.ensure_job(pool, extraction_id, document["id"], "ocr", {"extraction_id": extraction_id})
     await db_mod.ensure_job(pool, extraction_id, document["id"], "llm", {"extraction_id": extraction_id})
 
@@ -268,15 +267,26 @@ async def _process_postprocess(pool, job: dict) -> None:
         raise ValueError("Extraction not found for postprocess job")
 
     result = extraction_row.get("result")
-    ocr_data = extraction_row.get("ocr_data")
-    if not result or not ocr_data:
-        raise ValueError("Postprocess prerequisites not satisfied")
+    if not result:
+        raise ValueError("Postprocess prerequisites not satisfied (no result)")
 
-    field_locations = text_matcher.compute_field_locations(
+    ocr_data = extraction_row.get("ocr_data")
+    if not ocr_data:
+        raise ValueError("Postprocess prerequisites not satisfied (no ocr_data)")
+
+    page_results = extraction_row.get("page_results")
+
+    # Run CPU-bound text matching in a thread executor to avoid blocking
+    # the async event loop (prevents healthcheck timeouts / Docker Code 137)
+    loop = asyncio.get_running_loop()
+    field_locations = await loop.run_in_executor(
+        None,
+        text_matcher.compute_field_locations,
         result,
         ocr_data,
-        page_results=extraction_row.get("page_results"),
+        page_results,
     )
+
     await db_mod.save_field_locations(pool, extraction_id, field_locations)
     if await _stop_if_cancelled(pool, extraction_id, "postprocess", "Cancelled before outbound delivery"):
         return
@@ -284,7 +294,7 @@ async def _process_postprocess(pool, job: dict) -> None:
         pool,
         extraction_id,
         "done",
-        progress={"stage": "postprocess", "message": "Field mapping and validation complete"},
+        progress={"stage": "postprocess", "message": "PaddleOCR field mapping complete"},
     )
     await db_mod.ensure_job(pool, extraction_id, job["document_id"], "outbound", {"extraction_id": extraction_id})
 

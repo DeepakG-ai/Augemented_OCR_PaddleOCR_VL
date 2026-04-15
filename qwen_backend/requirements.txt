@@ -13,8 +13,9 @@ aiofiles
 websockets
 minio
 openpyxl
-paddlepaddle
 paddleocr
+paddlepaddle==3.2.2
+rapidfuzz
 arize-phoenix[evals]
 opentelemetry-api
 opentelemetry-sdk

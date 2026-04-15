@@ -997,3 +997,195 @@ html, body {
     border-left: 2px solid var(--blue);
     padding-left: 6px;
 }
+
+/* ══════════════════════════════════════════════════════════════════════ */
+/* PIPELINE VISUALIZATION                                                */
+/* ══════════════════════════════════════════════════════════════════════ */
+
+.pipeline-panel {
+    display: none;
+    padding: 0;
+}
+.pipeline-panel.active { display: block; }
+
+.pipeline-header {
+    padding: 16px 14px 10px;
+    border-bottom: 1px solid var(--border);
+}
+.pipeline-title {
+    font-family: var(--display);
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.18em;
+    color: var(--text);
+    text-transform: uppercase;
+    margin-bottom: 2px;
+}
+.pipeline-subtitle {
+    font-size: 9px;
+    letter-spacing: 0.1em;
+    color: var(--text-dim);
+}
+
+.pipeline-stages {
+    padding: 16px 14px 14px 20px;
+}
+
+.pipeline-stage {
+    position: relative;
+    padding-left: 28px;
+    padding-bottom: 22px;
+}
+.pipeline-stage:last-child { padding-bottom: 4px; }
+
+/* Vertical connector line */
+.pipeline-stage::before {
+    content: '';
+    position: absolute;
+    left: 5px;
+    top: 12px;
+    bottom: -2px;
+    width: 1px;
+    background: var(--border2);
+    transition: background 0.4s;
+}
+.pipeline-stage:last-child::before { display: none; }
+.pipeline-stage.done::before { background: var(--green-dim); }
+.pipeline-stage.active::before {
+    background: linear-gradient(to bottom, var(--amber), var(--border2));
+}
+
+/* Dot */
+.pipeline-dot {
+    position: absolute;
+    left: 0;
+    top: 4px;
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    border: 2px solid var(--border2);
+    background: var(--bg1);
+    transition: all 0.4s;
+    z-index: 2;
+}
+.pipeline-stage.done .pipeline-dot {
+    background: var(--green);
+    border-color: var(--green);
+    box-shadow: 0 0 10px rgba(34, 197, 94, 0.5);
+}
+.pipeline-stage.active .pipeline-dot {
+    background: var(--amber);
+    border-color: var(--amber);
+    box-shadow: 0 0 12px rgba(245, 158, 11, 0.6);
+    animation: pipeline-pulse 1.4s ease-in-out infinite;
+}
+.pipeline-stage.failed .pipeline-dot {
+    background: var(--red);
+    border-color: var(--red);
+    box-shadow: 0 0 10px rgba(239, 68, 68, 0.5);
+}
+
+@keyframes pipeline-pulse {
+    0%, 100% { box-shadow: 0 0 8px rgba(245, 158, 11, 0.4); transform: scale(1); }
+    50% { box-shadow: 0 0 16px rgba(245, 158, 11, 0.8); transform: scale(1.15); }
+}
+
+.pipeline-stage-name {
+    font-family: var(--display);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    transition: color 0.3s;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.pipeline-stage.done .pipeline-stage-name { color: var(--green); }
+.pipeline-stage.active .pipeline-stage-name { color: var(--amber); }
+.pipeline-stage.failed .pipeline-stage-name { color: var(--red); }
+
+.pipeline-badge {
+    font-family: var(--mono);
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    padding: 1px 7px;
+    border-radius: 2px;
+    margin-left: auto;
+}
+.pipeline-badge.done {
+    background: var(--green-bg);
+    color: var(--green);
+    border: 1px solid rgba(34, 197, 94, 0.25);
+}
+.pipeline-badge.active {
+    background: var(--amber-bg);
+    color: var(--amber);
+    border: 1px solid rgba(245, 158, 11, 0.2);
+}
+.pipeline-badge.failed {
+    background: var(--red-bg);
+    color: var(--red);
+    border: 1px solid rgba(239, 68, 68, 0.2);
+}
+
+.pipeline-stage-detail {
+    font-size: 9px;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    margin-top: 3px;
+    line-height: 1.4;
+}
+.pipeline-stage.active .pipeline-stage-detail { color: var(--text-mid); }
+
+/* Progress bar for active stages */
+.pipeline-progress-bar {
+    margin-top: 6px;
+    height: 3px;
+    background: var(--bg3);
+    border-radius: 2px;
+    overflow: hidden;
+    display: none;
+}
+.pipeline-stage.active .pipeline-progress-bar { display: block; }
+
+.pipeline-progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--amber), #fbbf24);
+    border-radius: 2px;
+    transition: width 0.5s ease;
+    box-shadow: 0 0 8px rgba(245, 158, 11, 0.4);
+}
+
+/* Indeterminate progress animation */
+.pipeline-progress-fill.indeterminate {
+    width: 40% !important;
+    animation: pipeline-indeterminate 1.6s ease-in-out infinite;
+}
+@keyframes pipeline-indeterminate {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(300%); }
+}
+
+/* Elapsed timer */
+.pipeline-elapsed {
+    margin-top: 16px;
+    padding: 10px 14px;
+    border-top: 1px solid var(--border);
+    font-size: 9px;
+    letter-spacing: 0.1em;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.pipeline-elapsed-value {
+    color: var(--amber);
+    font-weight: 600;
+    font-family: var(--mono);
+    font-size: 11px;
+}

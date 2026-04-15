@@ -148,11 +148,14 @@ services:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
       MINIO_SECURE: "false"
+      LLM_URL: http://host.docker.internal:8001/v1/chat/completions
     depends_on:
       postgres:
         condition: service_healthy
       minio:
         condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./:/app
 

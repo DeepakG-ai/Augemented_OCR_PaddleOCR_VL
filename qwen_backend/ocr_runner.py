@@ -20,6 +20,7 @@ import asyncio
 import base64
 import logging
 import os
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -27,6 +28,16 @@ os.environ.setdefault("HUB_DATASET_ENDPOINT", "https://modelscope.cn/api/v1/data
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 
 logger = logging.getLogger("ocr_runner")
+
+# Ensure this logger has at least one handler that flushes immediately,
+# so log lines survive PaddleOCR/MKLDNN C++ stderr interleaving in Docker.
+if not logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    _h.setLevel(logging.DEBUG)
+    logger.addHandler(_h)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False #True before duplicate logs
 
 try:
     from .phoenix_tracing import trace_ocr_page
@@ -36,6 +47,9 @@ except ImportError:
 _executor = ThreadPoolExecutor(max_workers=3)
 
 import threading
+import numpy as np
+import cv2
+
 _ocr_local = threading.local()
 
 def _get_ocr_engine():
@@ -51,23 +65,13 @@ def _get_ocr_engine():
             use_doc_unwarping=False,
             use_textline_orientation=False,
             device="cpu",
-            enable_mkldnn=False,
+            enable_mkldnn=True,
+            cpu_threads=4,
         )
         elapsed = (time.perf_counter() - t0) * 1000
         logger.info("PaddleOCR engine ready for thread %s in %.0fms", threading.current_thread().name, elapsed)
+        sys.stderr.flush()
     return _ocr_local.engine
-
-
-def _b64_to_temp_path(image_b64: str, page_number: int) -> str:
-    """Decode base64 image and write to a temp file (PaddleOCR needs a file path)."""
-    import tempfile
-    img_bytes = base64.b64decode(image_b64)
-    # Determine extension from JPEG header
-    ext = ".jpg" if img_bytes[:2] == b'\xff\xd8' else ".png"
-    fd, path = tempfile.mkstemp(suffix=f"_page{page_number}{ext}")
-    with os.fdopen(fd, "wb") as f:
-        f.write(img_bytes)
-    return path
 
 
 def _run_ocr_on_page(image_b64: str, page_number: int) -> dict:
@@ -81,14 +85,18 @@ def _run_ocr_on_page(image_b64: str, page_number: int) -> dict:
     Returns:
         {"page_number": 1, "words": [{"text": "...", "box": [x0,y0,x1,y1], "score": 0.95}]}
     """
+
     with trace_ocr_page(page_number) as ocr_page_ctx:
         t0 = time.perf_counter()
-        tmp_path = None
         try:
             ocr = _get_ocr_engine()
-            tmp_path = _b64_to_temp_path(image_b64, page_number)
+            
+            # Decode base64 directly to in-memory numpy array (no disk write needed)
+            img_bytes = base64.b64decode(image_b64)
+            img_array = np.frombuffer(img_bytes, dtype=np.uint8)
+            img_cv = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
 
-            result = ocr.predict(tmp_path)
+            result = ocr.predict(img_cv)
 
             words = []
             for res in result:
@@ -113,6 +121,7 @@ def _run_ocr_on_page(image_b64: str, page_number: int) -> dict:
                 "PaddleOCR page %d: %d words detected in %.0fms",
                 page_number, len(words), elapsed,
             )
+            sys.stderr.flush()
 
             ocr_page_ctx["words_detected"] = len(words)
 
@@ -125,14 +134,6 @@ def _run_ocr_on_page(image_b64: str, page_number: int) -> dict:
             logger.error("PaddleOCR failed on page %d: %s", page_number, exc)
             return {"page_number": page_number, "words": []}
 
-        finally:
-            # Clean up temp file
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-
 
 async def run_ocr_on_pages(pages: list[dict]) -> list[dict]:
     if not pages:
@@ -140,6 +141,7 @@ async def run_ocr_on_pages(pages: list[dict]) -> list[dict]:
 
     t0 = time.perf_counter()
     logger.info("Starting PaddleOCR on %d page(s)...", len(pages))
+    sys.stderr.flush()
 
     loop = asyncio.get_running_loop()
 
@@ -162,5 +164,6 @@ async def run_ocr_on_pages(pages: list[dict]) -> list[dict]:
         "PaddleOCR complete: %d page(s), %d total words, %.0fms",
         len(ocr_pages), total_words, elapsed,
     )
+    sys.stderr.flush()
 
     return ocr_pages

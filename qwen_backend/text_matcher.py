@@ -1,344 +1,411 @@
 """
-text_matcher.py -- Match Qwen VL extracted field values to PaddleOCR bounding boxes.
+text_matcher.py -- Match extracted JSON values to PaddleOCR boxes.
 
-Given:
-  - extraction_result: {"vendor_name": "FRESH PRODUCTS, INC.", "po_number": "P1416576", ...}
-  - ocr_pages: [{"page_number": 1, "words": [{"text": "...", "box": [x0,y0,x1,y1], "score": 0.98}, ...]}]
-
-Returns:
-  - field_locations: {"vendor_name": {"page": 1, "box": [128,214,338,229], "matched_text": "...", "score": 0.96, "strategy": "exact"}}
-
-Matching strategies (tried in order):
-  1. exact     -- OCR text == extracted value (case-insensitive)
-  2. contains  -- one contains the other
-  3. multi_span -- combine consecutive OCR spans
-  4. fuzzy     -- Levenshtein similarity above threshold
+Design goals:
+1) Avoid giant "block" boxes for multi-line fields (vendor/bill_to/ship_to).
+2) Support matching token values inside long OCR chunks (item codes in row text).
+3) Keep output contract stable for the Review UI.
 """
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any
 
+from rapidfuzz import fuzz, process
+
 logger = logging.getLogger("text_matcher")
 
-
-# ---------------------------------------------------------------------------
-# Levenshtein distance (no external dependency)
-# ---------------------------------------------------------------------------
-
-def _levenshtein(s1: str, s2: str) -> int:
-    if len(s1) < len(s2):
-        return _levenshtein(s2, s1)
-    if len(s2) == 0:
-        return len(s1)
-    prev_row = range(len(s2) + 1)
-    for i, c1 in enumerate(s1):
-        curr_row = [i + 1]
-        for j, c2 in enumerate(s2):
-            insertions = prev_row[j + 1] + 1
-            deletions = curr_row[j] + 1
-            substitutions = prev_row[j] + (c1 != c2)
-            curr_row.append(min(insertions, deletions, substitutions))
-        prev_row = curr_row
-    return prev_row[-1]
+_WS_RE = re.compile(r"\s+")
+_TOKEN_RE = re.compile(r"\S+")
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 
-def _similarity(s1: str, s2: str) -> float:
-    if not s1 or not s2:
-        return 0.0
-    max_len = max(len(s1), len(s2))
-    if max_len == 0:
-        return 1.0
-    return 1.0 - (_levenshtein(s1, s2) / max_len)
+def _normalize_text(text: str) -> str:
+    text = str(text or "")
+    text = text.replace("\u00a0", " ")
+    text = text.replace("\u2010", "-").replace("\u2011", "-").replace("\u2012", "-")
+    text = text.replace("\u2013", "-").replace("\u2014", "-")
+    return _WS_RE.sub(" ", text).strip().lower()
 
 
-# ---------------------------------------------------------------------------
-# Spatial sanity check for multi-word bounding boxes
-# ---------------------------------------------------------------------------
+def _normalize_token(token: str) -> str:
+    token = _normalize_text(token)
+    return token.strip(".,:;()[]{}\"'")
 
-def _box_is_sane(word_boxes: list[list], max_height_ratio: float = 5.0) -> bool:
-    """Reject a combined bounding box if it is unreasonably tall or wide.
-    
-    When OCR words from different rows/columns get merged, the resulting
-    box can span the entire page. This guard catches those cases.
-    
-    Rules:
-      - Combined box height must be <= max_height_ratio * avg individual word height
-      - Combined box height must be <= combined box width * 3  (no vertical sliver)
-    """
+
+def _normalize_token_loose(token: str) -> str:
+    return _NON_ALNUM_RE.sub("", _normalize_token(token))
+
+
+def _valid_box(box: Any) -> bool:
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        return False
+    try:
+        x0, y0, x1, y1 = [float(v) for v in box]
+    except Exception:
+        return False
+    return x1 > x0 and y1 > y0
+
+
+def _box_union(boxes: list[list[int]]) -> list[int]:
+    return [
+        int(min(b[0] for b in boxes)),
+        int(min(b[1] for b in boxes)),
+        int(max(b[2] for b in boxes)),
+        int(max(b[3] for b in boxes)),
+    ]
+
+
+def _box_center_x(box: list[int]) -> float:
+    return (box[0] + box[2]) / 2.0
+
+
+def _box_area(box: list[int]) -> int:
+    return max(1, box[2] - box[0]) * max(1, box[3] - box[1])
+
+
+def _estimate_sub_box(box: list[int], text: str, start: int, end: int) -> list[int]:
+    """Estimate a tighter sub-box for substring [start:end] inside OCR chunk text."""
+    x0, y0, x1, y1 = [int(v) for v in box]
+    width = max(1, x1 - x0)
+    height = max(1, y1 - y0)
+    text_len = max(1, len(text))
+
+    start = max(0, min(start, text_len - 1))
+    end = max(start + 1, min(end, text_len))
+
+    # Most OCR boxes here are horizontal. Keep a vertical fallback for safety.
+    if width >= height:
+        sx = int(round(x0 + (start / text_len) * width))
+        ex = int(round(x0 + (end / text_len) * width))
+        if ex <= sx:
+            ex = min(x1, sx + 2)
+        return [max(x0, sx), y0, min(x1, ex), y1]
+
+    sy = int(round(y0 + (start / text_len) * height))
+    ey = int(round(y0 + (end / text_len) * height))
+    if ey <= sy:
+        ey = min(y1, sy + 2)
+    return [x0, max(y0, sy), x1, min(y1, ey)]
+
+
+def _box_is_sane(word_boxes: list[list[int]], max_height_ratio: float = 3.5) -> bool:
+    """Reject merged boxes that span too many rows."""
     if len(word_boxes) <= 1:
-        return True  # single word is always fine
-    
-    x0 = min(b[0] for b in word_boxes)
-    y0 = min(b[1] for b in word_boxes)
-    x1 = max(b[2] for b in word_boxes)
-    y1 = max(b[3] for b in word_boxes)
-    
-    combined_h = y1 - y0
-    combined_w = x1 - x0
-    
+        return True
+
+    union = _box_union(word_boxes)
+    combined_h = union[3] - union[1]
+    combined_w = union[2] - union[0]
     if combined_h <= 0 or combined_w <= 0:
         return False
-    
-    # Average height of individual words
-    avg_word_h = sum(b[3] - b[1] for b in word_boxes) / len(word_boxes)
-    if avg_word_h <= 0:
-        avg_word_h = 1
-    
-    # If combined height >> average word height, it spans multiple rows
-    if combined_h > avg_word_h * max_height_ratio:
+
+    heights = [max(1, b[3] - b[1]) for b in word_boxes]
+    avg_h = sum(heights) / len(heights)
+    if combined_h > avg_h * max_height_ratio:
         return False
-    
+
+    # Also reject if Y centers are spread too far apart.
+    centers = [((b[1] + b[3]) / 2.0) for b in word_boxes]
+    if max(centers) - min(centers) > avg_h * 2.4:
+        return False
+
     return True
 
 
-# ---------------------------------------------------------------------------
-# Single-value matching against a page's OCR data
-# ---------------------------------------------------------------------------
+def _choose_best(matches: list[dict], x_target: float | None = None) -> dict | None:
+    if not matches:
+        return None
+    if x_target is not None:
+        return min(matches, key=lambda m: (abs(_box_center_x(m["box"]) - x_target), _box_area(m["box"])))
+    return min(matches, key=lambda m: (_box_area(m["box"]), -float(m.get("score", 0.0))))
+
+
+def _tokenize_with_spans(text: str) -> list[tuple[str, int, int]]:
+    return [(m.group(0), m.start(), m.end()) for m in _TOKEN_RE.finditer(text)]
+
+
+def _build_token_stream(entries: list[dict]) -> list[dict]:
+    stream: list[dict] = []
+    for entry_idx, entry in enumerate(entries):
+        raw_text = entry["raw"]
+        for token_raw, start, end in _tokenize_with_spans(raw_text):
+            token_norm = _normalize_token(token_raw)
+            token_loose = _normalize_token_loose(token_raw)
+            if not token_norm:
+                continue
+            stream.append(
+                {
+                    "entry_idx": entry_idx,
+                    "token_raw": token_raw,
+                    "token_norm": token_norm,
+                    "token_loose": token_loose,
+                    "token_box": _estimate_sub_box(entry["box"], raw_text, start, end),
+                    "source_box": entry["box"],
+                }
+            )
+    return stream
+
+
+def _match_token_sequence(
+    stream: list[dict],
+    target_tokens: list[str],
+    entries: list[dict],
+    use_loose: bool,
+) -> list[dict]:
+    matches: list[dict] = []
+    if not stream or not target_tokens:
+        return matches
+
+    field = "token_loose" if use_loose else "token_norm"
+    n = len(target_tokens)
+    if n > len(stream):
+        return matches
+
+    for i in range(len(stream) - n + 1):
+        window = stream[i : i + n]
+        if any(window[j][field] != target_tokens[j] for j in range(n)):
+            continue
+
+        display_boxes = [t["token_box"] for t in window]
+        source_boxes_map: dict[tuple[int, int, int, int], list[int]] = {}
+        for t in window:
+            key = tuple(t["source_box"])
+            source_boxes_map[key] = t["source_box"]
+
+        entry_indices = sorted({t["entry_idx"] for t in window})
+        avg_score = sum(float(entries[idx]["score"]) for idx in entry_indices) / max(1, len(entry_indices))
+        matches.append(
+            {
+                "box": _box_union(display_boxes),
+                "matched_text": " ".join(t["token_raw"] for t in window),
+                "matched_boxes": list(source_boxes_map.values()),
+                "score": round(avg_score, 4),
+                "strategy": "token_chain",
+            }
+        )
+    return matches
+
 
 def find_value_in_ocr(
     value: str,
     ocr_words: list[dict],
     fuzzy_threshold: float = 0.80,
+    y_band: tuple[float, float] | None = None,
+    x_target: float | None = None,
 ) -> dict | None:
     """
-    Search for an extracted field value in PaddleOCR results.
-
-    Args:
-        value: The extracted value from Qwen VL (e.g. "FRESH PRODUCTS, INC.")
-        ocr_words: List of PaddleOCR results [{text, box, score}, ...]
-        fuzzy_threshold: Minimum similarity for fuzzy matching (0.0 - 1.0)
+    Search for one extracted value in OCR words.
 
     Returns:
-        {box: [x0,y0,x1,y1], matched_text, score, strategy} or None
+      {box, matched_text, matched_boxes, score, strategy} or None
     """
     if not value or not ocr_words:
         return None
 
-    target = str(value).strip()
-    target_lower = target.lower()
-    target_words = target.split()
-
-    if not target_lower:
+    target_raw = str(value).strip()
+    target_norm = _normalize_text(target_raw)
+    if not target_norm:
         return None
 
-    # â”€â”€ Strategy 1: Exact match (case-insensitive) â”€â”€
-    for word in ocr_words:
-        if word["text"].strip().lower() == target_lower:
-            return {
-                "box": word["box"],
-                "matched_text": word["text"],
-                "matched_boxes": [word["box"]],
-                "score": round(float(word.get("score", 0)), 4),
-                "strategy": "exact",
-            }
+    target_tokens = [_normalize_token(t) for t in target_raw.split() if _normalize_token(t)]
+    target_loose_tokens = [_normalize_token_loose(t) for t in target_raw.split() if _normalize_token_loose(t)]
 
-    # â”€â”€ Strategy 2: Contains match â”€â”€
-    # Check if OCR text contains the value, or value contains OCR text.
-    # We prefer the TIGHTEST fit (shortest word that contains the target).
-    best_contains = None
-    best_contains_diff = float("inf")
-
+    # Filter words first (and normalize once).
+    entries: list[dict] = []
+    target_raw_lower = target_raw.lower()
     for word in ocr_words:
-        word_lower = word["text"].strip().lower()
-        if not word_lower:
+        raw = str(word.get("text", "")).strip()
+        box = word.get("box")
+        if not raw or not _valid_box(box):
             continue
+        if y_band is not None:
+            center_y = (float(box[1]) + float(box[3])) / 2.0
+            if not ((y_band[0] - 15) <= center_y <= (y_band[1] + 15)):
+                continue
+        entries.append(
+            {
+                "raw": raw,
+                "raw_lower": raw.lower(),
+                "norm": _normalize_text(raw),
+                "loose": _NON_ALNUM_RE.sub("", _normalize_text(raw)),
+                "box": [int(round(float(v))) for v in box],
+                "score": float(word.get("score", 0.0)),
+            }
+        )
+    if not entries:
+        return None
 
-        # OCR span contains the extracted value
-        if target_lower in word_lower:
-            diff = len(word_lower) - len(target_lower)
-            if diff < best_contains_diff:
-                best_contains = {
-                    "box": word["box"],
-                    "matched_text": word["text"],
-                    "matched_boxes": [word["box"]],
-                    "score": round(float(word.get("score", 0)), 4),
-                    "strategy": "contains",
+    # Strategy 1: exact text
+    exact_matches: list[dict] = []
+    for entry in entries:
+        if entry["norm"] == target_norm:
+            exact_matches.append(
+                {
+                    "box": entry["box"],
+                    "matched_text": entry["raw"],
+                    "matched_boxes": [entry["box"]],
+                    "score": round(entry["score"], 4),
+                    "strategy": "exact",
                 }
-                best_contains_diff = diff
+            )
+    best = _choose_best(exact_matches, x_target=x_target)
+    if best:
+        return best
 
-        # Extracted value contains the OCR span.
-        # Keep this only for single-token targets; for multi-word targets
-        # we want the matcher to continue to multi-span instead of grabbing
-        # one partial token like "PEPPER" for "RED PEPPER".
-        if len(target_words) == 1 and word_lower in target_lower and len(word_lower) >= len(target_lower) * 0.6:
-            diff = len(target_lower) - len(word_lower)
-            if diff < best_contains_diff:
-                best_contains = {
-                    "box": word["box"],
-                    "matched_text": word["text"],
-                    "matched_boxes": [word["box"]],
-                    "score": round(float(word.get("score", 0)), 4),
-                    "strategy": "contains",
+    # Strategy 2: token chain (tight box for values inside long chunks)
+    if target_tokens:
+        stream = _build_token_stream(entries)
+        chain_matches = _match_token_sequence(stream, target_tokens, entries, use_loose=False)
+        if not chain_matches and target_loose_tokens:
+            chain_matches = _match_token_sequence(stream, target_loose_tokens, entries, use_loose=True)
+        best = _choose_best(chain_matches, x_target=x_target)
+        if best:
+            return best
+
+    # Strategy 3: contains / subspan on one OCR chunk
+    contains_matches: list[dict] = []
+    for entry in entries:
+        raw = entry["raw"]
+        raw_lower = entry["raw_lower"]
+        if target_raw_lower in raw_lower:
+            idx = raw_lower.find(target_raw_lower)
+            sub_box = _estimate_sub_box(entry["box"], raw, idx, idx + len(target_raw_lower))
+            strategy = "contains_subspan" if len(raw) > len(target_raw) + 4 else "contains"
+            contains_matches.append(
+                {
+                    "box": sub_box,
+                    "matched_text": raw[idx : idx + len(target_raw)],
+                    "matched_boxes": [entry["box"]],
+                    "score": round(entry["score"], 4),
+                    "strategy": strategy,
+                    "diff": len(raw) - len(target_raw),
                 }
-                best_contains_diff = diff
+            )
+        elif len(target_tokens) == 1 and raw_lower in target_raw_lower and len(raw_lower) >= max(2, int(len(target_raw_lower) * 0.6)):
+            contains_matches.append(
+                {
+                    "box": entry["box"],
+                    "matched_text": raw,
+                    "matched_boxes": [entry["box"]],
+                    "score": round(entry["score"], 4),
+                    "strategy": "contains",
+                    "diff": len(target_raw) - len(raw),
+                }
+            )
 
-    if best_contains:
-        return best_contains
+    if contains_matches:
+        min_diff = min(m["diff"] for m in contains_matches)
+        best = _choose_best([m for m in contains_matches if m["diff"] == min_diff], x_target=x_target)
+        if best:
+            best.pop("diff", None)
+            return best
 
-    # â”€â”€ Strategy 3: Multi-span match â”€â”€
-    # Combine consecutive OCR spans and check if they form the target.
-    # We restrict the combination length to avoid merging unrelated words.
-    for i in range(len(ocr_words)):
-        combined = ""
-        for j in range(i, min(i + 25, len(ocr_words))):
-            sep = " " if combined else ""
-            combined += sep + ocr_words[j]["text"].strip()
+    # Strategy 4: multi-span chunks (no anchor expansion to avoid giant boxes)
+    multi_span_matches: list[dict] = []
+    max_span = min(10, len(entries))
+    for i in range(len(entries)):
+        combined_parts: list[str] = []
+        for j in range(i, min(i + max_span, len(entries))):
+            combined_parts.append(entries[j]["raw"])
+            combined = " ".join(combined_parts)
+            combined_norm = _normalize_text(combined)
 
-            # If the combined string gets way longer than the target, stop this j loop
-            if len(combined) > len(target_lower) * 1.5 + 5:
+            # Early break if span became much larger than target.
+            if len(combined_norm) > len(target_norm) * 1.8 + 12:
                 break
 
-            # Check if it equals or tightly contains the target
-            if target_lower in combined.lower() and len(combined) <= len(target_lower) + 5:
-                # Build bounding box from span[i] to span[j]
-                span_boxes = [ocr_words[k]["box"] for k in range(i, j + 1)]
-                # Spatial sanity check: reject if box spans too much page area
+            if target_norm in combined_norm:
+                span_boxes = [entries[k]["box"] for k in range(i, j + 1)]
                 if not _box_is_sane(span_boxes):
                     continue
-                x0 = min(b[0] for b in span_boxes)
-                y0 = min(b[1] for b in span_boxes)
-                x1 = max(b[2] for b in span_boxes)
-                y1 = max(b[3] for b in span_boxes)
-                avg_score = sum(
-                    float(ocr_words[k].get("score", 0)) for k in range(i, j + 1)
-                ) / (j - i + 1)
+                avg_score = sum(entries[k]["score"] for k in range(i, j + 1)) / (j - i + 1)
+                multi_span_matches.append(
+                    {
+                        "box": _box_union(span_boxes),
+                        "matched_text": combined,
+                        "matched_boxes": span_boxes,
+                        "score": round(avg_score, 4),
+                        "strategy": "multi_span",
+                    }
+                )
 
-                return {
-                    "box": [x0, y0, x1, y1],
-                    "matched_text": combined.strip(),
-                    "score": round(avg_score, 4),
-                    "strategy": "multi_span",
-                }
+    best = _choose_best(multi_span_matches, x_target=x_target)
+    if best:
+        return best
 
-    # â”€â”€ Strategy 4: Anchor match (first + last words for long values) â”€â”€
-    # For long values like full addresses, find the first few words and
-    # last few words separately, then build a box spanning both.
-    if len(target_words) >= 6:
-        first_anchor = " ".join(target_words[:3]).lower()
-        last_anchor = " ".join(target_words[-3:]).lower()
+    # Strategy 5: fuzzy
+    is_short_numeric = len(target_raw) <= 4 and any(c.isdigit() for c in target_raw)
+    if is_short_numeric:
+        return None
 
-        first_idx = None   # first OCR word index of the start anchor
-        last_idx = None    # last OCR word index of the end anchor
-
-        # Find first anchor (scan forward, stop at first match)
-        for i in range(len(ocr_words)):
-            combined = ""
-            for j in range(i, min(i + 6, len(ocr_words))):
-                combined = (combined + " " + ocr_words[j]["text"].strip()).strip()
-                if first_anchor in combined.lower():
-                    first_idx = i
-                    break
-            if first_idx is not None:
-                break
-
-        # Find last anchor (scan forward, start from first_idx)
-        if first_idx is not None:
-            # We restrict the distance to avoid spanning the whole page
-            for i in range(first_idx, min(first_idx + 60, len(ocr_words))):
-                combined = ""
-                for j in range(i, min(i + 6, len(ocr_words))):
-                    combined = (combined + " " + ocr_words[j]["text"].strip()).strip()
-                    if last_anchor in combined.lower():
-                        last_idx = j
-                        break
-                if last_idx is not None:
-                    break
-
-        if first_idx is not None and last_idx is not None and first_idx <= last_idx:
-            anchor_boxes = [ocr_words[k]["box"] for k in range(first_idx, last_idx + 1)]
-            # Spatial sanity check: reject if anchor box spans too much page
-            if _box_is_sane(anchor_boxes, max_height_ratio=8.0):
-                x0 = min(b[0] for b in anchor_boxes)
-                y0 = min(b[1] for b in anchor_boxes)
-                x1 = max(b[2] for b in anchor_boxes)
-                y1 = max(b[3] for b in anchor_boxes)
-                avg_score = sum(
-                    float(ocr_words[k].get("score", 0)) for k in range(first_idx, last_idx + 1)
-                ) / (last_idx - first_idx + 1)
-
-                return {
-                    "box": [x0, y0, x1, y1],
-                    "matched_text": " ".join(
-                        ocr_words[k]["text"].strip() for k in range(first_idx, last_idx + 1)
-                    ),
-                    "matched_boxes": anchor_boxes,
-                    "score": round(avg_score, 4),
-                    "strategy": "anchor",
-                }
-
-    # â”€â”€ Strategy 5: Fuzzy match (handles OCR typos) â”€â”€
-    best_fuzzy = None
-    best_sim = fuzzy_threshold
-
-    for word in ocr_words:
-        word_text = word["text"].strip()
-        if not word_text or len(word_text) < 3:
-            continue
-
-        sim = _similarity(target_lower, word_text.lower())
-        if sim > best_sim:
-            best_sim = sim
-            best_fuzzy = {
-                "box": word["box"],
-                "matched_text": word_text,
-                "matched_boxes": [word["box"]],
-                "score": round(float(word.get("score", 0)), 4),
+    cutoff_100 = fuzzy_threshold * 100.0
+    candidate_map = {idx: e["norm"] for idx, e in enumerate(entries) if e["norm"] and len(e["norm"]) >= 3}
+    if candidate_map:
+        best_single = process.extractOne(
+            target_norm,
+            candidate_map,
+            scorer=fuzz.ratio,
+            score_cutoff=cutoff_100,
+            processor=None,
+        )
+        if best_single:
+            idx = best_single[2]
+            sim = best_single[1] / 100.0
+            entry = entries[idx]
+            return {
+                "box": entry["box"],
+                "matched_text": entry["raw"],
+                "matched_boxes": [entry["box"]],
+                "score": round(entry["score"], 4),
                 "strategy": f"fuzzy({sim:.2f})",
             }
 
-    # Also try fuzzy on multi-span combinations
-    for i in range(len(ocr_words)):
-        combined = ""
-        for j in range(i, min(i + 25, len(ocr_words))):
-            sep = " " if combined else ""
-            combined += sep + ocr_words[j]["text"].strip()
+    best_span: dict | None = None
+    best_sim = 0.0
+    for i in range(len(entries)):
+        parts: list[str] = []
+        for j in range(i, min(i + max_span, len(entries))):
+            parts.append(entries[j]["raw"])
+            combined = " ".join(parts)
+            combined_norm = _normalize_text(combined)
 
-            if abs(len(combined) - len(target)) > len(target) * 0.5:
-                # Skip if lengths are too different (optimization)
-                if len(combined) > len(target):
+            if abs(len(combined_norm) - len(target_norm)) > max(6, int(len(target_norm) * 0.35)):
+                if len(combined_norm) > len(target_norm):
                     break
                 continue
 
-            sim = _similarity(target_lower, combined.lower())
-            if sim > best_sim:
-                span_boxes = [ocr_words[k]["box"] for k in range(i, j + 1)]
-                # Spatial sanity check
-                if not _box_is_sane(span_boxes):
-                    continue
-                best_sim = sim
-                x0 = min(b[0] for b in span_boxes)
-                y0 = min(b[1] for b in span_boxes)
-                x1 = max(b[2] for b in span_boxes)
-                y1 = max(b[3] for b in span_boxes)
-                avg_score = sum(
-                    float(ocr_words[k].get("score", 0)) for k in range(i, j + 1)
-                ) / (j - i + 1)
+            sim_100 = fuzz.ratio(target_norm, combined_norm, score_cutoff=cutoff_100)
+            if sim_100 <= 0:
+                continue
+            sim = sim_100 / 100.0
+            if sim <= best_sim:
+                continue
 
-                best_fuzzy = {
-                    "box": [x0, y0, x1, y1],
-                    "matched_text": combined.strip(),
-                    "matched_boxes": span_boxes,
-                    "score": round(avg_score, 4),
-                    "strategy": f"fuzzy({sim:.2f})",
-                }
+            span_boxes = [entries[k]["box"] for k in range(i, j + 1)]
+            if not _box_is_sane(span_boxes):
+                continue
+            avg_score = sum(entries[k]["score"] for k in range(i, j + 1)) / (j - i + 1)
+            best_sim = sim
+            best_span = {
+                "box": _box_union(span_boxes),
+                "matched_text": combined,
+                "matched_boxes": span_boxes,
+                "score": round(avg_score, 4),
+                "strategy": f"fuzzy({sim:.2f})",
+            }
 
-    return best_fuzzy
+    return best_span
 
 
-# ---------------------------------------------------------------------------
-# Confidence classification based on matching strategy
-# ---------------------------------------------------------------------------
-
-_HIGH_STRATEGIES = {"exact", "contains", "multi_span"}
-_MEDIUM_STRATEGIES = {"anchor"}
-# fuzzy(*) strategies â†’ low
+_HIGH_STRATEGIES = {"exact", "contains", "contains_subspan", "token_chain"}
+_MEDIUM_STRATEGIES = {"multi_span"}
 
 
 def _classify_confidence(strategy: str) -> str:
-    """Return 'high', 'medium', or 'low' based on matching strategy."""
-    base = strategy.split("(")[0]  # "fuzzy(0.87)" â†’ "fuzzy"
+    base = strategy.split("(")[0]
     if base in _HIGH_STRATEGIES:
         return "high"
     if base in _MEDIUM_STRATEGIES:
@@ -346,9 +413,22 @@ def _classify_confidence(strategy: str) -> str:
     return "low"
 
 
-# ---------------------------------------------------------------------------
-# Compute field locations for all header fields + line item cells
-# ---------------------------------------------------------------------------
+def _is_empty_value(value: Any) -> bool:
+    if value is None:
+        return True
+    val = str(value).strip()
+    return not val or val.lower() in {"null", "none", "n/a", "-"}
+
+
+def _split_value_lines(value: str) -> list[str]:
+    return [ln.strip() for ln in re.split(r"[\r\n]+", str(value)) if ln and ln.strip()]
+
+
+def _ordered_pages(ocr_pages: list[dict], preferred_page: int | None = None) -> list[dict]:
+    if preferred_page is None:
+        return ocr_pages
+    return sorted(ocr_pages, key=lambda p, pref=preferred_page: 0 if p.get("page_number") == pref else 1)
+
 
 def compute_field_locations(
     extraction_result: dict[str, Any],
@@ -356,73 +436,93 @@ def compute_field_locations(
     page_results: list[dict] | None = None,
 ) -> dict[str, dict]:
     """
-    Match each extracted field value to its PaddleOCR bounding box.
+    Match extracted fields to OCR boxes.
 
-    Covers:
-      - Header fields  â†’  key = field_name  (e.g. "vendor_name")
-      - Line item cells â†’  key = "line_item_{row}_{col}"  (e.g. "line_item_0_unit_price")
-
-    Each location dict includes a 'confidence' key: 'high', 'medium', or 'low'.
-
-    Args:
-        page_results: Optional list of per-page extraction results. Used to
-            determine which page each line item came from so we search the
-            correct page first (fixes page 2 mapping).
+    Header keys:
+      "vendor", "bill_to", ...
+    Line item keys:
+      "line_item_{row}_{column}"
     """
     t0 = time.perf_counter()
     locations: dict[str, dict] = {}
-    skipped = []
-    missed = []
+    skipped: list[str] = []
+    missed: list[str] = []
 
-    # Handle po_per_page format where extraction_result is a list of dicts.
-    # Merge into a single dict: header from first entry, line_items concatenated.
+    # Handle po_per_page style result list.
     if isinstance(extraction_result, list):
-        merged = {}
-        all_items = []
+        merged: dict[str, Any] = {}
+        all_items: list[dict] = []
         for entry in extraction_result:
             if not isinstance(entry, dict):
                 continue
-            for k, v in entry.items():
-                if k == "line_items":
-                    if isinstance(v, list):
-                        all_items.extend(v)
-                elif k not in merged and k not in ("_page", "_total_pages", "_error"):
-                    merged[k] = v
+            for key, val in entry.items():
+                if key == "line_items":
+                    if isinstance(val, list):
+                        all_items.extend(val)
+                elif key not in merged and key not in {"_page", "_total_pages", "_error"}:
+                    merged[key] = val
         merged["line_items"] = all_items
         extraction_result = merged
 
-    # â”€â”€ Header fields â”€â”€
+    # Stage 1: headers
     for field_name, field_value in extraction_result.items():
-        if field_name == "line_items" or field_value is None:
+        if field_name == "line_items":
+            continue
+        if _is_empty_value(field_value):
+            skipped.append(field_name)
             continue
 
         val_str = str(field_value).strip()
-        if not val_str or val_str.lower() in ("null", "none", "n/a", "", "-"):
+        lines = _split_value_lines(val_str)
+        if not lines:
             skipped.append(field_name)
             continue
 
         found = False
-        for page_data in ocr_pages:
-            location = find_value_in_ocr(val_str, page_data.get("words", []))
-            if location:
+        line_hits: list[dict] = []
+        preferred_page: int | None = None
+        for line in lines:
+            hit_for_line: dict | None = None
+            for page_data in _ordered_pages(ocr_pages, preferred_page):
+                location = find_value_in_ocr(line, page_data.get("words", []))
+                if not location:
+                    continue
                 location["page"] = page_data["page_number"]
                 location["confidence"] = _classify_confidence(location["strategy"])
-                locations[field_name] = location
-                found = True
-                logger.debug(
-                    "Matched %s='%s' on page %d via %s (%s)",
-                    field_name, val_str[:30], page_data["page_number"],
-                    location["strategy"], location["confidence"],
-                )
                 location.pop("matched_boxes", None)
+                hit_for_line = location
+                preferred_page = page_data["page_number"]
                 break
+            if hit_for_line:
+                line_hits.append(hit_for_line)
+
+        if line_hits:
+            primary = line_hits[0]
+            if len(line_hits) > 1:
+                primary["sub_locations"] = [
+                    {
+                        "page": h["page"],
+                        "box": h["box"],
+                        "matched_text": h["matched_text"],
+                        "strategy": h["strategy"],
+                        "confidence": h["confidence"],
+                    }
+                    for h in line_hits[1:]
+                ]
+            locations[field_name] = primary
+            found = True
+            logger.debug(
+                "Matched %s='%s' via %s (%s)",
+                field_name,
+                lines[0][:30],
+                primary["strategy"],
+                primary["confidence"],
+            )
 
         if not found:
             missed.append(field_name)
 
-    # â”€â”€ Build row â†’ page map from page_results â”€â”€
-    # This tells us which page each merged line item row came from,
-    # so we can search that page first instead of always starting from page 1.
+    # Stage 2: line items
     row_page_map: dict[int, int] = {}
     if page_results:
         running_idx = 0
@@ -434,74 +534,152 @@ def compute_field_locations(
                     row_page_map[running_idx] = page_num
                     running_idx += 1
 
-    # â”€â”€ Line item cells â”€â”€
     line_items = extraction_result.get("line_items")
     li_matched = 0
     li_total = 0
 
-    # Track consumed OCR box positions so duplicate values (e.g. two rows
-    # with the same qty) map to DIFFERENT OCR locations.
-    # Key: (page_number, tuple(box))
-    used_boxes: set[tuple] = set()
+    # Key: (page_number, tuple(source_box)) -> row_idx that owns this source box.
+    used_boxes: dict[tuple[int, tuple[int, int, int, int]], int] = {}
+
+    page_words_cache: dict[int, list[tuple[dict, tuple[int, tuple[int, int, int, int]]]]] = {}
+    for page_data in ocr_pages:
+        page_num = page_data["page_number"]
+        cached: list[tuple[dict, tuple[int, tuple[int, int, int, int]]]] = []
+        for word in page_data.get("words", []):
+            box = word.get("box")
+            if _valid_box(box):
+                key = (page_num, tuple(int(round(float(v))) for v in box))
+                cached.append((word, key))
+        page_words_cache[page_num] = cached
+
+    def _get_available_words(page_num: int, row_idx: int) -> list[dict]:
+        return [
+            word
+            for word, key in page_words_cache.get(page_num, [])
+            if key not in used_boxes or used_boxes[key] == row_idx
+        ]
 
     if isinstance(line_items, list):
+        row_y_bands: dict[int, tuple[float, float]] = {}
+        column_x_centers: dict[str, list[float]] = {}
+
+        # Pass A: longer anchor-like values first
         for row_idx, row in enumerate(line_items):
             if not isinstance(row, dict):
                 continue
-
-            # Determine preferred page for this row
             preferred_page = row_page_map.get(row_idx)
+            search_pages = _ordered_pages(ocr_pages, preferred_page)
+            row_min_y = float("inf")
+            row_max_y = float("-inf")
 
             for col_name, cell_value in row.items():
-                if cell_value is None:
+                if _is_empty_value(cell_value):
                     continue
                 cell_str = str(cell_value).strip()
-                if not cell_str or cell_str.lower() in ("null", "none", "n/a", "", "-"):
+
+                # Keep short/ambiguous values for pass B.
+                if len(cell_str) <= 8 and not cell_str.isalpha():
                     continue
 
                 li_total += 1
-                composite_key = f"line_item_{row_idx}_{col_name}"
-
-                # Sort OCR pages so the preferred page is searched first
-                search_pages = ocr_pages
-                if preferred_page is not None:
-                    search_pages = sorted(
-                        ocr_pages,
-                        key=lambda p, pp=preferred_page: 0 if p["page_number"] == pp else 1,
-                    )
+                key_name = f"line_item_{row_idx}_{col_name}"
 
                 for page_data in search_pages:
                     page_num = page_data["page_number"]
-                    # Filter out already-consumed words for this search
-                    available_words = [
-                        w for w in page_data.get("words", [])
-                        if (page_num, tuple(w["box"])) not in used_boxes
-                    ]
+                    available_words = _get_available_words(page_num, row_idx)
                     location = find_value_in_ocr(cell_str, available_words)
-                    if location:
-                        matched_boxes = location.pop("matched_boxes", [location["box"]])
-                        location["page"] = page_num
-                        location["confidence"] = _classify_confidence(location["strategy"])
-                        location["row_idx"] = row_idx
-                        location["col_name"] = col_name
-                        locations[composite_key] = location
-                        li_matched += 1
-                        # Mark all matched OCR spans as consumed so the next
-                        # duplicate value finds a different occurrence.
-                        for box in matched_boxes:
-                            used_boxes.add((page_num, tuple(box)))
-                        break
+                    if not location:
+                        continue
+
+                    matched_boxes = location.pop("matched_boxes", [location["box"]])
+                    location["page"] = page_num
+                    location["confidence"] = _classify_confidence(location["strategy"])
+                    location["row_idx"] = row_idx
+                    location["col_name"] = col_name
+                    locations[key_name] = location
+                    li_matched += 1
+
+                    for box in matched_boxes:
+                        if _valid_box(box):
+                            src_key = (page_num, tuple(int(round(float(v))) for v in box))
+                            if src_key not in used_boxes:
+                                used_boxes[src_key] = row_idx
+
+                    bx = location["box"]
+                    row_min_y = min(row_min_y, bx[1])
+                    row_max_y = max(row_max_y, bx[3])
+                    column_x_centers.setdefault(col_name, []).append(_box_center_x(bx))
+                    break
+
+            if row_min_y != float("inf"):
+                row_y_bands[row_idx] = (row_min_y, row_max_y)
+
+        col_median_x: dict[str, float] = {}
+        for col_name, centers in column_x_centers.items():
+            sorted_centers = sorted(centers)
+            col_median_x[col_name] = sorted_centers[len(sorted_centers) // 2]
+
+        # Pass B: short/ambiguous values constrained by row band + col X target
+        for row_idx, row in enumerate(line_items):
+            if not isinstance(row, dict):
+                continue
+            preferred_page = row_page_map.get(row_idx)
+            search_pages = _ordered_pages(ocr_pages, preferred_page)
+            y_band = row_y_bands.get(row_idx)
+
+            for col_name, cell_value in row.items():
+                if _is_empty_value(cell_value):
+                    continue
+                cell_str = str(cell_value).strip()
+
+                if len(cell_str) > 8 or cell_str.isalpha():
+                    continue
+
+                key_name = f"line_item_{row_idx}_{col_name}"
+                if key_name in locations:
+                    continue
+
+                li_total += 1
+                x_target = col_median_x.get(col_name)
+
+                for page_data in search_pages:
+                    page_num = page_data["page_number"]
+                    available_words = _get_available_words(page_num, row_idx)
+                    location = find_value_in_ocr(cell_str, available_words, y_band=y_band, x_target=x_target)
+                    if not location:
+                        continue
+
+                    matched_boxes = location.pop("matched_boxes", [location["box"]])
+                    location["page"] = page_num
+                    location["confidence"] = _classify_confidence(location["strategy"])
+                    location["row_idx"] = row_idx
+                    location["col_name"] = col_name
+                    locations[key_name] = location
+                    li_matched += 1
+
+                    for box in matched_boxes:
+                        if _valid_box(box):
+                            src_key = (page_num, tuple(int(round(float(v))) for v in box))
+                            if src_key not in used_boxes:
+                                used_boxes[src_key] = row_idx
+
+                    center_x = _box_center_x(location["box"])
+                    col_median_x.setdefault(col_name, center_x)
+                    break
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    header_total = len([k for k in locations if not k.startswith("line_item_")]) + len(missed)
-
+    header_matched = len([k for k in locations if not k.startswith("line_item_")])
+    header_total = header_matched + len(missed)
     logger.info(
         "Text matching complete: headers=%d/%d, line_items=%d/%d, missed=%d, skipped=%d | %.1fms",
-        header_total - len(missed), header_total,
-        li_matched, li_total,
-        len(missed), len(skipped), elapsed_ms,
+        header_matched,
+        header_total,
+        li_matched,
+        li_total,
+        len(missed),
+        len(skipped),
+        elapsed_ms,
     )
     if missed:
         logger.info("  Unmatched header fields: %s", ", ".join(missed))
-
     return locations

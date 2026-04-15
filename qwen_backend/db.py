@@ -703,6 +703,18 @@ async def save_ocr_data(
             json.dumps(ocr_data),
         )
 
+async def is_postprocess_ready(pool: asyncpg.Pool, extraction_id: int) -> bool:
+    """Lightweight check: are both result and ocr_data present?
+    
+    Avoids loading the massive JSONB blobs — just checks for IS NOT NULL.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT (result IS NOT NULL AND ocr_data IS NOT NULL) AS ready FROM extractions WHERE id = $1",
+            extraction_id,
+        )
+        return bool(row and row["ready"])
+
 
 async def get_ocr_data(pool: asyncpg.Pool, extraction_id: int) -> list[dict] | None:
     """Return PaddleOCR results (words + boxes per page) for click-to-select."""
@@ -857,9 +869,9 @@ async def get_gold_examples(
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT corrected_result
+            SELECT correction_diff
             FROM gold_examples
-            WHERE vendor_id = $1
+            WHERE vendor_id = $1 AND correction_diff IS NOT NULL
             ORDER BY created_at DESC
             LIMIT $2
             """,
@@ -868,7 +880,7 @@ async def get_gold_examples(
         results = []
         for r in rows:
             d = dict(r)
-            _parse_jsonb(d, "corrected_result")
+            _parse_jsonb(d, "correction_diff")
             results.append(d)
         return results
 

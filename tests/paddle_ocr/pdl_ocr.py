@@ -6,7 +6,7 @@ os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 
 from paddleocr import PaddleOCR
 
-IMAGE_PATH = r"C:\Users\aigroup5\Pictures\Screenshots\Screenshot 2026-03-24 172803.png"
+IMAGE_PATH = r"C:\Users\aigroup5\Pictures\Screenshots\Screenshot 2026-04-15 123101.png"
 OUT_DIR = Path("output")
 OUT_DIR.mkdir(exist_ok=True)
 
@@ -18,6 +18,7 @@ ocr = PaddleOCR(
     use_textline_orientation     = False,
     device        = "cpu",
     enable_mkldnn = False,
+    return_word_box=True,
 )
 
 result = ocr.predict(IMAGE_PATH)
@@ -43,9 +44,9 @@ for res in result:
             "box"   : box.tolist(),
         })
 
-(OUT_DIR / "raw_text.txt").write_text("\n".join(texts), encoding="utf-8")
-(OUT_DIR / "bboxes.json").write_text(json.dumps(boxes, indent=2), encoding="utf-8")
-(OUT_DIR / "mapping.json").write_text(json.dumps(mapping, indent=2, ensure_ascii=False), encoding="utf-8")
+(OUT_DIR / "rd_raw_text.txt").write_text("\n".join(texts), encoding="utf-8")
+(OUT_DIR / "rd_bboxes.json").write_text(json.dumps(boxes, indent=2), encoding="utf-8")
+(OUT_DIR / "rd_mapping.json").write_text(json.dumps(mapping, indent=2, ensure_ascii=False), encoding="utf-8")
 
 print(f"✅ {len(texts)} regions")
 for m in mapping:

@@ -96,13 +96,15 @@ def build_system_prompt(
     gold_section = ""
     if gold_examples:
         examples_json = "\n---\n".join(
-            json.dumps(ex["corrected_result"], indent=2, ensure_ascii=False)
-            for ex in gold_examples[:2]  # max 2 to save context window
+            json.dumps(ex["correction_diff"], indent=2, ensure_ascii=False)
+            for ex in gold_examples[:2] if "correction_diff" in ex
         )
-        gold_section = f"""
+        if examples_json.strip():
+            gold_section = f"""
 <verified_examples>
-The following are human-verified correct extractions for this vendor's documents.
-Use them as reference for field formatting, value style, and expected output structure:
+The following are examples of human corrections tracking how raw outputs were fixed.
+These represent "Diffs" in the form {{"field_name": "correct_value"}}.
+Use these as hints for formatting issues or re-occurring mistakes:
 
 {examples_json}
 </verified_examples>"""
