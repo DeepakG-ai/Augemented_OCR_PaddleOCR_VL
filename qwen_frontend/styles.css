@@ -470,6 +470,29 @@ html, body {
 }
 
 /* ── PAGE-LEVEL CARDS ────────────────────────────────────────────────── */
+.history-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.history-delete-btn {
+    padding: 4px 10px;
+    border-radius: 3px;
+    border: 1px solid rgba(239, 68, 68, 0.45);
+    background: rgba(239, 68, 68, 0.08);
+    color: var(--red);
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+.history-delete-btn:hover {
+    background: rgba(239, 68, 68, 0.16);
+    border-color: rgba(239, 68, 68, 0.7);
+}
+
 .page-title {
     font-family: var(--display); font-size: 18px; font-weight: 600;
     letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 16px;

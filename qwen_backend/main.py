@@ -1069,6 +1069,88 @@ async def get_extraction(request: Request, extraction_id: int):
     return ExtractionOut(**row)
 
 
+@app.delete("/extractions/{extraction_id}")
+@limiter.limit("20/minute")
+async def delete_extraction(request: Request, extraction_id: int):
+    """
+    Delete one extraction (history row + related artifacts), not the whole DB/vendor.
+    """
+    pool = request.app.state.pool
+    store = request.app.state.store
+
+    extraction = await db_mod.get_extraction(pool, extraction_id)
+    if not extraction:
+        raise HTTPException(404, detail="Extraction not found")
+
+    if extraction.get("status") in {"queued", "processing", "cancelling"}:
+        raise HTTPException(
+            409,
+            detail="Extraction is active. Cancel it first, then delete.",
+        )
+
+    document_id = extraction.get("document_id")
+    document_key = None
+    if document_id:
+        doc = await db_mod.get_document(pool, document_id)
+        if doc:
+            document_key = doc.get("object_key")
+
+    page_keys = await db_mod.get_page_object_keys(pool, extraction_id)
+    delivery_keys = await db_mod.list_delivery_object_keys(pool, extraction_id)
+
+    export_keys: set[str] = set()
+    export_object_key = extraction.get("export_object_key")
+    if export_object_key:
+        export_keys.add(export_object_key)
+        if export_object_key.endswith(".xlsx"):
+            export_keys.add(export_object_key[:-5] + ".csv")
+    for key in delivery_keys:
+        export_keys.add(key)
+
+    deleted = await db_mod.delete_extraction(pool, extraction_id)
+    if not deleted:
+        raise HTTPException(404, detail="Extraction not found")
+
+    deleted_document = False
+    if document_id and await db_mod.count_extractions_for_document(pool, document_id) == 0:
+        deleted_document = await db_mod.delete_document(pool, document_id)
+
+    try:
+        await request.app.state.redis.delete(f"extraction:{extraction_id}")
+    except Exception:
+        logger.debug("Redis cache delete failed for extraction %d", extraction_id, exc_info=True)
+
+    deleted_objects = {"pages": 0, "exports": 0, "document": 0}
+
+    for object_key in set(page_keys):
+        try:
+            store.delete_object(ARTIFACTS_BUCKET, object_key)
+            deleted_objects["pages"] += 1
+        except Exception:
+            logger.warning("Failed deleting page object %s", object_key, exc_info=True)
+
+    for object_key in export_keys:
+        try:
+            store.delete_object(EXPORTS_BUCKET, object_key)
+            deleted_objects["exports"] += 1
+        except Exception:
+            logger.warning("Failed deleting export object %s", object_key, exc_info=True)
+
+    if deleted_document and document_key:
+        try:
+            store.delete_object(DOCUMENTS_BUCKET, document_key)
+            deleted_objects["document"] = 1
+        except Exception:
+            logger.warning("Failed deleting document object %s", document_key, exc_info=True)
+
+    return {
+        "status": "deleted",
+        "extraction_id": extraction_id,
+        "deleted_document": deleted_document,
+        "deleted_objects": deleted_objects,
+    }
+
+
 @app.get("/extractions/{extraction_id}/pages")
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def get_extraction_pages(request: Request, extraction_id: int):

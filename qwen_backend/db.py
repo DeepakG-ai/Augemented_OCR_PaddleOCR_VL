@@ -664,6 +664,36 @@ async def get_pages(pool: asyncpg.Pool, extraction_id: int) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+async def get_page_object_keys(pool: asyncpg.Pool, extraction_id: int) -> list[str]:
+    """Return artifact object keys for all rendered pages of an extraction."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT object_key
+            FROM pages
+            WHERE extraction_id = $1
+            ORDER BY page_number ASC
+            """,
+            extraction_id,
+        )
+        return [r["object_key"] for r in rows if r.get("object_key")]
+
+
+async def list_delivery_object_keys(pool: asyncpg.Pool, extraction_id: int) -> list[str]:
+    """Return object keys created for integration deliveries/exports."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT object_key
+            FROM integration_deliveries
+            WHERE extraction_id = $1 AND object_key IS NOT NULL
+            ORDER BY created_at DESC
+            """,
+            extraction_id,
+        )
+        return [r["object_key"] for r in rows if r.get("object_key")]
+
+
 # -- Field locations + OCR data --------------------------------------------
 
 async def save_field_locations(
@@ -773,6 +803,38 @@ async def save_export_artifact(pool: asyncpg.Pool, extraction_id: int, object_ke
             extraction_id,
             object_key,
         )
+
+
+async def delete_extraction(pool: asyncpg.Pool, extraction_id: int) -> bool:
+    """Delete exactly one extraction record."""
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM extractions WHERE id = $1",
+            extraction_id,
+        )
+        return result == "DELETE 1"
+
+
+async def count_extractions_for_document(pool: asyncpg.Pool, document_id: int) -> int:
+    """How many extractions still reference a document."""
+    async with pool.acquire() as conn:
+        return int(
+            await conn.fetchval(
+                "SELECT COUNT(*) FROM extractions WHERE document_id = $1",
+                document_id,
+            )
+            or 0
+        )
+
+
+async def delete_document(pool: asyncpg.Pool, document_id: int) -> bool:
+    """Delete exactly one document record."""
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM documents WHERE id = $1",
+            document_id,
+        )
+        return result == "DELETE 1"
 
 
 def get_effective_result(extraction: dict) -> dict:

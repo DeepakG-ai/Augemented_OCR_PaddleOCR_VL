@@ -90,6 +90,24 @@ class ObjectStore:
             response.close()
             response.release_conn()
 
+    def delete_object(self, bucket: str, object_key: str) -> None:
+        """Delete an object if present. Missing objects are ignored."""
+        self._validate_object_key(object_key)
+        if self.client is None:
+            target = (self._local_root / bucket / object_key).resolve()
+            if not str(target).startswith(str(self._local_root.resolve())):
+                raise ValueError("object_key attempts to escape storage directory")
+            if target.exists():
+                target.unlink()
+            return
+        try:
+            self.client.remove_object(bucket, object_key)
+        except Exception as exc:
+            code = str(getattr(exc, "code", ""))
+            if code in {"NoSuchKey", "NoSuchObject", "NoSuchBucket"}:
+                return
+            raise
+
 
 @lru_cache(maxsize=1)
 def get_store() -> ObjectStore:

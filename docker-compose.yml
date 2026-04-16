@@ -188,11 +188,6 @@ services:
       - PHOENIX_WORKING_DIR=/phoenix
     volumes:
       - phoenixdata:/phoenix
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:6006/healthz')"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
 volumes:
   pgdata:

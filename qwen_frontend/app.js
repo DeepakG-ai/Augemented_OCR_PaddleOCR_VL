@@ -832,11 +832,11 @@ let _pipelineStartTime = null;
 let _pipelineTimerInterval = null;
 
 const PIPELINE_STAGES = [
-    { id: 'upload',      label: 'Uploading',       detail: 'Data stream verified' },
-    { id: 'normalize',   label: 'Normalization',   detail: 'Page render engine' },
-    { id: 'ocr',         label: 'OCR Execution',   detail: 'PaddleOCR v5' },
-    { id: 'llm',         label: 'Qwen VL',         detail: 'Vision extraction' },
-    { id: 'postprocess', label: 'Post-Processing',  detail: 'Field mapping' },
+    { id: 'upload', label: 'Uploading', detail: 'Data stream verified' },
+    { id: 'normalize', label: 'Normalization', detail: 'Page render engine' },
+    { id: 'ocr', label: 'OCR Execution', detail: 'PaddleOCR v5' },
+    { id: 'llm', label: 'Qwen VL', detail: 'Vision extraction' },
+    { id: 'postprocess', label: 'Post-Processing', detail: 'Field mapping' },
 ];
 
 function buildPipelineHTML() {
@@ -860,7 +860,7 @@ function buildPipelineHTML() {
             </div>
             <div class="pipeline-stages">${stagesHTML}</div>
             <div class="pipeline-elapsed" id="pipelineElapsed">
-                Elapsed: <span class="pipeline-elapsed-value" id="pipelineTimer">0.0s</span>
+                Working: <span class="pipeline-elapsed-value" id="pipelineTimer">0.0s</span>
             </div>
         </div>
     `;
@@ -1429,9 +1429,16 @@ async function renderHistoryPage(app) {
                             <a class="link-btn" href="#/review/${e.id}" onclick="event.stopPropagation()" style="font-size:9px">Review</a>
                         </div>
                     </div>
+                    <div class="history-actions">
                     <div class="history-latency ${e.duration_ms ? '' : 'no-data'}" title="End-to-end extraction latency">
                         <span class="history-latency-icon">⏱</span>
                         <span class="history-latency-value">${e.duration_ms ? (e.duration_ms / 1000).toFixed(1) + 's' : '—'}</span>
+                    </div>
+                    <button
+                        class="history-delete-btn"
+                        title="Delete this extraction"
+                        onclick="event.stopPropagation(); deleteExtractionSafe(${e.id}, '${escapeInlineJsString(e.filename || 'this file')}')"
+                    >Delete</button>
                     </div>
                 </div>
             </div>`).join('')}
@@ -1448,6 +1455,19 @@ async function renderHistoryPage(app) {
 
 
 // ── NAV HELPER ─────────────────────────────────────────────────────────
+async function deleteExtractionSafe(id, filename) {
+    const msg = `Delete "${filename}" from History?\n\nThis removes only this extraction and its files.`;
+    if (!window.confirm(msg)) return;
+    try {
+        await apiJSON(`/extractions/${id}`, { method: 'DELETE' });
+        showToast('Extraction deleted');
+        const app = document.getElementById('appRoot');
+        if (app) await renderHistoryPage(app);
+    } catch (e) {
+        showToast(`Delete failed: ${e.message}`);
+    }
+}
+
 async function showHistoryDetailSafe(id) {
     try {
         const data = await apiJSON(`/extractions/${id}`);
