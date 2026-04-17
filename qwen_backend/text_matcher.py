@@ -8,6 +8,7 @@ Design goals:
 """
 from __future__ import annotations
 
+from collections import defaultdict
 import logging
 import re
 import time
@@ -20,6 +21,48 @@ logger = logging.getLogger("text_matcher")
 _WS_RE = re.compile(r"\s+")
 _TOKEN_RE = re.compile(r"\S+")
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+_ROW_STRONG_FIELDS = {"item", "no", "part_number", "item_number", "item_code", "supplier_code"}
+_ROW_MEDIUM_FIELDS = {
+    "qty",
+    "ship_qty",
+    "order_qty",
+    "req_quantity",
+    "ordered_qty",
+    "shipped_qty",
+    "uom",
+    "um",
+    "pack",
+}
+_ROW_WEAK_FIELDS = {
+    "unit_cost",
+    "unit_price",
+    "net_price",
+    "amount",
+    "extended_price",
+    "extendnd_price",
+    "due_date",
+    "variant",
+}
+_ROW_DESCRIPTION_FIELDS = {"description"}
+_TABLE_HEADER_CUES = (
+    "item",
+    "description",
+    "qty",
+    "uom",
+    "u m",
+    "unit",
+    "cost",
+    "price",
+    "amount",
+    "variant",
+    "pack",
+    "due",
+    "order",
+    "ship",
+    "no",
+    "supplier code",
+)
 
 
 def _normalize_text(text: str) -> str:
@@ -37,6 +80,12 @@ def _normalize_token(token: str) -> str:
 
 def _normalize_token_loose(token: str) -> str:
     return _NON_ALNUM_RE.sub("", _normalize_token(token))
+
+
+_ROW_STRONG_FIELDS_NORM = {_normalize_token_loose(name) for name in _ROW_STRONG_FIELDS}
+_ROW_MEDIUM_FIELDS_NORM = {_normalize_token_loose(name) for name in _ROW_MEDIUM_FIELDS}
+_ROW_WEAK_FIELDS_NORM = {_normalize_token_loose(name) for name in _ROW_WEAK_FIELDS}
+_ROW_DESCRIPTION_FIELDS_NORM = {_normalize_token_loose(name) for name in _ROW_DESCRIPTION_FIELDS}
 
 
 def _valid_box(box: Any) -> bool:
@@ -60,6 +109,10 @@ def _box_union(boxes: list[list[int]]) -> list[int]:
 
 def _box_center_x(box: list[int]) -> float:
     return (box[0] + box[2]) / 2.0
+
+
+def _box_center_y(box: list[int]) -> float:
+    return (box[1] + box[3]) / 2.0
 
 
 def _box_area(box: list[int]) -> int:
@@ -430,6 +483,328 @@ def _ordered_pages(ocr_pages: list[dict], preferred_page: int | None = None) -> 
     return sorted(ocr_pages, key=lambda p, pref=preferred_page: 0 if p.get("page_number") == pref else 1)
 
 
+def _median_int(values: list[float | int]) -> int:
+    if not values:
+        return 0
+    ordered = sorted(float(v) for v in values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return int(round(ordered[mid]))
+    return int(round((ordered[mid - 1] + ordered[mid]) / 2.0))
+
+
+def _field_weight(field_name: str) -> int:
+    normalized = _normalize_token_loose(field_name)
+    if normalized in _ROW_STRONG_FIELDS_NORM:
+        return 5
+    if normalized in _ROW_MEDIUM_FIELDS_NORM:
+        return 3
+    if normalized in _ROW_WEAK_FIELDS_NORM:
+        return 2
+    if normalized in _ROW_DESCRIPTION_FIELDS_NORM:
+        return 1
+    return 2
+
+
+def _strategy_score_factor(strategy: str) -> float:
+    base = strategy.split("(")[0]
+    if base == "exact":
+        return 1.0
+    if base in {"token_chain", "contains", "contains_subspan", "multi_span"}:
+        return 0.85
+    if base == "fuzzy":
+        return 0.60
+    return 0.0
+
+
+def _strategy_to_match_mode(strategy: str) -> str:
+    base = strategy.split("(")[0]
+    if base in {"exact", "token_chain", "contains", "contains_subspan"}:
+        return "cell_exact"
+    if base == "multi_span":
+        return "cell_span"
+    if base == "fuzzy":
+        return "cell_fuzzy"
+    return "cell_exact"
+
+
+def _prepare_page_words(page_words: list[dict]) -> list[dict]:
+    prepared: list[dict] = []
+    for word in page_words:
+        raw = str(word.get("text", "")).strip()
+        box = word.get("box")
+        if not raw or not _valid_box(box):
+            continue
+        prepared.append(
+            {
+                "text": raw,
+                "box": [int(round(float(v))) for v in box],
+                "score": float(word.get("score", 0.0)),
+            }
+        )
+    prepared.sort(key=lambda w: (_box_center_y(w["box"]), w["box"][0]))
+    return prepared
+
+
+def _build_ocr_lines(page_words: list[dict]) -> list[dict]:
+    lines: list[dict] = []
+    for word in page_words:
+        word_box = word["box"]
+        word_h = max(1, word_box[3] - word_box[1])
+        word_cy = _box_center_y(word_box)
+
+        if not lines:
+            lines.append(
+                {
+                    "words": [word],
+                    "box": word_box[:],
+                    "center_y": word_cy,
+                    "avg_height": float(word_h),
+                }
+            )
+            continue
+
+        last = lines[-1]
+        tolerance = max(8.0, min(20.0, max(last["avg_height"], float(word_h)) * 0.65))
+        if abs(word_cy - last["center_y"]) <= tolerance:
+            last["words"].append(word)
+            last["words"].sort(key=lambda w: w["box"][0])
+            last["box"] = _box_union([w["box"] for w in last["words"]])
+            last["center_y"] = sum(_box_center_y(w["box"]) for w in last["words"]) / len(last["words"])
+            last["avg_height"] = sum(max(1, w["box"][3] - w["box"][1]) for w in last["words"]) / len(last["words"])
+        else:
+            lines.append(
+                {
+                    "words": [word],
+                    "box": word_box[:],
+                    "center_y": word_cy,
+                    "avg_height": float(word_h),
+                }
+            )
+
+    for idx, line in enumerate(lines):
+        line["index"] = idx
+        line["text"] = " ".join(w["text"] for w in sorted(line["words"], key=lambda w: w["box"][0]))
+        line["norm"] = _normalize_text(line["text"])
+    return lines
+
+
+def _detect_table_region(lines: list[dict], line_items: list[dict]) -> dict[str, int | None]:
+    if not lines:
+        return {"header_y": None, "data_start_y": 0, "data_end_y": 0}
+
+    header_idx: int | None = None
+    for idx, line in enumerate(lines):
+        norm = line.get("norm", "")
+        cue_hits = sum(1 for cue in _TABLE_HEADER_CUES if cue in norm)
+        if cue_hits >= 2:
+            header_idx = idx
+            break
+
+    if header_idx is None and line_items:
+        sample_rows = [row for row in line_items[: min(3, len(line_items))] if isinstance(row, dict)]
+        for idx, line in enumerate(lines):
+            line_score = 0.0
+            for row in sample_rows:
+                for field_name, cell_value in row.items():
+                    if _is_empty_value(cell_value):
+                        continue
+                    if find_value_in_ocr(str(cell_value).strip(), line.get("words", []), fuzzy_threshold=0.88):
+                        line_score += _field_weight(field_name)
+            if line_score >= 4.0:
+                header_idx = max(0, idx - 1)
+                break
+
+    data_start_idx = min(len(lines) - 1, header_idx + 1) if header_idx is not None else 0
+    data_start_y = lines[data_start_idx]["box"][1]
+    data_end_y = max(line["box"][3] for line in lines[data_start_idx:]) if lines[data_start_idx:] else lines[-1]["box"][3]
+    header_y = lines[header_idx]["box"][1] if header_idx is not None else None
+    return {"header_y": header_y, "data_start_y": data_start_y, "data_end_y": data_end_y}
+
+
+def _line_has_left_anchor(line: dict, table_left: int) -> bool:
+    words = line.get("words", [])
+    if not words:
+        return False
+    first_box = words[0]["box"]
+    return first_box[0] <= table_left + 45
+
+
+def _should_merge_row_line(current_row: dict, next_line: dict, table_left: int, median_height: int) -> bool:
+    gap = next_line["box"][1] - current_row["box"][3]
+    if gap > max(10, int(median_height * 1.2)):
+        return False
+    if next_line["box"][0] <= table_left + 45:
+        return False
+    if _line_has_left_anchor(next_line, table_left):
+        return False
+    return True
+
+
+def _build_logical_rows(lines: list[dict], table_region: dict[str, int | None]) -> list[dict]:
+    data_start_y = int(table_region.get("data_start_y") or 0)
+    data_end_y = int(table_region.get("data_end_y") or 0)
+    data_lines = [line for line in lines if line["box"][1] >= data_start_y - 4 and line["box"][3] <= data_end_y + 4]
+    if not data_lines:
+        return []
+
+    table_left = min(line["box"][0] for line in data_lines)
+    median_height = max(10, _median_int([line["avg_height"] for line in data_lines]))
+    rows: list[dict] = []
+    for line in data_lines:
+        if not rows or not _should_merge_row_line(rows[-1], line, table_left, median_height):
+            rows.append({"lines": [line], "box": line["box"][:]})
+            continue
+        rows[-1]["lines"].append(line)
+        rows[-1]["box"] = _box_union([ln["box"] for ln in rows[-1]["lines"]])
+
+    logical_rows: list[dict] = []
+    for idx, row in enumerate(rows):
+        row_words = [word for line in row["lines"] for word in line.get("words", [])]
+        if not row_words:
+            continue
+        row_words.sort(key=lambda word: (_box_center_y(word["box"]), word["box"][0]))
+        row_box = _box_union([word["box"] for word in row_words])
+        row_text = " ".join(word["text"] for word in row_words)
+        logical_rows.append(
+            {
+                "index": idx,
+                "box": row_box,
+                "words": row_words,
+                "text": row_text,
+                "norm": _normalize_text(row_text),
+            }
+        )
+    return logical_rows
+
+
+def _build_page_models(ocr_pages: list[dict], line_items: list[dict]) -> dict[int, dict]:
+    page_models: dict[int, dict] = {}
+    for page_data in ocr_pages:
+        page_number = int(page_data.get("page_number", 0) or 0)
+        prepared_words = _prepare_page_words(page_data.get("words", []))
+        lines = _build_ocr_lines(prepared_words)
+        table_region = _detect_table_region(lines, line_items)
+        rows = _build_logical_rows(lines, table_region)
+        for row in rows:
+            row["page"] = page_number
+        page_models[page_number] = {
+            "page_number": page_number,
+            "ocr_words": prepared_words,
+            "ocr_lines": lines,
+            "ocr_rows": rows,
+            "table_region": table_region,
+        }
+    return page_models
+
+
+def _score_qwen_row_to_ocr_row(row: dict[str, Any], candidate_row: dict) -> tuple[float, list[dict]]:
+    score = 0.0
+    evidence: list[dict] = []
+    has_anchor = False
+
+    for field_name, cell_value in row.items():
+        if _is_empty_value(cell_value):
+            continue
+        weight = _field_weight(field_name)
+        if weight <= 0:
+            continue
+        location = find_value_in_ocr(str(cell_value).strip(), candidate_row.get("words", []), fuzzy_threshold=0.88)
+        if not location:
+            continue
+        factor = _strategy_score_factor(location.get("strategy", ""))
+        if factor <= 0:
+            continue
+        weighted = weight * factor
+        score += weighted
+        if weight >= 3:
+            has_anchor = True
+        evidence.append(
+            {
+                "field_name": field_name,
+                "strategy": location.get("strategy", ""),
+                "weight": weight,
+                "score": weighted,
+            }
+        )
+
+    if not has_anchor and score < 4.0:
+        return 0.0, []
+    return score, evidence
+
+
+def _assign_qwen_rows_to_ocr_rows(
+    line_items: list[dict],
+    row_candidates: list[dict],
+    row_page_map: dict[int, int],
+) -> tuple[dict[int, int], dict[tuple[int, int], list[dict]]]:
+    n = len(line_items)
+    m = len(row_candidates)
+    if not n or not m:
+        return {}, {}
+
+    score_matrix: list[list[float]] = [[0.0 for _ in range(m)] for _ in range(n)]
+    evidence_map: dict[tuple[int, int], list[dict]] = {}
+    for row_idx, row in enumerate(line_items):
+        if not isinstance(row, dict):
+            continue
+        preferred_page = row_page_map.get(row_idx)
+        for cand_idx, candidate in enumerate(row_candidates):
+            if preferred_page is not None and candidate.get("page") != preferred_page:
+                continue
+            score, evidence = _score_qwen_row_to_ocr_row(row, candidate)
+            if score <= 0:
+                continue
+            score_matrix[row_idx][cand_idx] = score
+            evidence_map[(row_idx, cand_idx)] = evidence
+
+    dp: list[list[float]] = [[0.0 for _ in range(m + 1)] for _ in range(n + 1)]
+    parent: list[list[tuple[int, int, str] | None]] = [[None for _ in range(m + 1)] for _ in range(n + 1)]
+
+    for i in range(1, n + 1):
+        dp[i][0] = dp[i - 1][0]
+        parent[i][0] = (i - 1, 0, "skip_qwen")
+    for j in range(1, m + 1):
+        parent[0][j] = (0, j - 1, "skip_ocr")
+
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            best_score = dp[i - 1][j]
+            best_parent = (i - 1, j, "skip_qwen")
+
+            if dp[i][j - 1] > best_score:
+                best_score = dp[i][j - 1]
+                best_parent = (i, j - 1, "skip_ocr")
+
+            candidate_score = score_matrix[i - 1][j - 1]
+            if candidate_score > 0 and dp[i - 1][j - 1] + candidate_score > best_score:
+                best_score = dp[i - 1][j - 1] + candidate_score
+                best_parent = (i - 1, j - 1, "match")
+
+            dp[i][j] = best_score
+            parent[i][j] = best_parent
+
+    assignments: dict[int, int] = {}
+    i, j = n, m
+    while i > 0 or j > 0:
+        step = parent[i][j]
+        if step is None:
+            break
+        prev_i, prev_j, action = step
+        if action == "match" and score_matrix[i - 1][j - 1] > 0:
+            assignments[i - 1] = j - 1
+        i, j = prev_i, prev_j
+
+    return assignments, evidence_map
+
+
+def _box_from_location(location: dict[str, Any]) -> list[int] | None:
+    box = location.get("box")
+    if _valid_box(box):
+        return [int(round(float(v))) for v in box]
+    return None
+
+
 def compute_field_locations(
     extraction_result: dict[str, Any],
     ocr_pages: list[dict],
@@ -464,6 +839,8 @@ def compute_field_locations(
         merged["line_items"] = all_items
         extraction_result = merged
 
+    line_items = extraction_result.get("line_items")
+
     # Stage 1: headers
     for field_name, field_value in extraction_result.items():
         if field_name == "line_items":
@@ -497,7 +874,10 @@ def compute_field_locations(
                 line_hits.append(hit_for_line)
 
         if line_hits:
-            primary = line_hits[0]
+            primary = dict(line_hits[0])
+            same_page_hits = [hit for hit in line_hits if hit["page"] == primary["page"]]
+            if len(same_page_hits) > 1:
+                primary["box"] = _box_union([hit["box"] for hit in same_page_hits])
             if len(line_hits) > 1:
                 primary["sub_locations"] = [
                     {
@@ -523,6 +903,9 @@ def compute_field_locations(
             missed.append(field_name)
 
     # Stage 2: line items
+    li_total = 0
+    li_matched = 0
+
     row_page_map: dict[int, int] = {}
     if page_results:
         running_idx = 0
@@ -534,138 +917,122 @@ def compute_field_locations(
                     row_page_map[running_idx] = page_num
                     running_idx += 1
 
-    line_items = extraction_result.get("line_items")
-    li_matched = 0
-    li_total = 0
-
-    # Key: (page_number, tuple(source_box)) -> row_idx that owns this source box.
-    used_boxes: dict[tuple[int, tuple[int, int, int, int]], int] = {}
-
-    page_words_cache: dict[int, list[tuple[dict, tuple[int, tuple[int, int, int, int]]]]] = {}
-    for page_data in ocr_pages:
-        page_num = page_data["page_number"]
-        cached: list[tuple[dict, tuple[int, tuple[int, int, int, int]]]] = []
-        for word in page_data.get("words", []):
-            box = word.get("box")
-            if _valid_box(box):
-                key = (page_num, tuple(int(round(float(v))) for v in box))
-                cached.append((word, key))
-        page_words_cache[page_num] = cached
-
-    def _get_available_words(page_num: int, row_idx: int) -> list[dict]:
-        return [
-            word
-            for word, key in page_words_cache.get(page_num, [])
-            if key not in used_boxes or used_boxes[key] == row_idx
-        ]
-
     if isinstance(line_items, list):
-        row_y_bands: dict[int, tuple[float, float]] = {}
-        column_x_centers: dict[str, list[float]] = {}
+        li_total = sum(
+            1
+            for row in line_items
+            if isinstance(row, dict)
+            for value in row.values()
+            if not _is_empty_value(value)
+        )
 
-        # Pass A: longer anchor-like values first
+        page_models = _build_page_models(ocr_pages, [row for row in line_items if isinstance(row, dict)])
+        row_candidates: list[dict] = []
+        for page_num in sorted(page_models):
+            page_rows = page_models[page_num].get("ocr_rows", [])
+            row_candidates.extend(sorted(page_rows, key=lambda row: (row["box"][1], row["box"][0])))
+
+        row_assignments, _ = _assign_qwen_rows_to_ocr_rows(line_items, row_candidates, row_page_map)
+        missing_fields_by_row: dict[int, list[tuple[str, str, dict]]] = defaultdict(list)
+
         for row_idx, row in enumerate(line_items):
             if not isinstance(row, dict):
                 continue
-            preferred_page = row_page_map.get(row_idx)
-            search_pages = _ordered_pages(ocr_pages, preferred_page)
-            row_min_y = float("inf")
-            row_max_y = float("-inf")
+            assigned_candidate = row_candidates[row_assignments[row_idx]] if row_idx in row_assignments else None
 
             for col_name, cell_value in row.items():
                 if _is_empty_value(cell_value):
                     continue
                 cell_str = str(cell_value).strip()
-
-                # Keep short/ambiguous values for pass B.
-                if len(cell_str) <= 8 and not cell_str.isalpha():
-                    continue
-
-                li_total += 1
                 key_name = f"line_item_{row_idx}_{col_name}"
 
-                for page_data in search_pages:
-                    page_num = page_data["page_number"]
-                    available_words = _get_available_words(page_num, row_idx)
-                    location = find_value_in_ocr(cell_str, available_words)
+                if assigned_candidate is not None:
+                    location = find_value_in_ocr(cell_str, assigned_candidate.get("words", []), fuzzy_threshold=0.88)
+                    if location:
+                        value_box = _box_from_location(location)
+                        if value_box:
+                            location.pop("matched_boxes", None)
+                            location["page"] = assigned_candidate["page"]
+                            location["box"] = value_box
+                            location["value_box"] = value_box[:]
+                            location["row_box"] = assigned_candidate["box"][:]
+                            location["row_index"] = row_idx
+                            location["field_name"] = col_name
+                            location["match_mode"] = _strategy_to_match_mode(location["strategy"])
+                            location["confidence"] = _classify_confidence(location["strategy"])
+                            locations[key_name] = location
+                            li_matched += 1
+                            continue
+
+                    missing_fields_by_row[row_idx].append((col_name, cell_str, assigned_candidate))
+                    continue
+
+                preferred_page = row_page_map.get(row_idx)
+                for page_data in _ordered_pages(ocr_pages, preferred_page):
+                    location = find_value_in_ocr(cell_str, page_data.get("words", []), fuzzy_threshold=0.88)
                     if not location:
                         continue
-
-                    matched_boxes = location.pop("matched_boxes", [location["box"]])
-                    location["page"] = page_num
-                    location["confidence"] = _classify_confidence(location["strategy"])
-                    location["row_idx"] = row_idx
-                    location["col_name"] = col_name
+                    value_box = _box_from_location(location)
+                    if not value_box:
+                        continue
+                    location.pop("matched_boxes", None)
+                    location["page"] = page_data["page_number"]
+                    location["box"] = value_box
+                    location["value_box"] = value_box[:]
+                    location["row_box"] = None
+                    location["row_index"] = row_idx
+                    location["field_name"] = col_name
+                    location["match_mode"] = "value_fallback_global"
+                    location["confidence"] = "low"
                     locations[key_name] = location
                     li_matched += 1
-
-                    for box in matched_boxes:
-                        if _valid_box(box):
-                            src_key = (page_num, tuple(int(round(float(v))) for v in box))
-                            if src_key not in used_boxes:
-                                used_boxes[src_key] = row_idx
-
-                    bx = location["box"]
-                    row_min_y = min(row_min_y, bx[1])
-                    row_max_y = max(row_max_y, bx[3])
-                    column_x_centers.setdefault(col_name, []).append(_box_center_x(bx))
                     break
 
-            if row_min_y != float("inf"):
-                row_y_bands[row_idx] = (row_min_y, row_max_y)
-
-        col_median_x: dict[str, float] = {}
-        for col_name, centers in column_x_centers.items():
-            sorted_centers = sorted(centers)
-            col_median_x[col_name] = sorted_centers[len(sorted_centers) // 2]
-
-        # Pass B: short/ambiguous values constrained by row band + col X target
-        for row_idx, row in enumerate(line_items):
-            if not isinstance(row, dict):
+        fallback_spans: dict[tuple[int, str], list[list[int]]] = defaultdict(list)
+        for field_name, location in locations.items():
+            if not field_name.startswith("line_item_"):
                 continue
-            preferred_page = row_page_map.get(row_idx)
-            search_pages = _ordered_pages(ocr_pages, preferred_page)
-            y_band = row_y_bands.get(row_idx)
+            if location.get("match_mode") not in {"cell_exact", "cell_span"}:
+                continue
+            page = location.get("page")
+            column = location.get("field_name")
+            value_box = location.get("value_box") or location.get("box")
+            if page is None or not column or not _valid_box(value_box):
+                continue
+            fallback_spans[(int(page), str(column))].append([int(round(float(v))) for v in value_box])
 
-            for col_name, cell_value in row.items():
-                if _is_empty_value(cell_value):
-                    continue
-                cell_str = str(cell_value).strip()
-
-                if len(cell_str) > 8 or cell_str.isalpha():
-                    continue
-
+        for row_idx, missing_fields in missing_fields_by_row.items():
+            for col_name, _cell_str, assigned_candidate in missing_fields:
                 key_name = f"line_item_{row_idx}_{col_name}"
                 if key_name in locations:
                     continue
 
-                li_total += 1
-                x_target = col_median_x.get(col_name)
+                spans = fallback_spans.get((assigned_candidate["page"], col_name), [])
+                if len(spans) < 2:
+                    continue
 
-                for page_data in search_pages:
-                    page_num = page_data["page_number"]
-                    available_words = _get_available_words(page_num, row_idx)
-                    location = find_value_in_ocr(cell_str, available_words, y_band=y_band, x_target=x_target)
-                    if not location:
-                        continue
+                left = _median_int([box[0] for box in spans])
+                right = _median_int([box[2] for box in spans])
+                row_box = [int(v) for v in assigned_candidate["box"]]
+                fallback_box = [max(row_box[0], left), row_box[1], min(row_box[2], right), row_box[3]]
+                if not _valid_box(fallback_box):
+                    continue
 
-                    matched_boxes = location.pop("matched_boxes", [location["box"]])
-                    location["page"] = page_num
-                    location["confidence"] = _classify_confidence(location["strategy"])
-                    location["row_idx"] = row_idx
-                    location["col_name"] = col_name
-                    locations[key_name] = location
-                    li_matched += 1
-
-                    for box in matched_boxes:
-                        if _valid_box(box):
-                            src_key = (page_num, tuple(int(round(float(v))) for v in box))
-                            if src_key not in used_boxes:
-                                used_boxes[src_key] = row_idx
-
-                    center_x = _box_center_x(location["box"])
-                    col_median_x.setdefault(col_name, center_x)
-                    break
+                locations[key_name] = {
+                    "page": assigned_candidate["page"],
+                    "box": fallback_box,
+                    "matched_text": "",
+                    "score": 0.0,
+                    "strategy": "row_fallback_vertical",
+                    "confidence": "low",
+                    "row_index": row_idx,
+                    "field_name": col_name,
+                    "row_box": row_box,
+                    "value_box": None,
+                    "fallback_column_box": fallback_box[:],
+                    "match_mode": "row_fallback_vertical",
+                }
+                li_matched += 1
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
     header_matched = len([k for k in locations if not k.startswith("line_item_")])

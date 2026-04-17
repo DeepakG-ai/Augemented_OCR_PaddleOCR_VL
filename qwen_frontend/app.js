@@ -1677,10 +1677,24 @@ function rvGetDotClass(fieldKey) {
     const loc = _rvFieldLocs[fieldKey];
     if (!loc) return 'missing';
     if (loc.strategy === 'manual') return 'manual';
+    if (rvIsLowConfidenceLoc(loc)) return 'found-low';
     const conf = loc.confidence || 'high';
     if (conf === 'high') return 'found-high';
     if (conf === 'medium' || conf === 'low') return 'found-low';
     return 'found-high';
+}
+
+function rvIsLowConfidenceLoc(loc) {
+    if (!loc || loc.strategy === 'manual') return false;
+    return ['row_fallback_vertical', 'value_fallback_global', 'cell_fuzzy'].includes(loc.match_mode)
+        || loc.confidence === 'medium'
+        || loc.confidence === 'low';
+}
+
+function rvGetLineItemCellClass(loc) {
+    if (!loc) return '';
+    if (loc.strategy === 'manual') return 'cell-manual';
+    return rvIsLowConfidenceLoc(loc) ? 'cell-matched-low' : 'cell-matched';
 }
 
 function _isFieldChanged(key) {
@@ -1785,7 +1799,7 @@ function rvRenderLineItems() {
         `<tr>${cols.map(c => {
             const compKey = `line_item_${rowIdx}_${c}`;
             const loc = _rvFieldLocs[compKey];
-            const cellClass = loc ? (loc.strategy === 'manual' ? 'cell-manual' : 'cell-matched') : '';
+            const cellClass = rvGetLineItemCellClass(loc);
             const selClass = _rvSelectionField === compKey ? 'cell-selecting' : '';
             const cellValue = String(row[c] ?? '');
             const safeCompKey = escapeHtml(compKey);
@@ -1863,7 +1877,11 @@ function rvRenderMappingRects() {
         const height = (box[3] - box[1]) * scaleY;
 
         const rect = document.createElement('div');
-        rect.className = 'mapping-rect';
+        let rectClass = 'mapping-rect';
+        if (loc.strategy === 'manual') rectClass += ' mapping-rect-manual';
+        else if (loc.match_mode === 'row_fallback_vertical') rectClass += ' mapping-rect-vertical mapping-rect-low';
+        else if (rvIsLowConfidenceLoc(loc)) rectClass += ' mapping-rect-low';
+        rect.className = rectClass;
         rect.id = `rvRect_${fieldName}`;
         rect.style.left = `${left}px`;
         rect.style.top = `${top}px`;

@@ -775,6 +775,10 @@ html, body {
 .review-line-items td.cell-matched {
     border-left: 2px solid var(--green);
 }
+.review-line-items td.cell-matched-low {
+    border-left: 2px solid var(--amber);
+    background: var(--amber-bg);
+}
 .review-line-items td.cell-manual {
     border-left: 2px solid var(--blue);
 }
@@ -802,6 +806,17 @@ html, body {
     cursor: pointer;
     transition: all 0.15s ease;
     z-index: 10;
+}
+.mapping-rect.mapping-rect-low {
+    border-color: rgba(245, 158, 11, 0.55);
+    background: rgba(245, 158, 11, 0.08);
+}
+.mapping-rect.mapping-rect-vertical {
+    background: rgba(59, 130, 246, 0.14);
+}
+.mapping-rect.mapping-rect-manual {
+    border-style: solid;
+    border-color: rgba(59, 130, 246, 0.7);
 }
 .mapping-rect:hover,
 .mapping-rect.active {
