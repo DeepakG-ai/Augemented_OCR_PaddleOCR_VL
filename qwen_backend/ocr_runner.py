@@ -67,6 +67,7 @@ def _get_ocr_engine():
             device="cpu",
             enable_mkldnn=True,
             cpu_threads=4,
+            return_word_box=True,
         )
         elapsed = (time.perf_counter() - t0) * 1000
         logger.info("PaddleOCR engine ready for thread %s in %.0fms", threading.current_thread().name, elapsed)

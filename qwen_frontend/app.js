@@ -1686,7 +1686,7 @@ function rvGetDotClass(fieldKey) {
 
 function rvIsLowConfidenceLoc(loc) {
     if (!loc || loc.strategy === 'manual') return false;
-    return ['row_fallback_vertical', 'value_fallback_global', 'cell_fuzzy'].includes(loc.match_mode)
+    return ['row_fallback_vertical', 'value_fallback_global', 'cell_fuzzy', 'column_inferred', 'column_fuzzy'].includes(loc.match_mode)
         || loc.confidence === 'medium'
         || loc.confidence === 'low';
 }
@@ -1879,7 +1879,8 @@ function rvRenderMappingRects() {
         const rect = document.createElement('div');
         let rectClass = 'mapping-rect';
         if (loc.strategy === 'manual') rectClass += ' mapping-rect-manual';
-        else if (loc.match_mode === 'row_fallback_vertical') rectClass += ' mapping-rect-vertical mapping-rect-low';
+        else if (loc.match_mode === 'row_fallback_vertical' || loc.match_mode === 'column_inferred') rectClass += ' mapping-rect-vertical mapping-rect-low';
+        else if (loc.match_mode === 'column_fuzzy') rectClass += ' mapping-rect-low';
         else if (rvIsLowConfidenceLoc(loc)) rectClass += ' mapping-rect-low';
         rect.className = rectClass;
         rect.id = `rvRect_${fieldName}`;

@@ -57,6 +57,10 @@ _FORMAT_DESCRIPTIONS: dict[str, str] = {
 }
 
 
+# ── Prompt Version (bump this to invalidate all cached prompts in DB/Redis) ──
+# v2 = column-based text_matcher, no bbox_2d in output
+PROMPT_VERSION = "v2"
+
 # ── System Prompt (built once, stored in DB + Redis) ─────────────────
 
 def build_system_prompt(
@@ -227,6 +231,7 @@ def compute_prompt_hash(
         "instructions": instructions or "",
         "rules": sorted(rules),
         "format_type": format_type,
+        "prompt_version": PROMPT_VERSION,
         "gold_examples": [
             {
                 "corrected_result": ex.get("corrected_result"),
