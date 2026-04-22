@@ -54,8 +54,18 @@ def _resize_to_vlm_budget(img: Image.Image) -> Image.Image:
     if scale < 1.0:
         nw = max(1, int(w * scale))
         nh = max(1, int(h * scale))
+    else:
+        nw, nh = w, h
+
+    # Qwen3-VL patch size alignment: ensure dimensions are multiples of 32
+    # This prevents the VLM from internally padding/resizing and throwing off bbox coordinates
+    # (Fixes the issue where bounding boxes point slightly above the field)
+    nw = max(32, round(nw / 32) * 32)
+    nh = max(32, round(nh / 32) * 32)
+
+    if (nw, nh) != (w, h):
         img = img.resize((nw, nh), Image.Resampling.LANCZOS)
-        logger.debug("VLM resize %.3f → %dx%d", scale, nw, nh)
+        logger.debug("VLM resize %.3f → %dx%d (aligned to 32)", scale, nw, nh)
 
     return img
 
@@ -111,6 +121,8 @@ def _render_pdf_sync(file_bytes: bytes, dpi: int = DPI_DEFAULT) -> list[dict]:
                 finally:
                     bitmap.close()  # free C++ bitmap heap immediately after PIL copy
 
+                orig_w, orig_h = img.size
+
                 # Apply Qwen3-VL dual-budget resize (long-side + pixel-area)
                 img = _resize_to_vlm_budget(img)
 
@@ -129,6 +141,8 @@ def _render_pdf_sync(file_bytes: bytes, dpi: int = DPI_DEFAULT) -> list[dict]:
                     "mime_type":   "image/jpeg",
                     "width":       img.width,
                     "height":      img.height,
+                    "orig_width":  orig_w,
+                    "orig_height": orig_h,
                 })
 
             except Exception as page_err:
@@ -167,6 +181,8 @@ def _resize_image_sync(file_bytes: bytes) -> list[dict]:
         "mime_type":   "image/jpeg",
         "width":       img.width,
         "height":      img.height,
+        "orig_width":  w,
+        "orig_height": h,
     }]
 
 

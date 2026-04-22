@@ -104,6 +104,8 @@ CREATE TABLE IF NOT EXISTS pages (
     mime_type     TEXT DEFAULT 'image/jpeg',
     width         INT,
     height        INT,
+    orig_width    INT,
+    orig_height   INT,
     UNIQUE (extraction_id, page_number)
 );
 
@@ -191,6 +193,13 @@ async def init(pool: asyncpg.Pool) -> None:
                     WHERE table_name = 'pages' AND column_name = 'image_b64'
                 ) THEN
                     ALTER TABLE pages ALTER COLUMN image_b64 DROP NOT NULL;
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'pages' AND column_name = 'orig_width'
+                ) THEN
+                    ALTER TABLE pages ADD COLUMN orig_width INT;
+                    ALTER TABLE pages ADD COLUMN orig_height INT;
                 END IF;
             END $$;
         """)
@@ -627,13 +636,15 @@ async def save_pages(pool: asyncpg.Pool, extraction_id: int, pages: list[dict]) 
     async with pool.acquire() as conn:
         await conn.executemany(
             """
-            INSERT INTO pages (extraction_id, page_number, object_key, mime_type, width, height)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO pages (extraction_id, page_number, object_key, mime_type, width, height, orig_width, orig_height)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (extraction_id, page_number) DO UPDATE SET
                 object_key = EXCLUDED.object_key,
                 mime_type = EXCLUDED.mime_type,
                 width = EXCLUDED.width,
-                height = EXCLUDED.height
+                height = EXCLUDED.height,
+                orig_width = EXCLUDED.orig_width,
+                orig_height = EXCLUDED.orig_height
             """,
             [
                 (
@@ -643,6 +654,8 @@ async def save_pages(pool: asyncpg.Pool, extraction_id: int, pages: list[dict]) 
                     p.get("mime_type", "image/jpeg"),
                     p.get("width", 0),
                     p.get("height", 0),
+                    p.get("orig_width", p.get("width", 0)),
+                    p.get("orig_height", p.get("height", 0)),
                 )
                 for p in pages
             ],
@@ -654,7 +667,7 @@ async def get_pages(pool: asyncpg.Pool, extraction_id: int) -> list[dict]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT page_number, object_key, mime_type, width, height
+            SELECT page_number, object_key, mime_type, width, height, orig_width, orig_height
             FROM pages
             WHERE extraction_id = $1
             ORDER BY page_number ASC

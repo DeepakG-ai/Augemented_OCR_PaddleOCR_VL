@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import logging
 import re
 from typing import Any, Awaitable, Callable
 
@@ -21,6 +20,7 @@ import httpx
 try:
     from . import cache as cache_mod
     from . import db as db_mod
+    from .logging_config import get_logger
     from .phoenix_tracing import (
         trace_llm_call,
         trace_page_extraction,
@@ -30,6 +30,7 @@ try:
 except ImportError:
     import cache as cache_mod
     import db as db_mod
+    from logging_config import get_logger
     from phoenix_tracing import (
         trace_llm_call,
         trace_page_extraction,
@@ -37,7 +38,7 @@ except ImportError:
         trace_merge_results,
     )
 
-logger = logging.getLogger("extractor")
+logger = get_logger(__name__)
 
 # ── Format Descriptions ─────────────────────────────────────────────
 
@@ -58,8 +59,8 @@ _FORMAT_DESCRIPTIONS: dict[str, str] = {
 
 
 # ── Prompt Version (bump this to invalidate all cached prompts in DB/Redis) ──
-# v2 = column-based text_matcher, no bbox_2d in output
-PROMPT_VERSION = "v2"
+# v3 = Qwen returns {fields, boxes} — anchor bboxes for keys/headers only
+PROMPT_VERSION = "v3"
 
 # ── System Prompt (built once, stored in DB + Redis) ─────────────────
 
@@ -114,8 +115,11 @@ Use these as hints for formatting issues or re-occurring mistakes:
 </verified_examples>"""
 
     return f"""You are a highly accurate document data extraction assistant.
-Extract ONLY what is explicitly visible in the document image.
-Never guess or fabricate data. If a field is not visible, set it to null.
+This request is processed one page at a time.
+
+Return exactly two top-level keys:
+- `fields`: extracted values
+- `boxes`: bounding boxes for requested header-field anchors and requested line-item column headers only
 {context_section}
 {rules_section}
 {gold_section}
@@ -128,11 +132,18 @@ Count the number of rows in the line items table FIRST, then extract that exact 
 </critical>
 
 <output_rules>
+- Extract ONLY what is explicitly visible in the document image.
+- Never guess or fabricate data.
 - Return ONLY valid JSON. No markdown fences, no explanation, no extra text.
 - Use null for missing fields, never omit them.
 - For line_items, return an array even if only one item exists.
 - Numbers should be numeric (not strings) when possible.
 - Dates should be in the format they appear in the document.
+- Return bounding boxes only for requested field anchors and requested table column headers.
+- Do not return bounding boxes for field values.
+- Do not return row-level line item bounding boxes.
+- Every bounding box must be [x0, y0, x1, y1] in page-image pixel coordinates.
+- The bbox should tightly cover the anchor/header text region only.
 </output_rules>"""
 
 
@@ -151,11 +162,22 @@ def build_user_message(
 
     if header_fields or line_item_fields:
         # ── Extract Fields mode ──
-        template: dict[str, Any] = {}
+        fields_template: dict[str, Any] = {}
+        boxes_template: dict[str, None] = {}
+
         for f in header_fields:
-            template[f] = None
+            fields_template[f] = None
+            boxes_template[f] = None
+
         if line_item_fields:
-            template["line_items"] = [{col: "" for col in line_item_fields}]
+            fields_template["line_items"] = [{col: None for col in line_item_fields}]
+            for col in line_item_fields:
+                boxes_template[col] = None
+
+        full_template = {
+            "fields": fields_template,
+            "boxes": boxes_template,
+        }
 
         header_section = ""
         if header_fields:
@@ -174,40 +196,43 @@ def build_user_message(
 </line_item_columns>"""
 
         return f"""Extract the header fields AND all visible line item rows from this purchase order page (page {page_num} of {total_pages}).
-If any field is empty or not visible, return null in the JSON object.
+
+For each requested header field, also return the bounding box of the field LABEL (not the value) in the `boxes` section.
+For each requested line-item column, return the bounding box of the TABLE HEADER text (not the cell values) in the `boxes` section.
+
+If any field is empty or not visible, return null.
+If an anchor/header label is not visible on this page, return null for that box.
 {header_section}
 {line_section}
 
-<json_template>
-{json.dumps(template, indent=2)}
-</json_template>
+Return JSON in exactly this shape:
+{json.dumps(full_template, indent=2)}
 
 <rules>
 - Empty or missing cells → null.
 - Numbers (qty, unit_cost, amount, unit_price, etc.) must be numbers, not strings.
 - Extract every visible line item row.
+- boxes contain ONLY anchor/header label bounding boxes as [x0, y0, x1, y1].
+- Do NOT return bounding boxes for field values or individual line-item cells.
 </rules>
 
 Return ONLY valid JSON matching EXACTLY the structure above."""
 
     else:
-        # ── Auto Extract mode ──
+        # ── Auto Extract mode (no bbox support) ──
         return f"""Extract ALL data from this invoice/purchase order document (page {page_num} of {total_pages}).
 
 <critical>
 Count the number of rows in the line items table FIRST, then extract that exact number of items.
 </critical>
 
-<output_format>
 Return JSON with:
 - Header fields: extract all visible header fields (po_number, order_date, vendor, bill_to, ship_to, etc.)
 - Line items: extract all visible line item rows with all their columns
-</output_format>
 
 <accuracy>
 - Before extraction: Count total rows in the table visually.
 - After extraction: Verify your line_items array has that many items.
-- Double-check you didn't skip rows at page breaks or table headers.
 - Extract ONLY what is explicitly visible in the document image.
 - Never guess or fabricate values.
 </accuracy>
@@ -380,7 +405,7 @@ async def extract_document(
     
     Returns {"result": ..., "page_results": [...], "cancelled": bool, "last_completed_page": int}.
     """
-    PARALLEL_BATCH = 2  # Match llama-server --parallel value
+    PARALLEL_BATCH = 1  # Sequential: process page 1 before page 2
 
     total = len(pages)
     page_results: list[dict] = list(existing_page_results or [])
@@ -428,8 +453,11 @@ async def extract_document(
                 )
                 result["_page"] = page_num
                 result["_total_pages"] = total
+                # Count line items for logging (handle both v3 and legacy format)
+                _fields = result.get("fields", result)
+                _li_count = len(_fields.get("line_items") or [])
                 logger.info("Page %d/%d done — %d line item(s)",
-                            page_num, total, len(result.get("line_items") or []))
+                            page_num, total, _li_count)
                 page_ctx["result"] = result
                 return result
             except (ValueError, httpx.HTTPError) as exc:
@@ -487,9 +515,12 @@ async def extract_document(
         with trace_merge_results(total, format_type) as merge_ctx:
             final = merge_results(page_results, header_fields, line_item_fields)
             if isinstance(final, dict):
-                merge_ctx["merged_line_items"] = len(final.get("line_items", []))
+                # v3: line_items under fields, legacy: at top level
+                _f = final.get("fields", final)
+                merge_ctx["merged_line_items"] = len(_f.get("line_items", []))
                 merge_ctx["merged_fields"] = len([
-                    k for k in final.keys() if k != "line_items"
+                    k for k in (final.get("fields", final)).keys()
+                    if k not in ("line_items", "_format", "boxes")
                 ])
 
     return {
@@ -508,36 +539,73 @@ def merge_results(
     line_item_fields: list[str],
 ) -> dict:
     """
-    Header from page 1. Line items concatenated from all pages.
-    Works for both auto-extract and extract-fields mode.
+    Merge multi-page results.
+
+    Supports both v3 format ({fields, boxes}) and legacy flat format.
+    - Header values from page 1
+    - Line items concatenated from all pages
+    - Boxes merged per-page with page association
     """
     valid_pages = [pr for pr in page_results if "_error" not in pr]
     if not valid_pages:
         return {}
 
-    merged: dict[str, Any] = {}
-    _meta_keys = {"_page", "_total_pages", "_error", "line_items"}
+    _meta_keys = {"_page", "_total_pages", "_error", "line_items", "fields", "boxes"}
 
-    # ── Header: from page 1 only ──
     first_page = valid_pages[0]
-    if header_fields:
-        for f in header_fields:
-            merged[f] = first_page.get(f)
+    is_v3 = "fields" in first_page and isinstance(first_page.get("fields"), dict)
+
+    if is_v3:
+        # ── v3 format: {fields: {...}, boxes: {...}} ──
+        merged_fields: dict[str, Any] = {}
+        merged_boxes: list[dict] = []  # [{page, boxes: {key: [x0,y0,x1,y1]}}]
+
+        # Header from page 1
+        first_fields = first_page.get("fields", {})
+        if header_fields:
+            for f in header_fields:
+                merged_fields[f] = first_fields.get(f)
+        else:
+            for key, val in first_fields.items():
+                if key != "line_items":
+                    merged_fields[key] = val
+
+        # Line items from all pages
+        all_items: list[dict] = []
+        for pr in valid_pages:
+            pr_fields = pr.get("fields", {})
+            items = pr_fields.get("line_items")
+            if isinstance(items, list):
+                all_items.extend(items)
+        merged_fields["line_items"] = all_items
+
+        # Boxes from all pages (page-associated)
+        for pr in valid_pages:
+            page_num = pr.get("_page", 1)
+            page_boxes = pr.get("boxes")
+            if isinstance(page_boxes, dict):
+                merged_boxes.append({"page": page_num, "boxes": page_boxes})
+
+        return {
+            "fields": merged_fields,
+            "boxes": merged_boxes,
+            "_format": "v3",
+        }
     else:
-        # Auto-extract: take all non-metadata, non-list keys from page 1
-        for key, val in first_page.items():
-            if key not in _meta_keys:
-                merged[key] = val
+        # ── Legacy flat format ──
+        merged: dict[str, Any] = {}
+        if header_fields:
+            for f in header_fields:
+                merged[f] = first_page.get(f)
+        else:
+            for key, val in first_page.items():
+                if key not in _meta_keys:
+                    merged[key] = val
 
-    # ── Line items: concat from all pages, deduplicate ──
-    all_items: list[dict] = []
-
-    for pr in valid_pages:
-        items = pr.get("line_items")
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            all_items.append(item)
-
-    merged["line_items"] = all_items
-    return merged
+        all_items = []
+        for pr in valid_pages:
+            items = pr.get("line_items")
+            if isinstance(items, list):
+                all_items.extend(items)
+        merged["line_items"] = all_items
+        return merged

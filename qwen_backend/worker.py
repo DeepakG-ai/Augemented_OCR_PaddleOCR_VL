@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
-import logging
+import json as _json
 import os
 import time
 from uuid import uuid4
@@ -17,9 +17,10 @@ if __package__:
     from . import ocr_runner
     from . import processor
     from . import text_matcher
+    from . import qwen_bbox_parser
     from .contracts import build_purchase_order_contract
     from .exporter import build_csv_bytes, build_excel_bytes
-    from .logging_config import configure_logging
+    from .logging_config import configure_logging, get_logger
     from .object_store import ARTIFACTS_BUCKET, DOCUMENTS_BUCKET, EXPORTS_BUCKET, get_store
 else:
     import db as db_mod
@@ -27,14 +28,15 @@ else:
     import ocr_runner
     import processor
     import text_matcher
+    import qwen_bbox_parser
     from contracts import build_purchase_order_contract
     from exporter import build_csv_bytes, build_excel_bytes
-    from logging_config import configure_logging
+    from logging_config import configure_logging, get_logger
     from object_store import ARTIFACTS_BUCKET, DOCUMENTS_BUCKET, EXPORTS_BUCKET, get_store
 
 
 configure_logging()
-logger = logging.getLogger("worker")
+logger = get_logger(__name__)
 
 LLM_URL = os.getenv("LLM_URL", "http://localhost:8001/v1/chat/completions")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen3vl")
@@ -271,37 +273,46 @@ async def _process_postprocess(pool, job: dict) -> None:
         raise ValueError("Postprocess prerequisites not satisfied (no result)")
 
     ocr_data = extraction_row.get("ocr_data")
-    if not ocr_data:
-        raise ValueError("Postprocess prerequisites not satisfied (no ocr_data)")
-
     page_results = extraction_row.get("page_results")
 
     # ── Debug dump: save OCR + Qwen outputs for offline analysis ──
-    import json as _json
     _project_root = os.path.dirname(os.path.dirname(__file__))
     _debug_dir = os.path.join(_project_root, "bbox", "pdle_output")
     _qwen_dir = os.path.join(_project_root, "bbox", "qwn_output")
     os.makedirs(_debug_dir, exist_ok=True)
     os.makedirs(_qwen_dir, exist_ok=True)
     try:
-        with open(os.path.join(_debug_dir, f"ocr_{extraction_id}.json"), "w", encoding="utf-8") as _f:
-            _json.dump(ocr_data, _f, indent=2, ensure_ascii=False)
+        if ocr_data:
+            with open(os.path.join(_debug_dir, f"ocr_{extraction_id}.json"), "w", encoding="utf-8") as _f:
+                _json.dump(ocr_data, _f, indent=2, ensure_ascii=False)
         with open(os.path.join(_qwen_dir, f"qwen_{extraction_id}.json"), "w", encoding="utf-8") as _f:
             _json.dump({"result": result, "page_results": page_results}, _f, indent=2, ensure_ascii=False)
-        logger.info("Debug dump saved: ocr_%s.json / qwen_%s.json", extraction_id, extraction_id)
+        logger.debug("Debug dump saved: ocr_%s.json / qwen_%s.json", extraction_id, extraction_id)
     except Exception as _e:
         logger.warning("Failed to save debug dump for extraction %s: %s", extraction_id, _e)
 
-    # Run CPU-bound text matching in a thread executor to avoid blocking
-    # the async event loop (prevents healthcheck timeouts / Docker Code 137)
-    loop = asyncio.get_running_loop()
-    field_locations = await loop.run_in_executor(
-        None,
-        text_matcher.compute_field_locations,
-        result,
-        ocr_data,
-        page_results,
-    )
+    # ── Build field_locations ──
+    is_v3 = isinstance(result, dict) and result.get("_format") == "v3"
+
+    if is_v3:
+        # v3: Qwen returned {fields, boxes} — use qwen_bbox_parser directly
+        logger.info("Postprocess: using qwen_bbox_parser (v3 format)")
+        pages = await db_mod.get_pages(pool, extraction_id)
+        field_locations = qwen_bbox_parser.build_field_locations(result, page_results, pages=pages)
+    elif ocr_data:
+        # Legacy: fallback to text_matcher (CPU-bound, run in executor)
+        logger.info("Postprocess: using text_matcher fallback (legacy format)")
+        loop = asyncio.get_running_loop()
+        field_locations = await loop.run_in_executor(
+            None,
+            text_matcher.compute_field_locations,
+            result,
+            ocr_data,
+            page_results,
+        )
+    else:
+        logger.warning("Postprocess: no boxes and no ocr_data — empty field_locations")
+        field_locations = {}
 
     await db_mod.save_field_locations(pool, extraction_id, field_locations)
     if await _stop_if_cancelled(pool, extraction_id, "postprocess", "Cancelled before outbound delivery"):
@@ -310,7 +321,7 @@ async def _process_postprocess(pool, job: dict) -> None:
         pool,
         extraction_id,
         "done",
-        progress={"stage": "postprocess", "message": "PaddleOCR field mapping complete"},
+        progress={"stage": "postprocess", "message": "Field mapping complete"},
     )
     await db_mod.ensure_job(pool, extraction_id, job["document_id"], "outbound", {"extraction_id": extraction_id})
 
