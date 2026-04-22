@@ -1,0 +1,440 @@
+{
+  "result": {
+    "date": "09/03/2025",
+    "bill_to": {
+      "name": "HILLYARD - INDUSTRIES",
+      "address": "P.O Box: 909\nSaint Joseph, MO 64502"
+    },
+    "ship_to": {
+      "name": "HILLYARD INDUSTRIES",
+      "address": "800 N 3rd St\nSaint Joseph MO 64501-1720"
+    },
+    "po_number": 1088897,
+    "line_items": [
+      {
+        "um": "CS",
+        "quantity": 4,
+        "net_price": 71.23,
+        "item_number": "0010",
+        "material_number": "HTSC-P-012I072M-04-800"
+      },
+      {
+        "um": "CS",
+        "quantity": 4,
+        "net_price": 71.23,
+        "item_number": "0020",
+        "material_number": "HTSC-P-012I072M-02-800"
+      },
+      {
+        "um": "CS",
+        "quantity": 1,
+        "net_price": 110.05,
+        "item_number": "0030",
+        "material_number": "TWDS-P-006I036M-06-AAV"
+      },
+      {
+        "um": "CS",
+        "quantity": 1,
+        "net_price": 191.27,
+        "item_number": "0040",
+        "material_number": "EFA1B-P-012I072M-08-80"
+      },
+      {
+        "um": "CS",
+        "quantity": 1,
+        "net_price": 110.05,
+        "item_number": "0050",
+        "material_number": "TWDS-P-006I036M-06-AAV"
+      },
+      {
+        "um": "CS",
+        "quantity": 1,
+        "net_price": 86.02,
+        "item_number": "0060",
+        "material_number": "3WDS-P-010I060M-13-AAF"
+      },
+      {
+        "um": "CS",
+        "quantity": 4,
+        "net_price": 158.99,
+        "item_number": "0070",
+        "material_number": "OFB-P-0081048M-01-FRS"
+      },
+      {
+        "um": "CS",
+        "quantity": 1,
+        "net_price": 105.59,
+        "item_number": "0080",
+        "material_number": "BBL-F-0121048M-00"
+      },
+      {
+        "um": "CS",
+        "quantity": 1,
+        "net_price": 110.05,
+        "item_number": "0090",
+        "material_number": "TWDS-P-0061036M-06-AAV"
+      },
+      {
+        "um": "CS",
+        "quantity": 5,
+        "net_price": 86.02,
+        "item_number": "0100",
+        "material_number": "3WDS-P-0101060M-13-AAF"
+      },
+      {
+        "um": "CS",
+        "quantity": 1,
+        "net_price": 98.97,
+        "item_number": "0110",
+        "material_number": "EBC-P-0121072M-08-AAF4"
+      },
+      {
+        "um": "CS",
+        "quantity": 2,
+        "net_price": 94.61,
+        "item_number": "0120",
+        "material_number": "EA-P-0061036M-11-80015"
+      },
+      {
+        "um": "CS",
+        "quantity": 5,
+        "net_price": 158.99,
+        "item_number": "0130",
+        "material_number": null
+      },
+      {
+        "um": "CS",
+        "quantity": 6,
+        "net_price": 158.99,
+        "item_number": "0140",
+        "material_number": "OFB-P-008I048M-25-FRS"
+      },
+      {
+        "um": "CS",
+        "quantity": 1,
+        "net_price": 20.82,
+        "item_number": "0150",
+        "material_number": "OFB-P-008I048M-54-FRS"
+      },
+      {
+        "um": "CS",
+        "quantity": 1,
+        "net_price": 24.03,
+        "item_number": "0160",
+        "material_number": "2REF-P-012I072M-01"
+      },
+      {
+        "um": "CS",
+        "quantity": 1,
+        "net_price": 98.97,
+        "item_number": "0170",
+        "material_number": "2REF-P-012I072M-10-800"
+      },
+      {
+        "um": "CS",
+        "quantity": 2,
+        "net_price": 158.99,
+        "item_number": "0180",
+        "material_number": "EBC-P-012I072M-01-AAF4"
+      },
+      {
+        "um": "CS",
+        "quantity": 45,
+        "net_price": 86.02,
+        "item_number": "0190",
+        "material_number": "OFB-P-008I048M-06-FRS"
+      },
+      {
+        "um": "CS",
+        "quantity": 45,
+        "net_price": 86.02,
+        "item_number": "0200",
+        "material_number": "3WDS-P-0101060M-06-A AF"
+      },
+      {
+        "um": "CS",
+        "quantity": 90,
+        "net_price": 86.02,
+        "item_number": "0210",
+        "material_number": "3WDS-P-0101060M-04-A AF"
+      },
+      {
+        "um": "CS",
+        "quantity": 12,
+        "net_price": 94.61,
+        "item_number": "0220",
+        "material_number": "EA-P-006I036M-02-80015"
+      },
+      {
+        "um": "BOX",
+        "quantity": 12,
+        "net_price": 25.2,
+        "item_number": "0230",
+        "material_number": "TSU-P-006I006I-02-A AF4"
+      },
+      {
+        "um": null,
+        "quantity": null,
+        "net_price": null,
+        "item_number": null,
+        "material_number": null
+      }
+    ],
+    "delivery_date": "09/24/2025"
+  },
+  "page_results": [
+    {
+      "date": "09/03/2025",
+      "_page": 1,
+      "bill_to": {
+        "name": "HILLYARD - INDUSTRIES",
+        "address": "P.O Box: 909\nSaint Joseph, MO 64502"
+      },
+      "ship_to": {
+        "name": "HILLYARD INDUSTRIES",
+        "address": "800 N 3rd St\nSaint Joseph MO 64501-1720"
+      },
+      "po_number": 1088897,
+      "line_items": [
+        {
+          "um": "CS",
+          "quantity": 4,
+          "net_price": 71.23,
+          "item_number": "0010",
+          "material_number": "HTSC-P-012I072M-04-800"
+        },
+        {
+          "um": "CS",
+          "quantity": 4,
+          "net_price": 71.23,
+          "item_number": "0020",
+          "material_number": "HTSC-P-012I072M-02-800"
+        },
+        {
+          "um": "CS",
+          "quantity": 1,
+          "net_price": 110.05,
+          "item_number": "0030",
+          "material_number": "TWDS-P-006I036M-06-AAV"
+        },
+        {
+          "um": "CS",
+          "quantity": 1,
+          "net_price": 191.27,
+          "item_number": "0040",
+          "material_number": "EFA1B-P-012I072M-08-80"
+        },
+        {
+          "um": "CS",
+          "quantity": 1,
+          "net_price": 110.05,
+          "item_number": "0050",
+          "material_number": "TWDS-P-006I036M-06-AAV"
+        },
+        {
+          "um": "CS",
+          "quantity": 1,
+          "net_price": 86.02,
+          "item_number": "0060",
+          "material_number": "3WDS-P-010I060M-13-AAF"
+        }
+      ],
+      "_total_pages": 5,
+      "delivery_date": "09/24/2025"
+    },
+    {
+      "date": "09/03/2025",
+      "_page": 2,
+      "bill_to": {
+        "name": "HILLYARD - INDUSTRIES",
+        "address": "P.O Box: 909\nSaint Joseph, MO 64502"
+      },
+      "ship_to": {
+        "name": "HILLYARD INDUSTRIES",
+        "address": "800 N 3rd St\nSaint Joseph MO 64501-1720"
+      },
+      "po_number": 1088897,
+      "line_items": [
+        {
+          "um": "CS",
+          "quantity": 4,
+          "net_price": 158.99,
+          "item_number": "0070",
+          "material_number": "OFB-P-0081048M-01-FRS"
+        },
+        {
+          "um": "CS",
+          "quantity": 1,
+          "net_price": 105.59,
+          "item_number": "0080",
+          "material_number": "BBL-F-0121048M-00"
+        },
+        {
+          "um": "CS",
+          "quantity": 1,
+          "net_price": 110.05,
+          "item_number": "0090",
+          "material_number": "TWDS-P-0061036M-06-AAV"
+        },
+        {
+          "um": "CS",
+          "quantity": 5,
+          "net_price": 86.02,
+          "item_number": "0100",
+          "material_number": "3WDS-P-0101060M-13-AAF"
+        },
+        {
+          "um": "CS",
+          "quantity": 1,
+          "net_price": 98.97,
+          "item_number": "0110",
+          "material_number": "EBC-P-0121072M-08-AAF4"
+        },
+        {
+          "um": "CS",
+          "quantity": 2,
+          "net_price": 94.61,
+          "item_number": "0120",
+          "material_number": "EA-P-0061036M-11-80015"
+        },
+        {
+          "um": "CS",
+          "quantity": 5,
+          "net_price": 158.99,
+          "item_number": "0130",
+          "material_number": null
+        }
+      ],
+      "_total_pages": 5,
+      "delivery_date": "09/24/2025"
+    },
+    {
+      "date": "09/03/2025",
+      "_page": 3,
+      "bill_to": {
+        "name": "HILLYARD - INDUSTRIES",
+        "address": "P.O Box: 909\nSaint Joseph, MO 64502"
+      },
+      "ship_to": {
+        "name": "HILLYARD INDUSTRIES",
+        "address": "800 N 3rd St\nSaint Joseph MO 64501-1720"
+      },
+      "po_number": "1088897",
+      "line_items": [
+        {
+          "um": "CS",
+          "quantity": 6,
+          "net_price": 158.99,
+          "item_number": "0140",
+          "material_number": "OFB-P-008I048M-25-FRS"
+        },
+        {
+          "um": "CS",
+          "quantity": 1,
+          "net_price": 20.82,
+          "item_number": "0150",
+          "material_number": "OFB-P-008I048M-54-FRS"
+        },
+        {
+          "um": "CS",
+          "quantity": 1,
+          "net_price": 24.03,
+          "item_number": "0160",
+          "material_number": "2REF-P-012I072M-01"
+        },
+        {
+          "um": "CS",
+          "quantity": 1,
+          "net_price": 98.97,
+          "item_number": "0170",
+          "material_number": "2REF-P-012I072M-10-800"
+        },
+        {
+          "um": "CS",
+          "quantity": 2,
+          "net_price": 158.99,
+          "item_number": "0180",
+          "material_number": "EBC-P-012I072M-01-AAF4"
+        },
+        {
+          "um": "CS",
+          "quantity": 45,
+          "net_price": 86.02,
+          "item_number": "0190",
+          "material_number": "OFB-P-008I048M-06-FRS"
+        }
+      ],
+      "_total_pages": 5,
+      "delivery_date": "09/24/2025"
+    },
+    {
+      "date": "09/03/2025",
+      "_page": 4,
+      "bill_to": {
+        "name": "HILLYARD - INDUSTRIES",
+        "address": "P.O Box: 909\nSaint Joseph, MO 64502"
+      },
+      "ship_to": {
+        "name": "HILLYARD INDUSTRIES",
+        "address": "800 N 3rd St\nSaint Joseph MO 64501-1720"
+      },
+      "po_number": 1088897,
+      "line_items": [
+        {
+          "um": "CS",
+          "quantity": 45,
+          "net_price": 86.02,
+          "item_number": "0200",
+          "material_number": "3WDS-P-0101060M-06-A AF"
+        },
+        {
+          "um": "CS",
+          "quantity": 90,
+          "net_price": 86.02,
+          "item_number": "0210",
+          "material_number": "3WDS-P-0101060M-04-A AF"
+        },
+        {
+          "um": "CS",
+          "quantity": 12,
+          "net_price": 94.61,
+          "item_number": "0220",
+          "material_number": "EA-P-006I036M-02-80015"
+        },
+        {
+          "um": "BOX",
+          "quantity": 12,
+          "net_price": 25.2,
+          "item_number": "0230",
+          "material_number": "TSU-P-006I006I-02-A AF4"
+        }
+      ],
+      "_total_pages": 5,
+      "delivery_date": "09/24/2025"
+    },
+    {
+      "date": "09/03/2025",
+      "_page": 5,
+      "bill_to": {
+        "name": "HILLYARD - INDUSTRIES",
+        "address": "P.O Box: 909\nSaint Joseph, MO 64502"
+      },
+      "ship_to": {
+        "name": "HILLYARD INDUSTRIES",
+        "address": "800 N 3rd St\nSaint Joseph MO 64501-1720"
+      },
+      "po_number": 1088897,
+      "line_items": [
+        {
+          "um": null,
+          "quantity": null,
+          "net_price": null,
+          "item_number": null,
+          "material_number": null
+        }
+      ],
+      "_total_pages": 5,
+      "delivery_date": "09/24/2025"
+    }
+  ]
+}

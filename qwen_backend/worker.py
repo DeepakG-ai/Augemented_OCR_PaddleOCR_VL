@@ -276,6 +276,22 @@ async def _process_postprocess(pool, job: dict) -> None:
 
     page_results = extraction_row.get("page_results")
 
+    # ── Debug dump: save OCR + Qwen outputs for offline analysis ──
+    import json as _json
+    _project_root = os.path.dirname(os.path.dirname(__file__))
+    _debug_dir = os.path.join(_project_root, "bbox", "pdle_output")
+    _qwen_dir = os.path.join(_project_root, "bbox", "qwn_output")
+    os.makedirs(_debug_dir, exist_ok=True)
+    os.makedirs(_qwen_dir, exist_ok=True)
+    try:
+        with open(os.path.join(_debug_dir, f"ocr_{extraction_id}.json"), "w", encoding="utf-8") as _f:
+            _json.dump(ocr_data, _f, indent=2, ensure_ascii=False)
+        with open(os.path.join(_qwen_dir, f"qwen_{extraction_id}.json"), "w", encoding="utf-8") as _f:
+            _json.dump({"result": result, "page_results": page_results}, _f, indent=2, ensure_ascii=False)
+        logger.info("Debug dump saved: ocr_%s.json / qwen_%s.json", extraction_id, extraction_id)
+    except Exception as _e:
+        logger.warning("Failed to save debug dump for extraction %s: %s", extraction_id, _e)
+
     # Run CPU-bound text matching in a thread executor to avoid blocking
     # the async event loop (prevents healthcheck timeouts / Docker Code 137)
     loop = asyncio.get_running_loop()

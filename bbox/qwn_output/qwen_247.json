@@ -1,0 +1,442 @@
+{
+  "result": {
+    "vendor": null,
+    "supplier": "Fresh Products LLC 30600 Oregon Road Perrysburgh, OH 43551 USA",
+    "account_no": "V01250",
+    "deliver_to": "Crown Warehouse Ben Pollard Unit 7 Crown Business Park Cowm Top Lane Rochdale, OL11 2PU England",
+    "line_items": [
+      {
+        "no": "105230",
+        "qty": 10.0,
+        "uom": "BOX 6X12",
+        "variant": "COTTON",
+        "unit_cost": 82.94
+      },
+      {
+        "no": "105230",
+        "qty": 11.0,
+        "uom": "BOX 6X12",
+        "variant": "OCEAN",
+        "unit_cost": 82.94
+      },
+      {
+        "no": "105230",
+        "qty": 10.0,
+        "uom": "BOX 6X12",
+        "variant": "SPICEDAPPL",
+        "unit_cost": 82.94
+      },
+      {
+        "no": "105237",
+        "qty": 10.0,
+        "uom": "BOX 6X10",
+        "variant": "CITRUS",
+        "unit_cost": 79.36
+      },
+      {
+        "no": "105240",
+        "qty": 10.0,
+        "uom": "BOX 6X12",
+        "variant": "COTTON",
+        "unit_cost": 116.01
+      },
+      {
+        "no": "105240",
+        "qty": 10.0,
+        "uom": "BOX 6X12",
+        "variant": "OCEAN",
+        "unit_cost": 116.01
+      },
+      {
+        "no": "105405",
+        "qty": 16.0,
+        "uom": "BOX 6X6",
+        "variant": "SUMMER",
+        "unit_cost": 50.76
+      },
+      {
+        "no": "105251",
+        "qty": 25.0,
+        "uom": "BOX 6X10",
+        "variant": "COTTON",
+        "unit_cost": 75.76
+      },
+      {
+        "no": "105251",
+        "qty": 25.0,
+        "uom": "BOX 6X10",
+        "variant": "CUCUMMELON",
+        "unit_cost": 75.76
+      },
+      {
+        "no": "105251",
+        "qty": 25.0,
+        "uom": "BOX 6X10",
+        "variant": "HONEYSUCKL",
+        "unit_cost": 75.76
+      },
+      {
+        "no": "105251",
+        "qty": 50.0,
+        "uom": "BOX 6X10",
+        "variant": "OCEAN",
+        "unit_cost": 75.76
+      },
+      {
+        "no": "105254",
+        "qty": 50.0,
+        "uom": "BOX 6X10",
+        "variant": "OCEAN",
+        "unit_cost": 75.76
+      },
+      {
+        "no": "105254",
+        "qty": 42.0,
+        "uom": "BOX 6X10",
+        "variant": "SPICEDAPPL",
+        "unit_cost": 75.76
+      },
+      {
+        "no": "105255",
+        "qty": 50.0,
+        "uom": "BOX 6X10",
+        "variant": "COTTON",
+        "unit_cost": 75.76
+      },
+      {
+        "no": "105255",
+        "qty": 300.0,
+        "uom": "BOX 6X10",
+        "variant": "MANGO",
+        "unit_cost": 75.76
+      },
+      {
+        "no": "105255",
+        "qty": 100.0,
+        "uom": "BOX 6X10",
+        "variant": "OCEAN",
+        "unit_cost": 75.76
+      },
+      {
+        "no": "105295",
+        "qty": 50.0,
+        "uom": "BOX 12X5",
+        "variant": "MANGO",
+        "unit_cost": 75.76
+      },
+      {
+        "no": "105462",
+        "qty": 50.0,
+        "uom": "BOX 6X10",
+        "variant": "MANGO",
+        "unit_cost": 122.4
+      },
+      {
+        "no": "105257",
+        "qty": 30.0,
+        "uom": "BOX 6X6",
+        "variant": "MANGO",
+        "unit_cost": 82.44
+      },
+      {
+        "no": "105258",
+        "qty": 30.0,
+        "uom": "BOX 6X6",
+        "variant": "MANGO",
+        "unit_cost": 82.44
+      },
+      {
+        "no": "105230",
+        "qty": 1.0,
+        "uom": "BOX 6X12",
+        "variant": "OCEAN",
+        "unit_cost": 0.0
+      },
+      {
+        "no": "105240",
+        "qty": 1.0,
+        "uom": "BOX 6X12",
+        "variant": "OCEAN",
+        "unit_cost": 0.0
+      },
+      {
+        "no": "105255",
+        "qty": 43.0,
+        "uom": "BOX 6X10",
+        "variant": "MANGO",
+        "unit_cost": 0.0
+      },
+      {
+        "no": "105258",
+        "qty": 3.0,
+        "uom": "BOX 6X6",
+        "variant": "MANGO",
+        "unit_cost": 0.0
+      },
+      {
+        "no": "105316",
+        "qty": 40.0,
+        "uom": "BOX 6X10",
+        "variant": "MANGO",
+        "unit_cost": 75.76
+      },
+      {
+        "no": "105316",
+        "qty": 30.0,
+        "uom": "BOX 6X10",
+        "variant": "OCEAN",
+        "unit_cost": 75.76
+      },
+      {
+        "no": "105316",
+        "qty": 20.0,
+        "uom": "BOX 6X10",
+        "variant": "HONEYSCU KL",
+        "unit_cost": 75.76
+      },
+      {
+        "no": "105316",
+        "qty": 15.0,
+        "uom": "BOX 6X10",
+        "variant": "SPICEDAPPL",
+        "unit_cost": 75.76
+      }
+    ],
+    "document_date": "19. August 2025",
+    "purchase_order_no": "PO31942"
+  },
+  "page_results": [
+    {
+      "_page": 1,
+      "vendor": null,
+      "supplier": "Fresh Products LLC 30600 Oregon Road Perrysburgh, OH 43551 USA",
+      "account_no": "V01250",
+      "deliver_to": "Crown Warehouse Ben Pollard Unit 7 Crown Business Park Cowm Top Lane Rochdale, OL11 2PU England",
+      "line_items": [
+        {
+          "no": "105230",
+          "qty": 10.0,
+          "uom": "BOX 6X12",
+          "variant": "COTTON",
+          "unit_cost": 82.94
+        },
+        {
+          "no": "105230",
+          "qty": 11.0,
+          "uom": "BOX 6X12",
+          "variant": "OCEAN",
+          "unit_cost": 82.94
+        },
+        {
+          "no": "105230",
+          "qty": 10.0,
+          "uom": "BOX 6X12",
+          "variant": "SPICEDAPPL",
+          "unit_cost": 82.94
+        },
+        {
+          "no": "105237",
+          "qty": 10.0,
+          "uom": "BOX 6X10",
+          "variant": "CITRUS",
+          "unit_cost": 79.36
+        },
+        {
+          "no": "105240",
+          "qty": 10.0,
+          "uom": "BOX 6X12",
+          "variant": "COTTON",
+          "unit_cost": 116.01
+        },
+        {
+          "no": "105240",
+          "qty": 10.0,
+          "uom": "BOX 6X12",
+          "variant": "OCEAN",
+          "unit_cost": 116.01
+        },
+        {
+          "no": "105405",
+          "qty": 16.0,
+          "uom": "BOX 6X6",
+          "variant": "SUMMER",
+          "unit_cost": 50.76
+        },
+        {
+          "no": "105251",
+          "qty": 25.0,
+          "uom": "BOX 6X10",
+          "variant": "COTTON",
+          "unit_cost": 75.76
+        },
+        {
+          "no": "105251",
+          "qty": 25.0,
+          "uom": "BOX 6X10",
+          "variant": "CUCUMMELON",
+          "unit_cost": 75.76
+        },
+        {
+          "no": "105251",
+          "qty": 25.0,
+          "uom": "BOX 6X10",
+          "variant": "HONEYSUCKL",
+          "unit_cost": 75.76
+        },
+        {
+          "no": "105251",
+          "qty": 50.0,
+          "uom": "BOX 6X10",
+          "variant": "OCEAN",
+          "unit_cost": 75.76
+        },
+        {
+          "no": "105254",
+          "qty": 50.0,
+          "uom": "BOX 6X10",
+          "variant": "OCEAN",
+          "unit_cost": 75.76
+        },
+        {
+          "no": "105254",
+          "qty": 42.0,
+          "uom": "BOX 6X10",
+          "variant": "SPICEDAPPL",
+          "unit_cost": 75.76
+        }
+      ],
+      "_total_pages": 3,
+      "document_date": "19. August 2025",
+      "purchase_order_no": "PO31942"
+    },
+    {
+      "_page": 2,
+      "vendor": null,
+      "supplier": "Fresh Products LLC 30600 Oregon Road Perrysburgh, OH 43551 USA",
+      "account_no": "V01250",
+      "deliver_to": "Crown Warehouse Ben Pollard Unit 7 Crown Business Park Cowm Top Lane Rochdale, OL11 2PU England",
+      "line_items": [
+        {
+          "no": "105255",
+          "qty": 50.0,
+          "uom": "BOX 6X10",
+          "variant": "COTTON",
+          "unit_cost": 75.76
+        },
+        {
+          "no": "105255",
+          "qty": 300.0,
+          "uom": "BOX 6X10",
+          "variant": "MANGO",
+          "unit_cost": 75.76
+        },
+        {
+          "no": "105255",
+          "qty": 100.0,
+          "uom": "BOX 6X10",
+          "variant": "OCEAN",
+          "unit_cost": 75.76
+        },
+        {
+          "no": "105295",
+          "qty": 50.0,
+          "uom": "BOX 12X5",
+          "variant": "MANGO",
+          "unit_cost": 75.76
+        },
+        {
+          "no": "105462",
+          "qty": 50.0,
+          "uom": "BOX 6X10",
+          "variant": "MANGO",
+          "unit_cost": 122.4
+        },
+        {
+          "no": "105257",
+          "qty": 30.0,
+          "uom": "BOX 6X6",
+          "variant": "MANGO",
+          "unit_cost": 82.44
+        },
+        {
+          "no": "105258",
+          "qty": 30.0,
+          "uom": "BOX 6X6",
+          "variant": "MANGO",
+          "unit_cost": 82.44
+        },
+        {
+          "no": "105230",
+          "qty": 1.0,
+          "uom": "BOX 6X12",
+          "variant": "OCEAN",
+          "unit_cost": 0.0
+        },
+        {
+          "no": "105240",
+          "qty": 1.0,
+          "uom": "BOX 6X12",
+          "variant": "OCEAN",
+          "unit_cost": 0.0
+        },
+        {
+          "no": "105255",
+          "qty": 43.0,
+          "uom": "BOX 6X10",
+          "variant": "MANGO",
+          "unit_cost": 0.0
+        },
+        {
+          "no": "105258",
+          "qty": 3.0,
+          "uom": "BOX 6X6",
+          "variant": "MANGO",
+          "unit_cost": 0.0
+        },
+        {
+          "no": "105316",
+          "qty": 40.0,
+          "uom": "BOX 6X10",
+          "variant": "MANGO",
+          "unit_cost": 75.76
+        },
+        {
+          "no": "105316",
+          "qty": 30.0,
+          "uom": "BOX 6X10",
+          "variant": "OCEAN",
+          "unit_cost": 75.76
+        },
+        {
+          "no": "105316",
+          "qty": 20.0,
+          "uom": "BOX 6X10",
+          "variant": "HONEYSCU KL",
+          "unit_cost": 75.76
+        }
+      ],
+      "_total_pages": 3,
+      "document_date": "19. August 2025",
+      "purchase_order_no": "PO31942"
+    },
+    {
+      "_page": 3,
+      "vendor": null,
+      "supplier": "Fresh Products LLC 30600 Oregon Road Perrysburgh, OH 43551 USA",
+      "account_no": "V01250",
+      "deliver_to": "Crown Warehouse Ben Pollard Unit 7 Crown Business Park Cowm Top Lane Rochdale, OL11 2PU England",
+      "line_items": [
+        {
+          "no": "105316",
+          "qty": 15.0,
+          "uom": "BOX 6X10",
+          "variant": "SPICEDAPPL",
+          "unit_cost": 75.76
+        }
+      ],
+      "_total_pages": 3,
+      "document_date": "19. August 2025",
+      "purchase_order_no": "PO31942"
+    }
+  ]
+}
