@@ -1548,10 +1548,84 @@ function updateNavActive() {
 // PAGE 6: REVIEW (Human-in-the-Loop Field Mapping + Correction)
 // ══════════════════════════════════════════════════════════════════════
 
+// ── po_per_page helpers ──────────────────────────────────────────────
+
+function _cloneJson(value) {
+    return JSON.parse(JSON.stringify(value));
+}
+
+function _normalizeReviewRecord(value) {
+    return (value && typeof value === 'object' && !Array.isArray(value)) ? value : {};
+}
+
+function _rvCurrentPayload() {
+    if (!_rvIsPoPerPage) return _rvResult;
+    const payload = _cloneJson(_rvAllResults);
+    const idx = _rvRecordIndexForPage(_rvCurrentPage);
+    payload[idx] = _cloneJson(_rvResult);
+    return payload;
+}
+
+function _rvRecordIndexForPage(pageNumber) {
+    if (!_rvAllResults.length) return 0;
+    return Math.max(0, Math.min(_rvAllResults.length - 1, pageNumber - 1));
+}
+
+function _rvPersistCurrentRecord() {
+    if (!_rvIsPoPerPage) return;
+    const idx = _rvRecordIndexForPage(_rvCurrentPage);
+    _rvAllResults[idx] = _cloneJson(_rvResult);
+    _rvAllFieldLocs[idx] = _cloneJson(_rvFieldLocs);
+}
+
+function _rvLoadCurrentRecord() {
+    if (_rvIsPoPerPage) {
+        const idx = _rvRecordIndexForPage(_rvCurrentPage);
+        _rvResult = _cloneJson(_normalizeReviewRecord(_rvAllResults[idx]));
+        _rvOriginalResult = _cloneJson(_normalizeReviewRecord(_rvAllOriginalResults[idx]));
+        _rvFieldLocs = _cloneJson(_normalizeReviewRecord(_rvAllFieldLocs[idx]));
+        return;
+    }
+    _rvResult = _cloneJson(_normalizeReviewRecord(_rvSingleResult));
+    _rvOriginalResult = _cloneJson(_normalizeReviewRecord(_rvSingleOriginalResult));
+}
+
+function _rvHeaderKeys() {
+    return Object.keys(_rvResult).filter(k => k !== 'line_items' && _rvResult[k] != null);
+}
+
+function _rvUpdateStats() {
+    const headerKeys = _rvHeaderKeys();
+    const matchedCount = headerKeys.filter(k => _rvFieldLocs[k]).length;
+    const matchedEl = document.querySelector('.stat-matched');
+    const missedEl = document.querySelector('.stat-missed');
+    if (matchedEl) matchedEl.textContent = `${matchedCount} MATCHED`;
+    if (missedEl) missedEl.textContent = `${headerKeys.length - matchedCount} UNMATCHED`;
+}
+
+function _rvSetCurrentPage(nextPage) {
+    const clampedPage = Math.max(1, Math.min(_rvTotalPages, nextPage));
+    if (_rvCurrentPage === clampedPage) return;
+    _rvPersistCurrentRecord();
+    _rvCurrentPage = clampedPage;
+    _rvLoadCurrentRecord();
+    rvRenderFields();
+    _rvUpdateStats();
+    rvRenderCurrentPage();
+}
+
+// ── Core review state ────────────────────────────────────────────────
+
 let _rvCurrentPage = 1;
 let _rvTotalPages = 1;
 let _rvPages = [];
 let _rvResult = {};
+let _rvSingleResult = {};
+let _rvSingleOriginalResult = {};
+let _rvAllResults = [];
+let _rvAllOriginalResults = [];
+let _rvIsPoPerPage = false;
+let _rvAllFieldLocs = [];
 let _rvFieldLocs = {};
 let _rvOcrData = [];          // PaddleOCR words per page (for click-to-select)
 let _rvZoom = 100;
@@ -1581,23 +1655,51 @@ async function renderReviewPage(app, extractionId) {
     if (oldSvg) oldSvg.remove();
 
     // Always fetch fresh data from API to avoid stale in-memory snapshots.
-    // The in-memory reviewResult/reviewFieldLocations can be stale after
-    // corrections are saved, or reviewPages may have been snapshotted before
-    // the async page load finished.
     try {
         const data = await apiJSON(`/extractions/${extractionId}`);
-        // Use corrected_result if available (previous corrections), else original result
         const effectiveResult = data.corrected_result || data.result || {};
-        _rvResult = JSON.parse(JSON.stringify(effectiveResult));
-        _rvOriginalResult = JSON.parse(JSON.stringify(data.result || {})); // always the original
-        _rvFieldLocs = data.field_locations || {};
+        const origResult = data.result || {};
+        _rvIsPoPerPage = Array.isArray(effectiveResult);
+        if (_rvIsPoPerPage) {
+            _rvAllResults = _cloneJson(effectiveResult);
+            _rvAllOriginalResults = _cloneJson(Array.isArray(origResult) ? origResult : []);
+            _rvSingleResult = {};
+            _rvSingleOriginalResult = {};
+            _rvAllFieldLocs = Array.isArray(data.field_locations) ? _cloneJson(data.field_locations) : [];
+            if (_rvAllFieldLocs.length === 0) {
+                _rvAllFieldLocs = _rvAllResults.map(() => ({}));
+            }
+        } else {
+            _rvSingleResult = _cloneJson(_normalizeReviewRecord(effectiveResult));
+            _rvSingleOriginalResult = _cloneJson(_normalizeReviewRecord(origResult));
+            _rvAllResults = [];
+            _rvAllOriginalResults = [];
+            _rvAllFieldLocs = [];
+            _rvFieldLocs = data.field_locations || {};
+        }
         try { _rvPages = await apiJSON(`/extractions/${extractionId}/pages`); } catch (e2) { _rvPages = []; }
     } catch (e) {
         // API failed — fall back to in-memory state if available
         console.warn('Failed to fetch extraction from API, using in-memory fallback:', e.message);
-        _rvResult = JSON.parse(JSON.stringify(reviewResult || {}));
-        _rvOriginalResult = JSON.parse(JSON.stringify(reviewResult || {}));
-        _rvFieldLocs = JSON.parse(JSON.stringify(reviewFieldLocations || {}));
+        const fallbackResult = reviewResult || {};
+        _rvIsPoPerPage = Array.isArray(fallbackResult);
+        if (_rvIsPoPerPage) {
+            _rvAllResults = _cloneJson(fallbackResult);
+            _rvAllOriginalResults = _cloneJson(fallbackResult);
+            _rvSingleResult = {};
+            _rvSingleOriginalResult = {};
+            _rvAllFieldLocs = Array.isArray(reviewFieldLocations) ? _cloneJson(reviewFieldLocations) : [];
+            if (_rvAllFieldLocs.length === 0) {
+                _rvAllFieldLocs = _rvAllResults.map(() => ({}));
+            }
+        } else {
+            _rvSingleResult = _cloneJson(_normalizeReviewRecord(fallbackResult));
+            _rvSingleOriginalResult = _cloneJson(_normalizeReviewRecord(fallbackResult));
+            _rvAllResults = [];
+            _rvAllOriginalResults = [];
+            _rvAllFieldLocs = [];
+            _rvFieldLocs = JSON.parse(JSON.stringify(reviewFieldLocations || {}));
+        }
         _rvPages = extractionPages.length ? extractionPages : [];
     }
     _rvUndoStack = [];
@@ -1615,9 +1717,10 @@ async function renderReviewPage(app, extractionId) {
     _rvTotalPages = _rvPages.length || 1;
     _rvCurrentPage = 1;
     _rvZoom = 100;
+    _rvLoadCurrentRecord();
 
     // Count matched vs total header fields
-    const headerKeys = Object.keys(_rvResult).filter(k => k !== 'line_items' && _rvResult[k] != null);
+    const headerKeys = _rvHeaderKeys();
     const matchedCount = headerKeys.filter(k => _rvFieldLocs[k]).length;
 
     app.innerHTML = headerHTML() + `
@@ -1714,7 +1817,7 @@ function rvRenderFields() {
     const el = document.getElementById('rvFieldsList');
     if (!el) return;
 
-    const headerKeys = Object.keys(_rvResult).filter(k => k !== 'line_items' && _rvResult[k] != null);
+    const headerKeys = _rvHeaderKeys();
 
     if (!headerKeys.length) {
         el.innerHTML = '<div style="padding:10px;color:var(--text-dim);font-size:10px">No fields extracted</div>';
@@ -1747,6 +1850,7 @@ function rvRenderFields() {
 
     // Line items table
     rvRenderLineItems();
+    _rvUpdateStats();
 }
 
 function rvOnFieldEdit(input) {
@@ -2430,8 +2534,8 @@ function rvHideOcrOverlay() {
 // ── Review: Page navigation ──────────────────────────────────────────
 
 function rvChangePage(dir) {
-    _rvCurrentPage = Math.max(1, Math.min(_rvTotalPages, _rvCurrentPage + dir));
-    rvRenderCurrentPage();
+    _rvSetCurrentPage(_rvCurrentPage + dir);
+    return;  // _rvSetCurrentPage handles rendering
 }
 
 function rvUpdatePageNav() {
@@ -2491,13 +2595,13 @@ function rvApplyZoom() {
 // ── Review: Actions ──────────────────────────────────────────────────
 
 function rvCopyJSON() {
-    navigator.clipboard.writeText(JSON.stringify(_rvResult, null, 2));
+    navigator.clipboard.writeText(JSON.stringify(_rvCurrentPayload(), null, 2));
     showToast('JSON copied to clipboard');
 }
 
 function rvDownloadJSON() {
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([JSON.stringify(_rvResult, null, 2)], { type: 'application/json' }));
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(_rvCurrentPayload(), null, 2)], { type: 'application/json' }));
     a.download = `review_${_rvExtractionId || Date.now()}.json`;
     a.click();
 }
@@ -2506,17 +2610,20 @@ async function rvConfirm() {
     // Save corrections to backend if changes were made
     if (_rvDirty && _rvExtractionId) {
         try {
+            _rvPersistCurrentRecord();
+            const payload = _rvCurrentPayload();
+            const finalFieldLocs = _rvIsPoPerPage ? _rvAllFieldLocs : _rvFieldLocs;
             await apiJSON(`/extractions/${_rvExtractionId}/corrections`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    corrected_result: _rvResult,
-                    field_locations: _rvFieldLocs,
+                    corrected_result: payload,
+                    field_locations: finalFieldLocs,
                 }),
             });
             // Update in-memory snapshots so reopening review shows saved state
-            reviewResult = JSON.parse(JSON.stringify(_rvResult));
-            reviewFieldLocations = JSON.parse(JSON.stringify(_rvFieldLocs));
+            reviewResult = JSON.parse(JSON.stringify(payload));
+            reviewFieldLocations = JSON.parse(JSON.stringify(finalFieldLocs));
             showToast('Corrections saved successfully');
         } catch (e) {
             showToast('Failed to save corrections: ' + e.message);

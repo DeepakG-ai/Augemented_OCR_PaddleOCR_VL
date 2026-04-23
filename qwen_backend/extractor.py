@@ -60,7 +60,8 @@ _FORMAT_DESCRIPTIONS: dict[str, str] = {
 
 # ── Prompt Version (bump this to invalidate all cached prompts in DB/Redis) ──
 # v3 = Qwen returns {fields, boxes} — anchor bboxes for keys/headers only
-PROMPT_VERSION = "v3"
+# v3.1 = prompt enforces 0-1000 normalized grid for bbox coordinates
+PROMPT_VERSION = "v3.1"
 
 # ── System Prompt (built once, stored in DB + Redis) ─────────────────
 
@@ -142,7 +143,7 @@ Count the number of rows in the line items table FIRST, then extract that exact 
 - Return bounding boxes only for requested field anchors and requested table column headers.
 - Do not return bounding boxes for field values.
 - Do not return row-level line item bounding boxes.
-- Every bounding box must be [x0, y0, x1, y1] in page-image pixel coordinates.
+- Every bounding box must be [x0, y0, x1, y1] in a 0-1000 normalized grid relative to the page image.
 - The bbox should tightly cover the anchor/header text region only.
 </output_rules>"""
 
@@ -506,7 +507,7 @@ async def extract_document(
 
     # ── Build final result based on format ──
     if format_type == "po_per_page":
-        final = page_results
+        final = [pr.get("fields", pr) for pr in page_results if "_error" not in pr]
     elif format_type == "single_page" and len(page_results) == 1:
         if "_error" in page_results[0]:
             final = None

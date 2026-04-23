@@ -335,10 +335,15 @@ async def upsert_vendor(pool: asyncpg.Pool, vendor_id: str, name: str) -> dict:
 
 
 async def delete_vendor(pool: asyncpg.Pool, vendor_id: str) -> bool:
-    """Delete a vendor. CASCADE handles templates/extractions."""
+    """Delete a vendor and dependent rows even on schemas without FK cascades."""
     async with pool.acquire() as conn:
-        result = await conn.execute("DELETE FROM vendors WHERE id = $1", vendor_id)
-        return result == "DELETE 1"
+        async with conn.transaction():
+            # Some deployments still have vendor foreign keys without ON DELETE
+            # CASCADE, so delete dependents explicitly before removing the vendor.
+            await conn.execute("DELETE FROM extractions WHERE vendor_id = $1", vendor_id)
+            await conn.execute("DELETE FROM documents WHERE vendor_id = $1", vendor_id)
+            result = await conn.execute("DELETE FROM vendors WHERE id = $1", vendor_id)
+            return result == "DELETE 1"
 
 
 # -- Template queries ------------------------------------------------------
@@ -707,6 +712,55 @@ async def list_delivery_object_keys(pool: asyncpg.Pool, extraction_id: int) -> l
         return [r["object_key"] for r in rows if r.get("object_key")]
 
 
+async def get_vendor_object_keys(pool: asyncpg.Pool, vendor_id: str) -> dict[str, list[str]]:
+    """Collect object-store keys owned by a vendor for cleanup on delete."""
+    async with pool.acquire() as conn:
+        document_rows = await conn.fetch(
+            """
+            SELECT object_key
+            FROM documents
+            WHERE vendor_id = $1 AND object_key IS NOT NULL
+            ORDER BY created_at ASC
+            """,
+            vendor_id,
+        )
+        page_rows = await conn.fetch(
+            """
+            SELECT p.object_key
+            FROM pages p
+            JOIN extractions e ON e.id = p.extraction_id
+            WHERE e.vendor_id = $1 AND p.object_key IS NOT NULL
+            ORDER BY p.extraction_id ASC, p.page_number ASC
+            """,
+            vendor_id,
+        )
+        delivery_rows = await conn.fetch(
+            """
+            SELECT d.object_key
+            FROM integration_deliveries d
+            JOIN extractions e ON e.id = d.extraction_id
+            WHERE e.vendor_id = $1 AND d.object_key IS NOT NULL
+            ORDER BY d.created_at ASC
+            """,
+            vendor_id,
+        )
+        export_rows = await conn.fetch(
+            """
+            SELECT export_object_key
+            FROM extractions
+            WHERE vendor_id = $1 AND export_object_key IS NOT NULL
+            ORDER BY created_at ASC
+            """,
+            vendor_id,
+        )
+        return {
+            "documents": [r["object_key"] for r in document_rows if r.get("object_key")],
+            "pages": [r["object_key"] for r in page_rows if r.get("object_key")],
+            "deliveries": [r["object_key"] for r in delivery_rows if r.get("object_key")],
+            "exports": [r["export_object_key"] for r in export_rows if r.get("export_object_key")],
+        }
+
+
 # -- Field locations + OCR data --------------------------------------------
 
 async def save_field_locations(
@@ -747,13 +801,33 @@ async def save_ocr_data(
         )
 
 async def is_postprocess_ready(pool: asyncpg.Pool, extraction_id: int) -> bool:
-    """Lightweight check: are both result and ocr_data present?
-    
-    Avoids loading the massive JSONB blobs — just checks for IS NOT NULL.
+    """Lightweight check for postprocess prerequisites.
+
+    v3 extractions can proceed with Qwen boxes alone. Legacy flows still require
+    OCR data.
     """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT (result IS NOT NULL AND ocr_data IS NOT NULL) AS ready FROM extractions WHERE id = $1",
+            """
+            SELECT (
+                result IS NOT NULL
+                AND (
+                    ocr_data IS NOT NULL
+                    OR EXISTS (
+                        SELECT 1
+                        FROM jsonb_array_elements(
+                            CASE
+                                WHEN jsonb_typeof(page_results) = 'array' THEN page_results
+                                ELSE '[]'::jsonb
+                            END
+                        ) AS pr
+                        WHERE pr ? 'boxes'
+                    )
+                )
+            ) AS ready
+            FROM extractions
+            WHERE id = $1
+            """,
             extraction_id,
         )
         return bool(row and row["ready"])

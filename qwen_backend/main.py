@@ -1232,13 +1232,37 @@ async def get_extraction_ocr(request: Request, extraction_id: int):
 
 # -- Review: Save Corrections -----------------------------------------------
 
-def _compute_correction_diff(original: dict, corrected: dict) -> dict:
+def _compute_correction_diff(original, corrected) -> dict:
     """Compute which fields changed between original and corrected results.
 
     Returns a dict of {field_name: {"original": ..., "corrected": ...}} for
     changed fields only. Line items are compared as a whole array.
     """
     diff: dict = {}
+    
+    if isinstance(original, list) or isinstance(corrected, list):
+        if not isinstance(original, list): original = [original] if original and isinstance(original, dict) else []
+        if not isinstance(corrected, list): corrected = [corrected] if corrected and isinstance(corrected, dict) else []
+        
+        max_len = max(len(original), len(corrected))
+        for i in range(max_len):
+            orig_doc = original[i] if i < len(original) else {}
+            corr_doc = corrected[i] if i < len(corrected) else {}
+            if not isinstance(orig_doc, dict): orig_doc = {}
+            if not isinstance(corr_doc, dict): corr_doc = {}
+            
+            all_keys = set(list(orig_doc.keys()) + list(corr_doc.keys()))
+            for key in all_keys:
+                orig_val = orig_doc.get(key)
+                corr_val = corr_doc.get(key)
+                if orig_val != corr_val:
+                    diff_key = f"doc_{i}_{key}"
+                    diff[diff_key] = {"original": orig_val, "corrected": corr_val}
+        return diff
+
+    if not isinstance(original, dict): original = {}
+    if not isinstance(corrected, dict): corrected = {}
+    
     all_keys = set(list(original.keys()) + list(corrected.keys()))
     for key in all_keys:
         orig_val = original.get(key)

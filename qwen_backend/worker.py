@@ -124,6 +124,8 @@ async def _process_normalize(pool, job: dict) -> None:
                 "mime_type": page.get("mime_type", "image/jpeg"),
                 "width": page.get("width", 0),
                 "height": page.get("height", 0),
+                "orig_width": page.get("orig_width", page.get("width", 0)),
+                "orig_height": page.get("orig_height", page.get("height", 0)),
             }
         )
 
@@ -296,11 +298,23 @@ async def _process_postprocess(pool, job: dict) -> None:
     if isinstance(page_results, list) and len(page_results) > 0:
         is_v3 = any("boxes" in pr for pr in page_results)
 
-    if is_v3:
-        # v3: Qwen returned {fields, boxes} — use qwen_bbox_parser directly
+    if is_v3 and isinstance(result, dict):
+        # v3 dict result: Qwen returned {fields, boxes} for a single document
         logger.info("Postprocess: using qwen_bbox_parser (v3 format)")
         pages = await db_mod.get_pages(pool, extraction_id)
         field_locations = qwen_bbox_parser.build_field_locations(result, page_results, pages=pages)
+    elif is_v3 and isinstance(result, list):
+        # po_per_page returns a list of results. We build a list of field_locations.
+        logger.info("Postprocess: using qwen_bbox_parser for v3 po_per_page (list format)")
+        pages = await db_mod.get_pages(pool, extraction_id)
+        field_locations = []
+        valid_page_results = [pr for pr in page_results if "_error" not in pr]
+        for i, doc_result in enumerate(result):
+            # Match the i-th doc to the i-th valid page_result
+            pr = valid_page_results[i] if i < len(valid_page_results) else {}
+            # Pass a single element list for page_results to keep qwen_bbox_parser happy
+            locs = qwen_bbox_parser.build_field_locations(doc_result, [pr] if pr else [], pages=pages)
+            field_locations.append(locs)
     elif ocr_data:
         # Legacy: fallback to text_matcher (CPU-bound, run in executor)
         logger.info("Postprocess: using text_matcher fallback (legacy format)")
