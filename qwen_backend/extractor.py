@@ -508,7 +508,10 @@ async def extract_document(
     if format_type == "po_per_page":
         final = page_results
     elif format_type == "single_page" and len(page_results) == 1:
-        final = page_results[0] if "_error" not in page_results[0] else None
+        if "_error" in page_results[0]:
+            final = None
+        else:
+            final = page_results[0].get("fields", page_results[0])
     else:
         # single_po_multipage — merge header from page 1 + line_items from all
         # merge_results already filters out _error pages internally
@@ -556,9 +559,9 @@ def merge_results(
     is_v3 = "fields" in first_page and isinstance(first_page.get("fields"), dict)
 
     if is_v3:
-        # ── v3 format: {fields: {...}, boxes: {...}} ──
+        # ── v3 format: return JUST the merged fields ──
+        # Boxes and formats are now handled exclusively via page_results
         merged_fields: dict[str, Any] = {}
-        merged_boxes: list[dict] = []  # [{page, boxes: {key: [x0,y0,x1,y1]}}]
 
         # Header from page 1
         first_fields = first_page.get("fields", {})
@@ -579,18 +582,7 @@ def merge_results(
                 all_items.extend(items)
         merged_fields["line_items"] = all_items
 
-        # Boxes from all pages (page-associated)
-        for pr in valid_pages:
-            page_num = pr.get("_page", 1)
-            page_boxes = pr.get("boxes")
-            if isinstance(page_boxes, dict):
-                merged_boxes.append({"page": page_num, "boxes": page_boxes})
-
-        return {
-            "fields": merged_fields,
-            "boxes": merged_boxes,
-            "_format": "v3",
-        }
+        return merged_fields
     else:
         # ── Legacy flat format ──
         merged: dict[str, Any] = {}

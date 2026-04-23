@@ -292,7 +292,9 @@ async def _process_postprocess(pool, job: dict) -> None:
         logger.warning("Failed to save debug dump for extraction %s: %s", extraction_id, _e)
 
     # ── Build field_locations ──
-    is_v3 = isinstance(result, dict) and result.get("_format") == "v3"
+    is_v3 = False
+    if isinstance(page_results, list) and len(page_results) > 0:
+        is_v3 = any("boxes" in pr for pr in page_results)
 
     if is_v3:
         # v3: Qwen returned {fields, boxes} — use qwen_bbox_parser directly

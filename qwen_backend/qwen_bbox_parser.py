@@ -84,7 +84,7 @@ def build_field_locations(
         - Strategy: "qwen_column_header"
 
     Args:
-        merged_result: The merged extraction result (may have _format="v3").
+        merged_result: The merged extraction result (just fields now).
         page_results: The per-page raw results for page association.
         pages: The db rows for pages, providing orig_width and orig_height.
 
@@ -93,17 +93,16 @@ def build_field_locations(
     """
     locations: dict[str, dict] = {}
 
-    is_v3 = merged_result.get("_format") == "v3"
+    if not page_results:
+        return {}
+    
+    # Check if this is a v3 extraction (has 'boxes' in page_results)
+    is_v3 = any("boxes" in pr for pr in page_results)
     if not is_v3:
         logger.info("Result is not v3 format — skipping qwen_bbox_parser")
         return {}
 
-    fields = merged_result.get("fields", {})
-    boxes_list = merged_result.get("boxes", [])
-    # boxes_list = [{page: int, boxes: {key: [x0,y0,x1,y1]}}]
-
-    if not isinstance(boxes_list, list):
-        boxes_list = []
+    fields = merged_result  # The merged result is now purely the fields
 
     # Map page number to dimensions
     page_dims = {}
@@ -115,9 +114,9 @@ def build_field_locations(
 
     # Build a flat lookup: key -> {page, box}
     anchor_lookup: dict[str, dict] = {}
-    for page_entry in boxes_list:
-        page_num = page_entry.get("page", 1)
-        page_boxes = page_entry.get("boxes", {})
+    for pr in page_results:
+        page_num = pr.get("_page", 1)
+        page_boxes = pr.get("boxes", {})
         if not isinstance(page_boxes, dict):
             continue
         
@@ -169,9 +168,9 @@ def build_field_locations(
     # For multi-page: rows from page N use page N's column header box.
     # Build page-to-column-box mapping.
     page_column_boxes: dict[int, dict[str, list[int]]] = {}
-    for page_entry in boxes_list:
-        page_num = page_entry.get("page", 1)
-        page_boxes = page_entry.get("boxes", {})
+    for pr in page_results:
+        page_num = pr.get("_page", 1)
+        page_boxes = pr.get("boxes", {})
         if isinstance(page_boxes, dict):
             pw, ph = page_dims.get(page_num, (1000, 1000))
             col_boxes = {}
