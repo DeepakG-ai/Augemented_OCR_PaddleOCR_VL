@@ -36,6 +36,7 @@ try:
     from . import extractor
     from . import processor
     from .contracts import build_purchase_order_contract
+    from . import logging_config as plog
     from .logging_config import configure_logging
     from .models import (
         ExtractionJobStartOut,
@@ -58,6 +59,7 @@ except ImportError:
     import extractor
     import processor
     from contracts import build_purchase_order_contract
+    import logging_config as plog
     from logging_config import configure_logging
     from models import (
         ExtractionJobStartOut,
@@ -276,7 +278,17 @@ async def list_vendors(request: Request):
 @app.post("/vendors", response_model=VendorOut)
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def create_vendor(request: Request, body: VendorCreate):
-    row = await db_mod.upsert_vendor(request.app.state.pool, body.id, body.name)
+    pool = request.app.state.pool
+    row = await db_mod.upsert_vendor(pool, body.id, body.name)
+    # Auto-insert vendor name as a detection alias
+    try:
+        await db_mod.insert_vendor_alias(pool, body.id, body.name.lower(), weight=1, source="auto_from_name")
+        # Also insert the vendor_id itself as an alias (e.g. "robert_scott" -> "robert scott")
+        alias_from_id = body.id.replace("_", " ").replace("-", " ").lower()
+        if alias_from_id != body.name.lower():
+            await db_mod.insert_vendor_alias(pool, body.id, alias_from_id, weight=1, source="auto_from_id")
+    except Exception as exc:
+        logger.warning("Failed to auto-insert vendor alias for %s: %s", body.id, exc)
     return VendorOut(**row)
 
 
@@ -293,8 +305,85 @@ async def delete_vendor(request: Request, vendor_id: str):
     return {"status": "deleted", "vendor_id": vendor_id}
 
 
-# -- Templates --------------------------------------------------------------
+# -- Vendor Detection -------------------------------------------------------
 
+@app.post("/detect-vendor")
+@limiter.limit("10/minute")
+async def detect_vendor_endpoint(request: Request, file: UploadFile = File(...)):
+    """Detect vendor from uploaded PDF/image by analyzing page-1 text.
+
+    Renders page 1 only, extracts text via pypdfium2 (digital) or PaddleOCR
+    (scanned fallback), then matches against vendor_aliases in DB.
+
+    Returns:
+        200: {detected: true, vendor_id, vendor_name, score, page_source, matched_patterns}
+        409: {detected: false, reason: "unknown_vendor", hint: "..."}
+    """
+    try:
+        from . import geometry
+        from . import vendor_detector
+        from . import ocr_runner
+    except ImportError:
+        import geometry
+        import vendor_detector
+        import ocr_runner
+
+    pool = request.app.state.pool
+    file_bytes = await file.read()
+    filename = (file.filename or "unknown").lower()
+
+    # Render page 1 only
+    if filename.endswith(".pdf"):
+        rendered = await processor.pdf_to_images(file_bytes, max_pages=1)
+    else:
+        rendered = await processor.image_file_to_b64(file_bytes)
+
+    if not rendered:
+        raise HTTPException(400, detail="Could not render any pages from the uploaded file")
+
+    page1 = rendered[0]
+    page1_meta = {"page_number": 1, "width": page1.get("width", 0), "height": page1.get("height", 0)}
+
+    # Get page-1 text via geometry (digital-first, scanned-fallback)
+    page_source = "paddleocr"
+    if filename.endswith(".pdf"):
+        geo_pages = geometry.compute_pdf_geometry(file_bytes, [page1_meta])
+        geo_page = geo_pages[0] if geo_pages else {}
+        page_words = geo_page.get("words", [])
+        page_source = geo_page.get("source") or page_source
+    else:
+        page_words = []
+
+    if not page_words:
+        ocr_pages = await ocr_runner.run_ocr_on_pages([{
+            "page_number": 1,
+            "image_b64": page1["image_b64"],
+            "mime_type": page1.get("mime_type", "image/jpeg"),
+        }])
+        page_words = ocr_pages[0].get("words", []) if ocr_pages else []
+        page_source = "paddleocr"
+
+    match = await vendor_detector.detect_vendor(pool, page_words)
+    if match is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "detected": False,
+                "reason": "unknown_vendor",
+                "hint": "Create the vendor and vendor id first, then retry this document.",
+                "page_source": page_source,
+                "word_count": len(page_words),
+            },
+        )
+
+    return {
+        "detected": True,
+        "vendor_id": match.vendor_id,
+        "vendor_name": match.vendor_name,
+        "score": match.score,
+        "page_source": page_source,
+        "matched_patterns": match.matched_patterns,
+    }
 @app.get("/vendors/{vendor_id}/template", response_model=TemplateOut)
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def get_template(request: Request, vendor_id: str):
@@ -316,6 +405,39 @@ async def get_template(request: Request, vendor_id: str):
         tmpl["user_prompt"] = "Error building preview"
         
     return TemplateOut(**tmpl)
+
+
+@app.get("/vendors/{vendor_id}/gold-corrections")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_vendor_gold_corrections(request: Request, vendor_id: str):
+    """Return latest saved gold correction per field for UI warnings."""
+    fields = await db_mod.get_latest_gold_correction_fields(request.app.state.pool, vendor_id)
+    return {"vendor_id": vendor_id, "fields": fields}
+
+
+@app.get("/extractions/{extraction_id}/spatial-memory-fields")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_spatial_memory_fields(request: Request, extraction_id: int):
+    """Return field keys that have active spatial memory for this extraction's vendor+layout."""
+    pool = request.app.state.pool
+    extraction = await db_mod.get_extraction(pool, extraction_id)
+    if not extraction:
+        raise HTTPException(404, detail="Extraction not found")
+
+    vendor_id = extraction.get("vendor_id")
+    template_id = extraction.get("template_id")
+    if not vendor_id:
+        return {"extraction_id": extraction_id, "fields": {}}
+
+    try:
+        from .layout_key import compute_layout_key
+    except ImportError:
+        from layout_key import compute_layout_key
+    lk = compute_layout_key(vendor_id, template_id, [])
+
+    memories = await db_mod.get_spatial_memory_for_layout(pool, vendor_id, lk)
+    fields = {m["field_key"]: {"page": m["page_number"]} for m in memories}
+    return {"extraction_id": extraction_id, "vendor_id": vendor_id, "layout_key": lk, "fields": fields}
 
 
 @app.post("/vendors/{vendor_id}/template", response_model=TemplateSaveResponse)
@@ -839,7 +961,7 @@ async def ingest_document(
     request: Request,
     source_type: str,
     file: UploadFile = File(...),
-    vendor_id: str = Form(...),
+    vendor_id: str | None = Form(None),
     format_type: str = Form("single_po_multipage"),
     header_fields: str = Form(None),
     line_item_fields: str = Form(None),
@@ -848,11 +970,122 @@ async def ingest_document(
     if source_type not in {"ui", "rest", "email", "s3", "sftp", "partner"}:
         raise HTTPException(400, detail=f"Unsupported source_type '{source_type}'")
 
+    pool = request.app.state.pool
+    file_bytes = await file.read()
+    filename = file.filename or "unknown"
+    detected_vendor = None
+    plog.event(
+        "file_received",
+        stage="ingest",
+        filename=filename,
+        source_type=source_type,
+        size_bytes=len(file_bytes),
+        vendor_id=vendor_id,
+    )
+
+    # If vendor_id not provided, detect from page-1 text
+    if not vendor_id:
+        try:
+            from . import geometry as _geo
+            from . import vendor_detector as _vd
+            from . import ocr_runner as _ocr
+        except ImportError:
+            import geometry as _geo
+            import vendor_detector as _vd
+            import ocr_runner as _ocr
+
+        # Render page 1 only for detection
+        with plog.timed("page1_rendered_for_vendor_detection", stage="vendor_detection", filename=filename) as log_ctx:
+            if filename.lower().endswith(".pdf"):
+                rendered = await processor.pdf_to_images(file_bytes, max_pages=1)
+            else:
+                rendered = await processor.image_file_to_b64(file_bytes)
+            log_ctx["pages_rendered"] = len(rendered)
+
+        if not rendered:
+            plog.event(
+                "vendor_detection_failed",
+                stage="vendor_detection",
+                filename=filename,
+                status="error",
+                reason="no_rendered_pages",
+            )
+            raise HTTPException(400, detail="Could not render any pages from the uploaded file")
+
+        page1 = rendered[0]
+        page1_meta = {"page_number": 1, "width": page1.get("width", 0), "height": page1.get("height", 0)}
+
+        # Digital-first text extraction
+        if filename.lower().endswith(".pdf"):
+            with plog.timed("page1_pypdfium_geometry", stage="vendor_detection", filename=filename) as log_ctx:
+                geo_pages = _geo.compute_pdf_geometry(file_bytes, [page1_meta])
+                geo_page = geo_pages[0] if geo_pages else {}
+                log_ctx["page_source"] = geo_page.get("source")
+                log_ctx["char_count"] = geo_page.get("char_count", 0)
+                log_ctx["word_count"] = len(geo_page.get("words", []) or [])
+            page_words = geo_pages[0].get("words", []) if geo_pages else []
+        else:
+            page_words = []
+
+        # Scanned fallback if needed
+        if not page_words:
+            plog.event(
+                "page1_no_digital_words",
+                stage="vendor_detection",
+                filename=filename,
+                fallback="paddleocr",
+            )
+            with plog.timed("page1_paddleocr_fallback", stage="vendor_detection", filename=filename) as log_ctx:
+                ocr_pages = await _ocr.run_ocr_on_pages([{
+                    "page_number": 1,
+                    "image_b64": page1["image_b64"],
+                    "mime_type": page1.get("mime_type", "image/jpeg"),
+                }])
+                if ocr_pages:
+                    page_words = ocr_pages[0].get("words", [])
+                log_ctx["word_count"] = len(page_words)
+                log_ctx["sample_words"] = [w.get("text") for w in page_words[:12]]
+
+        with plog.timed("vendor_matched", stage="vendor_detection", filename=filename, word_count=len(page_words)) as log_ctx:
+            match = await _vd.detect_vendor(pool, page_words)
+            if match is not None:
+                log_ctx["vendor_id"] = match.vendor_id
+                log_ctx["vendor_name"] = match.vendor_name
+                log_ctx["match_type"] = getattr(match, "match_type", "unknown")
+                log_ctx["score"] = match.score
+                log_ctx["matched_patterns"] = match.matched_patterns
+        if match is None:
+            plog.event(
+                "unknown_vendor_blocked",
+                stage="vendor_detection",
+                filename=filename,
+                status="blocked",
+                word_count=len(page_words),
+                hint="Create the vendor and vendor id first, then retry this document.",
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": "unknown_vendor",
+                    "hint": "Create the vendor and vendor id first, then retry this document.",
+                    "word_count": len(page_words),
+                },
+            )
+        else:
+            vendor_id = match.vendor_id
+            detected_vendor = {
+                "vendor_id": match.vendor_id,
+                "vendor_name": match.vendor_name,
+                "score": match.score,
+                "match_type": getattr(match, "match_type", "unknown"),
+                "matched_patterns": match.matched_patterns,
+            }
+
     submitted = await _submit_ingestion_job(
-        request.app.state.pool,
+        pool,
         request.app.state.store,
-        file_bytes=await file.read(),
-        filename=file.filename or "unknown",
+        file_bytes=file_bytes,
+        filename=filename,
         vendor_id=vendor_id,
         format_type=format_type,
         header_fields=json.loads(header_fields) if header_fields else [],
@@ -860,11 +1093,30 @@ async def ingest_document(
         source_type=source_type,
         source_ref=source_ref,
     )
-    return ExtractionJobStartOut(
+    resp = ExtractionJobStartOut(
         job_id=submitted["job"]["id"],
         extraction_id=submitted["extraction"]["id"],
         status=submitted["job"]["status"],
     )
+    # Include detection result in response if auto-detected
+    result = resp.model_dump() if hasattr(resp, "model_dump") else resp.dict()
+    if detected_vendor:
+        result["detected_vendor"] = detected_vendor
+    plog.event(
+        "ingestion_job_created",
+        stage="ingest",
+        extraction_id=submitted["extraction"]["id"],
+        document_id=submitted["extraction"].get("document_id"),
+        job_id=submitted["job"]["id"],
+        vendor_id=vendor_id,
+        vendor_name=(detected_vendor or {}).get("vendor_name"),
+        filename=filename,
+        status=submitted["job"]["status"],
+        template_id=submitted["extraction"].get("template_id"),
+        format_type=submitted["extraction"].get("format_type"),
+        log_paths=plog.log_paths(submitted["extraction"]["id"]),
+    )
+    return result
 
 
 @app.get("/jobs/{job_id}", response_model=JobStatusOut)
@@ -998,15 +1250,18 @@ async def request_job_cancel(request: Request, extraction_id: int):
     if not extraction:
         raise HTTPException(404, detail="Extraction not found")
     await db_mod.set_cancel_requested(pool, extraction_id, True)
-    await db_mod.cancel_jobs_for_extraction(pool, extraction_id)
+    cancel_counts = await db_mod.cancel_jobs_for_extraction(pool, extraction_id)
+    has_running_work = cancel_counts.get("cancelling", 0) > 0
+    next_status = "cancelling" if has_running_work else "cancelled"
+    next_message = "Cancellation requested" if has_running_work else "Cancelled before execution"
     await db_mod.set_extraction_status(
         pool,
         extraction_id,
-        "cancelling",
-        progress={"stage": "cancel", "message": "Cancellation requested"},
+        next_status,
+        progress={"stage": "cancel", "message": next_message},
     )
     latest_job = await db_mod.get_latest_job_for_extraction(pool, extraction_id)
-    return {"status": "cancelling", "extraction_id": extraction_id, "job_id": latest_job["id"] if latest_job else None}
+    return {"status": next_status, "extraction_id": extraction_id, "job_id": latest_job["id"] if latest_job else None}
 
 
 @app.post("/jobs/extractions/{extraction_id}/resume", response_model=ExtractionJobStartOut)
@@ -1230,7 +1485,73 @@ async def get_extraction_ocr(request: Request, extraction_id: int):
     return {"extraction_id": extraction_id, "ocr_pages": ocr_data}
 
 
+@app.get("/extractions/{extraction_id}/geometry")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_extraction_geometry(request: Request, extraction_id: int):
+    """Return unified per-page geometry with source classification.
+
+    Each page entry includes: page_number, source ('pypdfium'|'paddleocr'),
+    char_count, word_count, and words [{text, box, score}].
+    Falls back to ocr_data if page-level geometry is not available.
+    """
+    pool = request.app.state.pool
+    pages = await db_mod.get_pages(pool, extraction_id)
+    if not pages:
+        raise HTTPException(404, detail="No pages found for this extraction")
+
+    ocr_data = await db_mod.get_ocr_data(pool, extraction_id)
+    ocr_by_page = {
+        entry.get("page_number"): entry
+        for entry in (ocr_data or [])
+        if isinstance(entry, dict)
+    }
+
+    # Build geometry from pages table if available, merging scanned OCR words
+    # from extraction.ocr_data because scanned pages store empty page geometry
+    # until the OCR worker fills the unified payload.
+    geometry_pages = []
+    has_geometry = any(p.get("source") is not None for p in pages)
+
+    if has_geometry:
+        for p in pages:
+            words = p.get("word_geometry") or []
+            ocr_entry = ocr_by_page.get(p["page_number"])
+            if ocr_entry and (p.get("source") != "pypdfium" or not words):
+                words = ocr_entry.get("words") or []
+            geometry_pages.append({
+                "page_number": p["page_number"],
+                "source": p.get("source") or (ocr_entry or {}).get("source"),
+                "char_count": p.get("char_count", 0) or (ocr_entry or {}).get("char_count", 0),
+                "word_count": len(words),
+                "words": words,
+            })
+    else:
+        # Fallback: use ocr_data for old extractions without geometry columns
+        if ocr_data:
+            for entry in ocr_data:
+                words = entry.get("words") or []
+                geometry_pages.append({
+                    "page_number": entry.get("page_number", 0),
+                    "source": entry.get("source"),
+                    "char_count": entry.get("char_count", 0),
+                    "word_count": len(words),
+                    "words": words,
+                })
+
+    return {
+        "extraction_id": extraction_id,
+        "pages": geometry_pages,
+    }
+
+
 # -- Review: Save Corrections -----------------------------------------------
+
+import re
+
+def _normalize_str(val):
+    if isinstance(val, str):
+        return re.sub(r'\s+', ' ', val).strip()
+    return val
 
 def _compute_correction_diff(original, corrected) -> dict:
     """Compute which fields changed between original and corrected results.
@@ -1255,7 +1576,7 @@ def _compute_correction_diff(original, corrected) -> dict:
             for key in all_keys:
                 orig_val = orig_doc.get(key)
                 corr_val = corr_doc.get(key)
-                if orig_val != corr_val:
+                if _normalize_str(orig_val) != _normalize_str(corr_val):
                     diff_key = f"doc_{i}_{key}"
                     diff[diff_key] = {"original": orig_val, "corrected": corr_val}
         return diff
@@ -1267,7 +1588,7 @@ def _compute_correction_diff(original, corrected) -> dict:
     for key in all_keys:
         orig_val = original.get(key)
         corr_val = corrected.get(key)
-        if orig_val != corr_val:
+        if _normalize_str(orig_val) != _normalize_str(corr_val):
             diff[key] = {"original": orig_val, "corrected": corr_val}
     return diff
 
@@ -1298,9 +1619,29 @@ async def save_extraction_corrections(request: Request, extraction_id: int):
         raise HTTPException(404, detail=f"Extraction {extraction_id} not found")
 
     original_result = extraction.get("result") or {}
+    base = {
+        "extraction_id": extraction_id,
+        "document_id": extraction.get("document_id"),
+        "vendor_id": extraction.get("vendor_id"),
+        "vendor_name": extraction.get("vendor_name"),
+        "filename": extraction.get("filename"),
+    }
 
     # Compute correction diff
     correction_diff = _compute_correction_diff(original_result, corrected_result)
+    plog.event(
+        "review_correction_received",
+        stage="review",
+        **base,
+        actor=actor,
+        reason_code=reason_code,
+        changed_fields=list(correction_diff.keys()) if correction_diff else [],
+        field_location_count=(
+            sum(len(v) for v in field_locations if isinstance(v, dict))
+            if isinstance(field_locations, list)
+            else len(field_locations or {})
+        ),
+    )
 
     correction_meta = {
         "corrected_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
@@ -1318,6 +1659,7 @@ async def save_extraction_corrections(request: Request, extraction_id: int):
     )
     if not updated:
         raise HTTPException(404, detail=f"Extraction {extraction_id} not found")
+    plog.event("review_correction_saved", stage="review", **base, changed_fields=list(correction_diff.keys()))
 
     review_event_id = await db_mod.create_review_event(
         pool,
@@ -1344,6 +1686,14 @@ async def save_extraction_corrections(request: Request, extraction_id: int):
             )
             logger.info("Gold example %d created for vendor=%s extraction=%d (changed: %s)",
                         gold_id, vendor_id, extraction_id, ", ".join(correction_diff.keys()))
+            plog.event(
+                "gold_correction_saved",
+                stage="review",
+                **base,
+                gold_example_id=gold_id,
+                changed_fields=list(correction_diff.keys()),
+                latest_per_field=True,
+            )
 
             # Invalidate prompt cache — next extraction will rebuild with gold example
             redis = getattr(request.app.state, "redis", None)
@@ -1352,6 +1702,38 @@ async def save_extraction_corrections(request: Request, extraction_id: int):
                 logger.info("Prompt cache invalidated for vendor=%s", vendor_id)
         except Exception as exc:
             logger.warning("Failed to create gold example for extraction %d: %s", extraction_id, exc)
+
+    # Save spatial memory from manual corrections (Phase 3)
+    spatial_saved = 0
+    if field_locations and vendor_id:
+        try:
+            try:
+                from . import spatial_memory as _sm
+            except ImportError:
+                import spatial_memory as _sm
+            spatial_saved = await _sm.save_from_corrections(
+                pool, extraction_id, field_locations, corrected_result,
+            )
+            if spatial_saved:
+                logger.info(
+                    "Spatial memory: %d regions saved for extraction=%d vendor=%s",
+                    spatial_saved, extraction_id, vendor_id,
+                )
+            plog.event(
+                "review_spatial_memory_saved",
+                stage="review",
+                **base,
+                saved_count=spatial_saved,
+            )
+        except Exception as exc:
+            logger.warning("Failed to save spatial memory for extraction %d: %s", extraction_id, exc)
+            plog.event(
+                "review_spatial_memory_failed",
+                stage="review",
+                status="error",
+                **base,
+                error=str(exc),
+            )
 
     await db_mod.ensure_job(
         pool,
@@ -1367,6 +1749,7 @@ async def save_extraction_corrections(request: Request, extraction_id: int):
         "fields_changed": list(correction_diff.keys()) if correction_diff else [],
         "gold_example_id": gold_id,
         "review_event_id": review_event_id,
+        "spatial_memory_saved": spatial_saved,
     }
 
 

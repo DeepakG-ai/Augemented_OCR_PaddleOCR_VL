@@ -187,6 +187,35 @@ html, body {
 }
 .add-vendor-btn:hover { border-color: var(--blue-dim); color: var(--blue); }
 
+.detected-vendor-card {
+    margin: 0 12px 8px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg2);
+}
+.detected-vendor-label {
+    color: var(--text-dim);
+    font-size: 9px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+}
+.detected-vendor-name {
+    margin-top: 6px;
+    color: var(--text);
+    font-family: var(--display);
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+.detected-vendor-detail {
+    margin-top: 5px;
+    color: var(--text-dim);
+    font-size: 10px;
+    line-height: 1.4;
+}
+
 .divider { height: 1px; background: var(--border); margin: 8px 0; }
 
 .upload-zone {

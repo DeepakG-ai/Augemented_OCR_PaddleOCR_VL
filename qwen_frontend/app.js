@@ -22,7 +22,7 @@ let dragStartX = 0, dragStartY = 0, scrollStartX = 0, scrollStartY = 0;
 let activeExtractionId = null;
 let activeJobId = null;
 let activeExtractButtonId = 'extractBtn';
-let lastExtractionMode = 'fields';
+let detectedVendorName = null;
 
 // ── REVIEW STATE ──────────────────────────────────────────────────────
 let reviewFieldLocations = {};   // {fieldName: {page, box, matched_text, score, strategy}}
@@ -498,15 +498,16 @@ async function renderExtractPage(app) {
         db.activeVendorId = savedVid;
         localStorage.removeItem('extractVendor');
     }
-    if (!db.activeVendorId && vendors.length) db.activeVendorId = vendors[0].id;
+    if (!savedVid) db.activeVendorId = null;
+    detectedVendorName = null;
 
     app.innerHTML = headerHTML() + `
     <aside class="sidebar">
-        <div class="sidebar-section"><div class="section-title">Select Vendor</div></div>
-        <div style="padding:0 12px 8px">
-            <select class="format-select" id="vendorSelect" onchange="extSetVendor(this.value)" style="width:100%">
-                ${vendors.map(v => `<option value="${escapeHtml(v.id)}" ${v.id === db.activeVendorId ? 'selected' : ''}>${escapeHtml(v.name)} (${escapeHtml(v.id)})</option>`).join('')}
-            </select>
+        <div class="sidebar-section"><div class="section-title">Vendor Detection</div></div>
+        <div class="detected-vendor-card" id="detectedVendorCard">
+            <div class="detected-vendor-label">Vendor Status</div>
+            <div class="detected-vendor-name" id="detectedVendorName">Upload a document</div>
+            <div class="detected-vendor-detail" id="detectedVendorDetail">System will auto-detect vendor from page 1.</div>
         </div>
         <div class="divider"></div>
         <div class="sidebar-section"><div class="section-title">Document</div></div>
@@ -516,18 +517,6 @@ async function renderExtractPage(app) {
         </div>
         <input type="file" id="fileInput" accept="image/*,.pdf" style="display:none" onchange="handleFile(this.files[0])">
         <div id="fileBadge" style="display:none" class="file-badge"><span>✓</span><span id="fileNameLabel" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span></div>
-        <div class="divider"></div>
-        <div class="sidebar-section"><div class="section-title">Header Fields</div></div>
-        <div style="padding:0 12px 4px">
-            <div class="add-rule-row"><input class="add-rule-input" id="headerFieldInput" placeholder="e.g. supplier, po_number" onkeydown="if(event.key==='Enter')addHeaderField()"><button class="small-btn" onclick="addHeaderField()">+ Add</button></div>
-            <div id="headerFieldsList" class="rules-list" style="margin-top:4px"></div>
-        </div>
-        <div class="divider"></div>
-        <div class="sidebar-section"><div class="section-title">Line Item Columns</div></div>
-        <div style="padding:0 12px 4px">
-            <div class="add-rule-row"><input class="add-rule-input" id="lineItemFieldInput" placeholder="e.g. no, description, qty" onkeydown="if(event.key==='Enter')addLineItemField()"><button class="small-btn" onclick="addLineItemField()">+ Add</button></div>
-            <div id="lineItemFieldsList" class="rules-list" style="margin-top:4px"></div>
-        </div>
     </aside>
     <main class="viewer">
         <div id="extractionView" style="display:flex;flex-direction:column;width:100%;height:100%">
@@ -557,25 +546,6 @@ async function renderExtractPage(app) {
             <div class="entity-name" id="rpEntityName">—</div>
             <span class="rp-badge optimal" id="rpBadge">OPTIMAL</span>
         </div>
-        <div class="rp-section">
-            <div class="rp-title">Format Type</div>
-            <select class="format-select" id="formatType">
-                <option value="single_po_multipage">Single PO — multi-page (header on pg 1)</option>
-                <option value="po_per_page">Different PO per page</option>
-                <option value="single_page">Single page document</option>
-            </select>
-            <div style="font-size:9px;color:var(--text-dim);line-height:1.5" id="formatHint">Page 1 → header + line items. Pages 2–N → line items only.</div>
-        </div>
-        <div class="rp-section">
-            <div class="rp-title">Prompt Instructions</div>
-            <textarea class="prompt-area" id="promptInstructions" placeholder="e.g. Supplier address is always in the top-left block..."></textarea>
-        </div>
-        <div class="rp-section">
-            <div class="rp-title">Extraction Rules</div>
-            <div class="rules-list" id="rulesList"></div>
-            <div class="add-rule-row"><input class="add-rule-input" id="newRuleInput" placeholder="Add extraction rule..." onkeydown="if(event.key==='Enter')addRule()"><button class="small-btn" onclick="addRule()">+ Add</button></div>
-            <button class="save-tpl-btn" onclick="saveTemplate()">💾 Save template for this vendor</button>
-        </div>
         <div class="rp-section" id="conflictSection" style="display:none">
             <div class="rp-title" style="color:var(--red)">⚠ Needs Review</div>
             <div id="conflictMsg"></div><div id="conflictCandidates"></div>
@@ -594,8 +564,7 @@ async function renderExtractPage(app) {
         </div>
     </aside>
     <div class="bottom-bar">
-        <button class="extract-btn secondary" id="autoExtractBtn" onclick="autoExtract()" disabled>Auto Extract</button>
-        <button class="extract-btn" id="extractBtn" onclick="runExtract()" disabled>Extract Fields</button>
+        <button class="extract-btn" id="extractBtn" onclick="runExtract()" disabled>EXTRACT</button>
     </div>` + vendorModalHTML();
 
     await extLoadVendorConfig();
@@ -610,10 +579,21 @@ async function extSetVendor(id) {
     await extLoadVendorConfig();
 }
 
+function setDetectedVendorDisplay(name, detail = '') {
+    detectedVendorName = name || null;
+    const nameEl = document.getElementById('detectedVendorName');
+    const detailEl = document.getElementById('detectedVendorDetail');
+    const rpName = document.getElementById('rpEntityName');
+    if (nameEl) nameEl.textContent = name || 'Upload a document';
+    if (detailEl) detailEl.textContent = detail || (name ? 'Detected from the uploaded document.' : 'System will auto-detect vendor from page 1.');
+    if (rpName) rpName.textContent = name || '---';
+}
+
 async function extLoadVendorConfig() {
     const v = db.vendors.find(v => v.id === db.activeVendorId);
     const nameEl = document.getElementById('rpEntityName');
-    if (nameEl) nameEl.textContent = v ? v.name : '---';
+    if (nameEl) nameEl.textContent = v ? v.name : (detectedVendorName || '---');
+    if (v) setDetectedVendorDisplay(v.name, 'Configured from vendor/template shortcut.');
 
     if (v) {
         try {
@@ -661,18 +641,11 @@ function renderLineItemFields() {
 
 function renderBottomBar() {
     const btn = document.getElementById('extractBtn');
-    const autoBtn = document.getElementById('autoExtractBtn');
-    if (!btn || !autoBtn) return;
-    const total = headerFields.length + lineItemFields.length;
-    btn.textContent = total === 0 ? 'Extract Fields' : `Extract ${total} Field${total !== 1 ? 's' : ''}`;
-    btn.disabled = !loadedFile || total === 0;
+    if (!btn) return;
+    btn.textContent = 'EXTRACT';
+    btn.disabled = !loadedFile;
     btn.className = 'extract-btn';
     btn.onclick = runExtract;
-
-    autoBtn.textContent = 'Auto Extract';
-    autoBtn.disabled = !loadedFile;
-    autoBtn.className = 'extract-btn secondary';
-    autoBtn.onclick = autoExtract;
 }
 
 function addRule() {
@@ -688,7 +661,10 @@ function renderRules() {
 
 async function saveTemplate() {
     const v = db.vendors.find(v => v.id === db.activeVendorId);
-    if (!v) return;
+    if (!v) {
+        showToast('Run extraction first so the system can detect the vendor');
+        return;
+    }
     const payload = { format_type: document.getElementById('formatType').value, vendor_name: v.name, header_fields: headerFields, line_item_fields: lineItemFields, prompt_instructions: document.getElementById('promptInstructions').value || null, extraction_rules: extractionRules };
     try {
         const resp = await apiJSON(`/vendors/${v.id}/template`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
@@ -832,11 +808,12 @@ let _pipelineStartTime = null;
 let _pipelineTimerInterval = null;
 
 const PIPELINE_STAGES = [
-    { id: 'upload', label: 'Uploading', detail: 'Data stream verified' },
-    { id: 'normalize', label: 'Normalization', detail: 'Page render engine' },
-    { id: 'ocr', label: 'OCR Execution', detail: 'PaddleOCR v5' },
-    { id: 'llm', label: 'Qwen VL', detail: 'Vision extraction' },
-    { id: 'postprocess', label: 'Post-Processing', detail: 'Field mapping' },
+    { id: 'upload', label: 'Uploading', detail: 'Document stream received' },
+    { id: 'detect', label: 'Detecting Vendor', detail: 'Reading page 1' },
+    { id: 'ocr', label: 'OCR Bounding Box', detail: 'Digital PDF or scanned PDF routing' },
+    { id: 'llm', label: 'Vision Extraction', detail: 'Qwen VL extraction' },
+    { id: 'json', label: 'JSON Created', detail: 'Structured output assembled' },
+    { id: 'postprocess', label: 'Post Processing', detail: 'Field mapping and review memory' },
 ];
 
 function buildPipelineHTML() {
@@ -899,7 +876,8 @@ function showPipelinePanel() {
     });
 
     // Mark upload as done immediately (file is already uploaded)
-    setPipelineStage('upload', 'done', 'Data stream verified');
+    setPipelineStage('upload', 'done', 'Document stream received');
+    setPipelineStage('detect', 'active', 'Reading page 1 for vendor');
 
     // Start elapsed timer
     _pipelineStartTime = Date.now();
@@ -981,11 +959,18 @@ function updatePipelineFromSSE(jobState) {
     if (!stage) return;
 
     // Mark upload as done always
-    setPipelineStage('upload', 'done', 'Data stream verified');
+    setPipelineStage('upload', 'done', 'Document stream received');
 
     // Define stage order for sequential markings
-    const stageOrder = ['upload', 'normalize', 'ocr', 'llm', 'postprocess'];
-    const currentIdx = stageOrder.indexOf(stage);
+    const stageMap = { normalize: 'ocr', ocr: 'ocr', llm: 'llm', postprocess: 'postprocess' };
+    const uiStage = stageMap[stage] || stage;
+    const stageOrder = ['upload', 'detect', 'ocr', 'llm', 'json', 'postprocess'];
+    const currentIdx = stageOrder.indexOf(uiStage);
+
+    if (extraction.vendor_name) {
+        setDetectedVendorDisplay(extraction.vendor_name, 'Detected from page 1');
+        setPipelineStage('detect', 'done', `Detected: ${extraction.vendor_name}`);
+    }
 
     // Mark all stages before current as done
     for (let i = 1; i < currentIdx; i++) {
@@ -1014,15 +999,29 @@ function updatePipelineFromSSE(jobState) {
     }
 
     if (event === 'failed') {
-        setPipelineStage(stage, 'failed', message);
+        setPipelineStage(uiStage, 'failed', message);
         if (_pipelineTimerInterval) { clearInterval(_pipelineTimerInterval); _pipelineTimerInterval = null; }
         return;
     }
 
     // Set current stage as active
     _pipelineSeenStages.add(stage);
-    const detail = message || PIPELINE_STAGES.find(p => p.id === stage)?.detail || '';
-    setPipelineStage(stage, 'active', detail);
+    let detail = message || PIPELINE_STAGES.find(p => p.id === uiStage)?.detail || '';
+    if (stage === 'normalize') {
+        const digital = progress.digital_pages;
+        const scanned = progress.scanned_pages;
+        detail = Number.isFinite(digital) && Number.isFinite(scanned)
+            ? `Bounding boxes: ${digital} digital, ${scanned} scanned`
+            : 'Detecting digital PDF or scanned PDF boxes';
+    } else if (stage === 'ocr') {
+        detail = message || 'Reading scanned page bounding boxes';
+    } else if (stage === 'llm') {
+        detail = message || 'Vision extraction in progress';
+    } else if (stage === 'postprocess') {
+        setPipelineStage('json', 'done', 'JSON output created');
+        detail = message || 'Field mapping and review memory';
+    }
+    setPipelineStage(uiStage, 'active', detail);
 
     // For LLM stage, show page progress
     if (stage === 'llm' && progress.page && progress.total_pages) {
@@ -1040,8 +1039,6 @@ function showStopButton(buttonId = 'extractBtn') {
     btn.textContent = '⏹ STOP';
     btn.disabled = false;
     btn.onclick = cancelExtract;
-    const otherBtn = document.getElementById(buttonId === 'extractBtn' ? 'autoExtractBtn' : 'extractBtn');
-    if (otherBtn) otherBtn.disabled = true;
 }
 
 function resetExtractButtons() {
@@ -1197,50 +1194,55 @@ async function streamJob(jobId) {
 }
 
 async function runExtract() {
-    const total = headerFields.length + lineItemFields.length;
-    if (!loadedFile || total === 0) return;
-    lastExtractionMode = 'fields';
+    if (!loadedFile) return;
     const v = db.vendors.find(v => v.id === db.activeVendorId);
-    if (!v) { showToast('Select a vendor first'); return; }
-    const format = document.getElementById('formatType').value;
 
     setStatus('processing');
     document.getElementById('rpBadge').className = 'rp-badge processing';
     document.getElementById('rpBadge').textContent = 'PROCESSING';
-    document.getElementById('extractBtn').className = 'extract-btn processing';
-    document.getElementById('extractBtn').textContent = 'Saving template...';
-    document.getElementById('extractBtn').disabled = true;
-    const autoBtn = document.getElementById('autoExtractBtn');
-    if (autoBtn) autoBtn.disabled = true;
+    const btn = document.getElementById('extractBtn');
+    if (btn) {
+        btn.className = 'extract-btn processing';
+        btn.textContent = 'Extracting...';
+        btn.disabled = true;
+    }
     const cs = document.getElementById('conflictSection'); if (cs) cs.style.display = 'none';
     const rs = document.getElementById('resultSection'); if (rs) rs.style.display = 'none';
 
-    // Auto-save template
-    try {
-        const payload = { format_type: format, vendor_name: v.name, header_fields: headerFields, line_item_fields: lineItemFields, prompt_instructions: document.getElementById('promptInstructions').value || null, extraction_rules: extractionRules };
-        await apiJSON(`/vendors/${v.id}/template`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-    } catch (e) {
-        showToast('Template save failed: ' + e.message);
-        resetExtractButtons(); setStatus('optimal'); return;
-    }
-
+    setDetectedVendorDisplay(null, 'Detecting vendor from page 1...');
     showStopButton('extractBtn');
     showPipelinePanel();
     const formData = new FormData();
     formData.append('file', loadedFile);
-    formData.append('vendor_id', v.id);
-    formData.append('header_fields', JSON.stringify(headerFields));
-    formData.append('line_item_fields', JSON.stringify(lineItemFields));
-    formData.append('format_type', format);
+    if (v) formData.append('vendor_id', v.id);
 
     try {
         const payload = await apiJSON('/ingest/ui', { method: 'POST', body: formData });
+        if (payload.detected_vendor) {
+            setDetectedVendorDisplay(payload.detected_vendor.vendor_name, 'Client Detected from page 1');
+            setPipelineStage('detect', 'done', `Client Detected: ${payload.detected_vendor.vendor_name}`);
+            db.activeVendorId = payload.detected_vendor.vendor_id;
+        } else if (v) {
+            setDetectedVendorDisplay(v.name, 'Using pre-selected vendor');
+            setPipelineStage('detect', 'done', `Client: ${v.name}`);
+        }
         activeExtractionId = payload.extraction_id;
         await streamJob(payload.job_id);
     } catch (err) {
+        let errorMsg = 'Extraction failed: ' + err.message;
+        try {
+            const match = err.message.match(/HTTP 409:\s*(.+)/s);
+            if (match) {
+                const parsed = JSON.parse(match[1]);
+                const detail = parsed.detail || parsed;
+                if (detail.reason === 'unknown_vendor') {
+                    errorMsg = 'Unknown Vendor - No vendor matched. Create a vendor with the correct name and aliases first, then retry.';
+                }
+            }
+        } catch (_) {}
         const cs2 = document.getElementById('conflictSection'); if (cs2) cs2.style.display = 'block';
-        const cm = document.getElementById('conflictMsg'); if (cm) cm.textContent = 'Extraction failed: ' + err.message;
-        const cc = document.getElementById('conflictCandidates'); if (cc) cc.innerHTML = '<button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">Retry Extraction</button>';
+        const cm = document.getElementById('conflictMsg'); if (cm) cm.textContent = errorMsg;
+        const cc = document.getElementById('conflictCandidates'); if (cc) cc.innerHTML = '<button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">Retry Extraction</button> <button class="small-btn" onclick="navigate(\'#/vendors\')" style="margin-top:8px">Manage Vendors</button>';
         setStatus('optimal');
         document.getElementById('rpBadge').className = 'rp-badge review';
         document.getElementById('rpBadge').textContent = 'NEEDS REVIEW';
@@ -1249,50 +1251,7 @@ async function runExtract() {
     }
 }
 
-async function autoExtract() {
-    if (!loadedFile) return;
-    lastExtractionMode = 'auto';
-    const v = db.vendors.find(v => v.id === db.activeVendorId);
-    if (!v) { showToast('Select a vendor first'); return; }
-    const format = document.getElementById('formatType').value;
 
-    setStatus('processing');
-    document.getElementById('rpBadge').className = 'rp-badge processing';
-    document.getElementById('rpBadge').textContent = 'PROCESSING';
-    const autoBtn = document.getElementById('autoExtractBtn');
-    if (autoBtn) {
-        autoBtn.className = 'extract-btn secondary processing';
-        autoBtn.textContent = 'Preparing...';
-        autoBtn.disabled = true;
-    }
-    const extractBtn = document.getElementById('extractBtn');
-    if (extractBtn) extractBtn.disabled = true;
-    const cs = document.getElementById('conflictSection'); if (cs) cs.style.display = 'none';
-    const rs = document.getElementById('resultSection'); if (rs) rs.style.display = 'none';
-
-    showStopButton('autoExtractBtn');
-    showPipelinePanel();
-    const formData = new FormData();
-    formData.append('file', loadedFile);
-    formData.append('vendor_id', v.id);
-    formData.append('format_type', format);
-
-    try {
-        const payload = await apiJSON('/ingest/ui', { method: 'POST', body: formData });
-        activeExtractionId = payload.extraction_id;
-        await streamJob(payload.job_id);
-    } catch (err) {
-        const cs2 = document.getElementById('conflictSection'); if (cs2) cs2.style.display = 'block';
-        const cm = document.getElementById('conflictMsg');
-        if (cm) cm.textContent = 'Auto extract failed: ' + err.message;
-        const cc = document.getElementById('conflictCandidates'); if (cc) cc.innerHTML = '<button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">Retry Auto Extract</button>';
-        setStatus('optimal');
-        document.getElementById('rpBadge').className = 'rp-badge review';
-        document.getElementById('rpBadge').textContent = 'NEEDS REVIEW';
-    } finally {
-        resetExtractButtons();
-    }
-}
 
 async function resumeExtract(extractionId) {
     setStatus('processing');
@@ -1319,7 +1278,7 @@ async function resumeExtract(extractionId) {
 }
 
 function retryLastExtract() {
-    return lastExtractionMode === 'auto' ? autoExtract() : runExtract();
+    return runExtract();
 }
 
 function showResult(data) {
@@ -1633,6 +1592,9 @@ let _rvIsDragging = false;
 let _rvDragStartX = 0, _rvDragStartY = 0, _rvScrollStartX = 0, _rvScrollStartY = 0;
 let _rvResizeHandler = null;
 let _rvExtractionId = null;
+let _rvVendorId = null;
+let _rvExistingCorrectionFields = {};
+let _rvExistingSpatialFields = {};
 
 // Selection mode state
 let _rvSelectionField = null;  // composite key of field being corrected (e.g. "vendor" or "line_item_0_qty")
@@ -1659,6 +1621,7 @@ async function renderReviewPage(app, extractionId) {
         const data = await apiJSON(`/extractions/${extractionId}`);
         const effectiveResult = data.corrected_result || data.result || {};
         const origResult = data.result || {};
+        _rvVendorId = data.vendor_id || null;
         _rvIsPoPerPage = Array.isArray(effectiveResult);
         if (_rvIsPoPerPage) {
             _rvAllResults = _cloneJson(effectiveResult);
@@ -1681,6 +1644,7 @@ async function renderReviewPage(app, extractionId) {
     } catch (e) {
         // API failed — fall back to in-memory state if available
         console.warn('Failed to fetch extraction from API, using in-memory fallback:', e.message);
+        _rvVendorId = null;
         const fallbackResult = reviewResult || {};
         _rvIsPoPerPage = Array.isArray(fallbackResult);
         if (_rvIsPoPerPage) {
@@ -1704,6 +1668,8 @@ async function renderReviewPage(app, extractionId) {
     }
     _rvUndoStack = [];
     _rvPendingSelection = null;
+    _rvExistingCorrectionFields = {};
+    _rvExistingSpatialFields = {};
 
     // Load OCR data for click-to-select
     _rvOcrData = [];
@@ -1712,6 +1678,25 @@ async function renderReviewPage(app, extractionId) {
         _rvOcrData = ocrResp.ocr_pages || [];
     } catch (e) {
         console.warn('OCR data not available for click-to-select:', e.message);
+    }
+
+    if (_rvVendorId) {
+        try {
+            const corrections = await apiJSON(`/vendors/${encodeURIComponent(_rvVendorId)}/gold-corrections`);
+            _rvExistingCorrectionFields = corrections.fields || {};
+        } catch (e) {
+            console.warn('Saved correction metadata not available:', e.message);
+            _rvExistingCorrectionFields = {};
+        }
+    }
+
+    // Load spatial memory fields for override warning
+    try {
+        const smResp = await apiJSON(`/extractions/${extractionId}/spatial-memory-fields`);
+        _rvExistingSpatialFields = smResp.fields || {};
+    } catch (e) {
+        console.warn('Spatial memory fields not available:', e.message);
+        _rvExistingSpatialFields = {};
     }
 
     _rvTotalPages = _rvPages.length || 1;
@@ -2345,6 +2330,21 @@ function rvAcceptSelection() {
     if (!sel) return;
 
     const fieldKey = sel.fieldKey;
+    const existingCorrection = !fieldKey.startsWith('line_item_')
+        ? _rvExistingCorrectionFields[fieldKey]
+        : null;
+    const existingSpatial = !fieldKey.startsWith('line_item_')
+        ? _rvExistingSpatialFields[fieldKey]
+        : null;
+    if (existingCorrection || existingSpatial) {
+        const parts = [];
+        if (existingCorrection) parts.push('a saved gold correction');
+        if (existingSpatial) parts.push('a saved spatial memory region');
+        const ok = window.confirm(
+            `"${fieldKey}" already has ${parts.join(' and ')}. Override with this new correction?`
+        );
+        if (!ok) return;
+    }
 
     // Push undo entry BEFORE applying
     const oldValue = fieldKey.startsWith('line_item_')

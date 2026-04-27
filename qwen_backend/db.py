@@ -106,6 +106,9 @@ CREATE TABLE IF NOT EXISTS pages (
     height        INT,
     orig_width    INT,
     orig_height   INT,
+    source        TEXT,
+    char_count    INT,
+    word_geometry JSONB,
     UNIQUE (extraction_id, page_number)
 );
 
@@ -201,11 +204,60 @@ async def init(pool: asyncpg.Pool) -> None:
                     ALTER TABLE pages ADD COLUMN orig_width INT;
                     ALTER TABLE pages ADD COLUMN orig_height INT;
                 END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'pages' AND column_name = 'source'
+                ) THEN
+                    ALTER TABLE pages ADD COLUMN source TEXT;
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'pages' AND column_name = 'char_count'
+                ) THEN
+                    ALTER TABLE pages ADD COLUMN char_count INT;
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'pages' AND column_name = 'word_geometry'
+                ) THEN
+                    ALTER TABLE pages ADD COLUMN word_geometry JSONB;
+                END IF;
             END $$;
         """)
         await conn.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS pages_extraction_page_number_idx
             ON pages (extraction_id, page_number);
+        """)
+        # Vendor aliases (Phase 2) + spatial memory (Phase 3) — idempotent creation.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS vendor_aliases (
+                id           SERIAL PRIMARY KEY,
+                vendor_id    TEXT REFERENCES vendors(id) ON DELETE CASCADE,
+                pattern      TEXT NOT NULL,
+                weight       INT NOT NULL DEFAULT 1,
+                source       TEXT DEFAULT 'manual',
+                created_at   TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(vendor_id, pattern)
+            );
+            CREATE INDEX IF NOT EXISTS vendor_aliases_pattern_idx
+                ON vendor_aliases (pattern);
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS spatial_memory (
+                id                          SERIAL PRIMARY KEY,
+                vendor_id                   TEXT NOT NULL REFERENCES vendors(id) ON DELETE CASCADE,
+                layout_key                  TEXT NOT NULL,
+                field_key                   TEXT NOT NULL,
+                page_number                 INT  NOT NULL,
+                normalized_box              JSONB NOT NULL,
+                source_engine               TEXT NOT NULL,
+                created_from_extraction_id  INT REFERENCES extractions(id) ON DELETE SET NULL,
+                last_verified_at            TIMESTAMPTZ DEFAULT NOW(),
+                is_active                   BOOLEAN NOT NULL DEFAULT TRUE,
+                UNIQUE(vendor_id, layout_key, field_key, page_number)
+            );
+            CREATE INDEX IF NOT EXISTS spatial_memory_lookup_idx
+                ON spatial_memory (vendor_id, layout_key, is_active);
         """)
         # Migration: add field_locations and ocr_data to extractions if missing
         await conn.execute("""
@@ -344,6 +396,168 @@ async def delete_vendor(pool: asyncpg.Pool, vendor_id: str) -> bool:
             await conn.execute("DELETE FROM documents WHERE vendor_id = $1", vendor_id)
             result = await conn.execute("DELETE FROM vendors WHERE id = $1", vendor_id)
             return result == "DELETE 1"
+
+# -- Vendor alias queries --------------------------------------------------
+
+async def insert_vendor_alias(
+    pool: asyncpg.Pool,
+    vendor_id: str,
+    pattern: str,
+    weight: int = 1,
+    source: str = "manual",
+) -> dict | None:
+    """Insert a vendor alias pattern. Returns the row or None on conflict."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO vendor_aliases (vendor_id, pattern, weight, source)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (vendor_id, pattern) DO NOTHING
+            RETURNING id, vendor_id, pattern, weight, source, created_at
+            """,
+            vendor_id, pattern.lower().strip(), weight, source,
+        )
+        return dict(row) if row else None
+
+
+async def list_vendor_aliases(pool: asyncpg.Pool, vendor_id: str | None = None) -> list[dict]:
+    """List vendor aliases, optionally filtered by vendor_id."""
+    async with pool.acquire() as conn:
+        if vendor_id:
+            rows = await conn.fetch(
+                """
+                SELECT va.id, va.vendor_id, v.name AS vendor_name, va.pattern, va.weight, va.source, va.created_at
+                FROM vendor_aliases va
+                JOIN vendors v ON v.id = va.vendor_id
+                WHERE va.vendor_id = $1
+                ORDER BY va.weight DESC, va.created_at ASC
+                """,
+                vendor_id,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT va.id, va.vendor_id, v.name AS vendor_name, va.pattern, va.weight, va.source, va.created_at
+                FROM vendor_aliases va
+                JOIN vendors v ON v.id = va.vendor_id
+                ORDER BY va.vendor_id, va.weight DESC, va.created_at ASC
+                """
+            )
+        return [dict(r) for r in rows]
+
+
+async def delete_vendor_alias(pool: asyncpg.Pool, alias_id: int) -> bool:
+    """Delete a single vendor alias by id."""
+    async with pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM vendor_aliases WHERE id = $1", alias_id)
+        return result == "DELETE 1"
+
+
+async def get_all_aliases_for_detection(pool: asyncpg.Pool) -> list[dict]:
+    """Load all active vendor aliases with vendor name for detection scoring."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT va.vendor_id, v.name AS vendor_name, va.pattern, va.weight
+            FROM vendor_aliases va
+            JOIN vendors v ON v.id = va.vendor_id
+            WHERE va.vendor_id <> '_auto'
+            ORDER BY va.vendor_id, va.weight DESC
+            """
+        )
+        return [dict(r) for r in rows]
+
+
+# -- Spatial memory queries ------------------------------------------------
+
+async def upsert_spatial_memory(
+    pool: asyncpg.Pool,
+    vendor_id: str,
+    layout_key: str,
+    field_key: str,
+    page_number: int,
+    normalized_box: dict,
+    source_engine: str,
+    created_from_extraction_id: int | None = None,
+) -> dict:
+    """Insert or update a spatial memory entry. Last write wins on conflict."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO spatial_memory
+                (vendor_id, layout_key, field_key, page_number, normalized_box,
+                 source_engine, created_from_extraction_id, last_verified_at, is_active)
+            VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, NOW(), TRUE)
+            ON CONFLICT (vendor_id, layout_key, field_key, page_number) DO UPDATE SET
+                normalized_box = EXCLUDED.normalized_box,
+                source_engine = EXCLUDED.source_engine,
+                created_from_extraction_id = EXCLUDED.created_from_extraction_id,
+                last_verified_at = NOW(),
+                is_active = TRUE
+            RETURNING id, vendor_id, layout_key, field_key, page_number,
+                      normalized_box, source_engine, created_from_extraction_id,
+                      last_verified_at, is_active
+            """,
+            vendor_id, layout_key, field_key, page_number,
+            json.dumps(normalized_box), source_engine, created_from_extraction_id,
+        )
+        d = dict(row)
+        _parse_jsonb(d, "normalized_box")
+        return d
+
+
+async def get_spatial_memory_for_layout(
+    pool: asyncpg.Pool,
+    vendor_id: str,
+    layout_key: str,
+) -> list[dict]:
+    """Load all active spatial memory entries for a vendor+layout."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, vendor_id, layout_key, field_key, page_number,
+                   normalized_box, source_engine, created_from_extraction_id,
+                   last_verified_at, is_active
+            FROM spatial_memory
+            WHERE vendor_id = $1 AND layout_key = $2 AND is_active = TRUE
+            ORDER BY field_key, page_number
+            """,
+            vendor_id, layout_key,
+        )
+        results = []
+        for r in rows:
+            d = dict(r)
+            _parse_jsonb(d, "normalized_box")
+            results.append(d)
+        return results
+
+
+async def deactivate_spatial_memory(
+    pool: asyncpg.Pool,
+    vendor_id: str,
+    layout_key: str,
+    field_key: str | None = None,
+) -> int:
+    """Deactivate spatial memory entries. If field_key is None, deactivate all for layout."""
+    async with pool.acquire() as conn:
+        if field_key:
+            result = await conn.execute(
+                """
+                UPDATE spatial_memory SET is_active = FALSE
+                WHERE vendor_id = $1 AND layout_key = $2 AND field_key = $3
+                """,
+                vendor_id, layout_key, field_key,
+            )
+        else:
+            result = await conn.execute(
+                """
+                UPDATE spatial_memory SET is_active = FALSE
+                WHERE vendor_id = $1 AND layout_key = $2
+                """,
+                vendor_id, layout_key,
+            )
+        # Returns e.g. "UPDATE 3"
+        return int(result.split()[-1]) if result else 0
 
 
 # -- Template queries ------------------------------------------------------
@@ -641,15 +855,19 @@ async def save_pages(pool: asyncpg.Pool, extraction_id: int, pages: list[dict]) 
     async with pool.acquire() as conn:
         await conn.executemany(
             """
-            INSERT INTO pages (extraction_id, page_number, object_key, mime_type, width, height, orig_width, orig_height)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            INSERT INTO pages (extraction_id, page_number, object_key, mime_type, width, height, orig_width, orig_height,
+                               source, char_count, word_geometry)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
             ON CONFLICT (extraction_id, page_number) DO UPDATE SET
                 object_key = EXCLUDED.object_key,
                 mime_type = EXCLUDED.mime_type,
                 width = EXCLUDED.width,
                 height = EXCLUDED.height,
                 orig_width = EXCLUDED.orig_width,
-                orig_height = EXCLUDED.orig_height
+                orig_height = EXCLUDED.orig_height,
+                source = EXCLUDED.source,
+                char_count = EXCLUDED.char_count,
+                word_geometry = EXCLUDED.word_geometry
             """,
             [
                 (
@@ -661,6 +879,9 @@ async def save_pages(pool: asyncpg.Pool, extraction_id: int, pages: list[dict]) 
                     p.get("height", 0),
                     p.get("orig_width", p.get("width", 0)),
                     p.get("orig_height", p.get("height", 0)),
+                    p.get("source"),
+                    p.get("char_count"),
+                    json.dumps(p["word_geometry"]) if p.get("word_geometry") is not None else None,
                 )
                 for p in pages
             ],
@@ -672,14 +893,20 @@ async def get_pages(pool: asyncpg.Pool, extraction_id: int) -> list[dict]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT page_number, object_key, mime_type, width, height, orig_width, orig_height
+            SELECT page_number, object_key, mime_type, width, height, orig_width, orig_height,
+                   source, char_count, word_geometry
             FROM pages
             WHERE extraction_id = $1
             ORDER BY page_number ASC
             """,
             extraction_id,
         )
-        return [dict(r) for r in rows]
+        results = []
+        for r in rows:
+            d = dict(r)
+            _parse_jsonb(d, "word_geometry")
+            results.append(d)
+        return results
 
 
 async def get_page_object_keys(pool: asyncpg.Pool, extraction_id: int) -> list[str]:
@@ -803,28 +1030,13 @@ async def save_ocr_data(
 async def is_postprocess_ready(pool: asyncpg.Pool, extraction_id: int) -> bool:
     """Lightweight check for postprocess prerequisites.
 
-    v3 extractions can proceed with Qwen boxes alone. Legacy flows still require
-    OCR data.
+    Hybrid extraction needs current-document geometry before postprocess because
+    spatial memory reads text from the current OCR/pdfium word boxes.
     """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT (
-                result IS NOT NULL
-                AND (
-                    ocr_data IS NOT NULL
-                    OR EXISTS (
-                        SELECT 1
-                        FROM jsonb_array_elements(
-                            CASE
-                                WHEN jsonb_typeof(page_results) = 'array' THEN page_results
-                                ELSE '[]'::jsonb
-                            END
-                        ) AS pr
-                        WHERE pr ? 'boxes'
-                    )
-                )
-            ) AS ready
+            SELECT (result IS NOT NULL AND ocr_data IS NOT NULL) AS ready
             FROM extractions
             WHERE id = $1
             """,
@@ -1012,26 +1224,54 @@ async def save_gold_example(
 async def get_gold_examples(
     pool: asyncpg.Pool,
     vendor_id: str,
-    limit: int = 2,
+    limit: int | None = None,
 ) -> list[dict]:
-    """Retrieve the most recent gold examples for a vendor (for prompt injection)."""
+    """Retrieve latest correction per field for prompt injection.
+
+    gold_examples remains append-only for audit history, but the prompt should
+    not receive stale conflicting examples for the same field. This returns a
+    single consolidated correction_diff object where each field uses its latest
+    saved correction.
+    """
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT correction_diff
-            FROM gold_examples
-            WHERE vendor_id = $1 AND correction_diff IS NOT NULL
-            ORDER BY created_at DESC
-            LIMIT $2
+            SELECT DISTINCT ON (field.key)
+                   field.key AS field_key,
+                   field.value AS correction,
+                   ge.id,
+                   ge.extraction_id,
+                   ge.created_at
+            FROM gold_examples ge
+            CROSS JOIN LATERAL jsonb_each(ge.correction_diff) AS field(key, value)
+            WHERE ge.vendor_id = $1 AND ge.correction_diff IS NOT NULL
+            ORDER BY field.key, ge.created_at DESC, ge.id DESC
             """,
-            vendor_id, limit,
+            vendor_id,
         )
-        results = []
+
+        latest: dict[str, Any] = {}
         for r in rows:
             d = dict(r)
-            _parse_jsonb(d, "correction_diff")
-            results.append(d)
-        return results
+            _parse_jsonb(d, "correction")
+            latest[d["field_key"]] = d["correction"]
+
+        if limit is not None and limit > 0:
+            latest = dict(list(latest.items())[:limit])
+
+        return [{"correction_diff": latest}] if latest else []
+
+
+async def get_latest_gold_correction_fields(
+    pool: asyncpg.Pool,
+    vendor_id: str,
+) -> dict[str, Any]:
+    """Return latest saved gold correction by field for UI warnings."""
+    examples = await get_gold_examples(pool, vendor_id)
+    if not examples:
+        return {}
+    correction_diff = examples[0].get("correction_diff")
+    return correction_diff if isinstance(correction_diff, dict) else {}
 
 
 # -- Job queue -------------------------------------------------------------
@@ -1182,9 +1422,9 @@ async def fail_job(pool: asyncpg.Pool, job_id: int, error: str, retryable: bool 
         )
 
 
-async def cancel_jobs_for_extraction(pool: asyncpg.Pool, extraction_id: int) -> None:
+async def cancel_jobs_for_extraction(pool: asyncpg.Pool, extraction_id: int) -> dict:
     async with pool.acquire() as conn:
-        await conn.execute(
+        rows = await conn.fetch(
             """
             UPDATE jobs
             SET status = CASE
@@ -1201,9 +1441,17 @@ async def cancel_jobs_for_extraction(pool: asyncpg.Pool, extraction_id: int) -> 
                 updated_at = NOW()
             WHERE extraction_id = $1
               AND status IN ('queued', 'running')
+            RETURNING status
             """,
             extraction_id,
         )
+        cancelled = sum(1 for row in rows if row["status"] == "cancelled")
+        cancelling = sum(1 for row in rows if row["status"] == "cancelling")
+        return {
+            "cancelled": cancelled,
+            "cancelling": cancelling,
+            "updated": len(rows),
+        }
 
 
 async def get_job(pool: asyncpg.Pool, job_id: int) -> dict | None:

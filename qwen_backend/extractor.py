@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import re
+import time
 from typing import Any, Awaitable, Callable
 
 import httpx
@@ -20,6 +21,7 @@ import httpx
 try:
     from . import cache as cache_mod
     from . import db as db_mod
+    from . import logging_config as plog
     from .logging_config import get_logger
     from .phoenix_tracing import (
         trace_llm_call,
@@ -30,6 +32,7 @@ try:
 except ImportError:
     import cache as cache_mod
     import db as db_mod
+    import logging_config as plog
     from logging_config import get_logger
     from phoenix_tracing import (
         trace_llm_call,
@@ -279,8 +282,8 @@ async def get_or_build_system_prompt(
     Includes gold examples from past human corrections in the prompt.
     """
 
-    # Fetch gold examples for this vendor (max 2)
-    gold_examples = await db_mod.get_gold_examples(pool, vendor_id, limit=2)
+    # Fetch one consolidated latest correction per field for this vendor.
+    gold_examples = await db_mod.get_gold_examples(pool, vendor_id)
 
     prompt_hash = compute_prompt_hash(
         header_fields, line_item_fields, instructions, rules, format_type,
@@ -327,6 +330,7 @@ async def call_llm(
     image_b64: str, system_prompt: str, user_message: str,
     llm_url: str, model: str, mime_type: str = "image/jpeg",
     page_num: int = 0, total_pages: int = 0,
+    pipeline_context: dict | None = None,
 ) -> dict:
     """POST to LLM, strip markdown fences, return parsed JSON dict."""
 
@@ -353,6 +357,7 @@ async def call_llm(
         "max_tokens": 6000,
     }
 
+    start = time.perf_counter()
     with trace_llm_call(model, messages, temperature=0.7, page_num=page_num, total_pages=total_pages) as trace_ctx:
         async with httpx.AsyncClient(timeout=180.0) as client:
             resp = await client.post(llm_url, json=payload)
@@ -364,6 +369,18 @@ async def call_llm(
         resp_json = resp.json()
         trace_ctx["response"] = resp_json["choices"][0]["message"]["content"]
         trace_ctx["usage"] = resp_json.get("usage", {})
+        if pipeline_context is not None:
+            plog.event(
+                "qwen_http_completed",
+                stage="llm",
+                duration_ms=(time.perf_counter() - start) * 1000,
+                page=page_num,
+                total_pages=total_pages,
+                model=model,
+                usage=resp_json.get("usage", {}),
+                response_chars=len(trace_ctx["response"]),
+                **pipeline_context,
+            )
 
     raw: str = resp_json["choices"][0]["message"]["content"].strip()
     raw = _JSON_FENCE_RE.sub("", raw)
@@ -374,9 +391,31 @@ async def call_llm(
     raw = re.sub(r'([\[:,]\s*)(-?0[0-9]+)(\s*[\]},])', r'\1"\2"\3', raw)
 
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        if pipeline_context is not None:
+            fields = parsed.get("fields", parsed) if isinstance(parsed, dict) else {}
+            plog.event(
+                "qwen_json_parsed",
+                stage="llm",
+                page=page_num,
+                total_pages=total_pages,
+                field_count=len([k for k in fields.keys() if k != "line_items"]) if isinstance(fields, dict) else 0,
+                line_item_count=len(fields.get("line_items") or []) if isinstance(fields, dict) else 0,
+                **pipeline_context,
+            )
+        return parsed
     except json.JSONDecodeError as exc:
         logger.error("LLM JSON parse failed. Raw response:\n%s", raw[:500])
+        if pipeline_context is not None:
+            plog.event(
+                "qwen_json_parse_failed",
+                stage="llm",
+                status="error",
+                page=page_num,
+                total_pages=total_pages,
+                raw_preview=raw[:500],
+                **pipeline_context,
+            )
         raise ValueError(f"LLM returned invalid JSON: {raw[:200]}") from exc
 
 
@@ -394,6 +433,7 @@ async def extract_document(
     cancel_event: asyncio.Event | None = None,
     start_from_page: int = 1,
     existing_page_results: list[dict] | None = None,
+    pipeline_context: dict | None = None,
 ) -> dict:
     """
     Process pages in parallel batches of 2 (matches --parallel 2 on llama-server).
@@ -451,6 +491,7 @@ async def extract_document(
                     page["image_b64"], system_prompt, user_msg, llm_url, model,
                     mime_type=page.get("mime_type", "image/jpeg"),
                     page_num=page_num, total_pages=total,
+                    pipeline_context=pipeline_context,
                 )
                 result["_page"] = page_num
                 result["_total_pages"] = total

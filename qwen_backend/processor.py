@@ -72,23 +72,29 @@ def _resize_to_vlm_budget(img: Image.Image) -> Image.Image:
 
 # ── PDF rendering ─────────────────────────────────────────────────────────────
 
-def _render_pdf_sync(file_bytes: bytes, dpi: int = DPI_DEFAULT) -> list[dict]:
+def _render_pdf_sync(file_bytes: bytes, dpi: int = DPI_DEFAULT, max_pages: int | None = None) -> list[dict]:
     """
     Render every page of a PDF to JPEG base64 using Google's PDFium engine.
 
     Auto-DPI: calculates per-page DPI so the long side hits MAX_LONG_SIDE px.
     Falls back to DPI_FLOOR so tiny pages (receipts, labels) remain readable.
+
+    Args:
+        file_bytes: Raw PDF bytes.
+        dpi: Target DPI (subject to per-page adaptive scaling).
+        max_pages: If set, render at most this many pages (from page 1).
     """
     results: list[dict] = []
 
     pdf = pdfium.PdfDocument(file_bytes)
     total_pages = len(pdf)
+    render_count = min(total_pages, max_pages) if max_pages else total_pages
 
-    logger.info("PDFium render — %d page(s), target=%dpx, dpi_floor=%d",
-                total_pages, MAX_LONG_SIDE, DPI_FLOOR)
+    logger.info("PDFium render — %d page(s) (rendering %d), target=%dpx, dpi_floor=%d",
+                total_pages, render_count, MAX_LONG_SIDE, DPI_FLOOR)
 
     try:
-        for i in range(total_pages):
+        for i in range(render_count):
             page = pdf[i]
             page_num = i + 1
 
@@ -191,14 +197,22 @@ def _resize_image_sync(file_bytes: bytes) -> list[dict]:
 async def pdf_to_images(
     file_bytes: bytes,
     dpi: int = DPI_DEFAULT,
+    max_pages: int | None = None,
 ) -> list[dict]:
     """
     Async wrapper — offloads PDFium rendering to ThreadPoolExecutor.
     Auto-DPI caps each page at MAX_LONG_SIDE for optimal Qwen3-VL tile count.
     Returns list of dicts: {page_number, image_b64, mime_type, width, height}
+
+    Args:
+        file_bytes: Raw PDF bytes.
+        dpi: Target DPI.
+        max_pages: If set, render at most this many pages.
     """
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_executor, _render_pdf_sync, file_bytes, dpi)
+    return await loop.run_in_executor(
+        _executor, _render_pdf_sync, file_bytes, dpi, max_pages
+    )
 
 
 async def image_file_to_b64(

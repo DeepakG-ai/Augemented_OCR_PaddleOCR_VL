@@ -166,3 +166,4 @@ class ExtractionJobStartOut(BaseModel):
     job_id: int
     extraction_id: int
     status: str
+    detected_vendor: Any | None = None
