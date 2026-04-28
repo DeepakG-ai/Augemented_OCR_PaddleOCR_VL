@@ -823,7 +823,8 @@ async def resume_extraction(request: Request, extraction_id: int):
 
     req_header = extraction.get("header_fields") or (tmpl["header_fields"] if tmpl else [])
     req_items = extraction.get("line_item_fields") or (tmpl["line_item_fields"] if tmpl else [])
-    req_format = extraction.get("format_type") or (tmpl["format_type"] if tmpl else "single_po_multipage")
+    # Prefer current template format over stale extraction record — template is the source of truth
+    req_format = (tmpl["format_type"] if tmpl else None) or extraction.get("format_type") or "single_po_multipage"
 
     # Get system prompt from template, or build fresh from extraction's saved fields
     if tmpl and tmpl.get("system_prompt"):
@@ -1009,7 +1010,7 @@ async def ingest_document(
     source_type: str,
     file: UploadFile = File(...),
     vendor_id: str | None = Form(None),
-    format_type: str = Form("single_po_multipage"),
+    format_type: str = Form(None),          # None → always defer to template
     header_fields: str = Form(None),
     line_item_fields: str = Form(None),
     source_ref: str = Form(None),

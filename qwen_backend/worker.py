@@ -376,7 +376,8 @@ async def _process_llm(pool, job: dict) -> None:
         log_ctx["has_system_prompt"] = bool((tmpl or {}).get("system_prompt"))
     req_header = extraction_row.get("header_fields") or ((tmpl.get("header_fields") or []) if tmpl else [])
     req_items = extraction_row.get("line_item_fields") or ((tmpl.get("line_item_fields") or []) if tmpl else [])
-    req_format = extraction_row.get("format_type") or ((tmpl.get("format_type") or "single_po_multipage") if tmpl else "single_po_multipage")
+    # Template is source of truth; stale extraction record is fallback only
+    req_format = (tmpl.get("format_type") if tmpl else None) or extraction_row.get("format_type") or "single_po_multipage"
     plog.event(
         "llm_request_configured",
         stage="llm",

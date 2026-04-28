@@ -1622,6 +1622,7 @@ function _rvSetCurrentPage(nextPage) {
     rvRenderFields();
     _rvUpdateStats();
     rvRenderCurrentPage();
+    rvUpdateJSON();
 }
 
 // ── Core review state ────────────────────────────────────────────────
@@ -1670,9 +1671,24 @@ async function renderReviewPage(app, extractionId) {
     // Always fetch fresh data from API to avoid stale in-memory snapshots.
     try {
         const data = await apiJSON(`/extractions/${extractionId}`);
-        const effectiveResult = data.corrected_result || data.result || {};
-        const origResult = data.result || {};
+        let effectiveResult = data.corrected_result || data.result || {};
+        let origResult = data.result || {};
         _rvVendorId = data.vendor_id || null;
+
+        // Detect po_per_page even for old extractions where format_type was saved wrong:
+        // if result is not already a list but page_results shows unique po_number per page,
+        // rebuild as a per-page list so page navigation shows correct per-page POs.
+        if (!Array.isArray(effectiveResult) && Array.isArray(data.page_results) && data.page_results.length > 1) {
+            const validPR = data.page_results.filter(pr => !pr._error && pr.fields);
+            if (validPR.length > 1) {
+                const poNums = validPR.map(pr => pr.fields.po_number).filter(Boolean);
+                if (new Set(poNums).size > 1) {
+                    effectiveResult = validPR.map(pr => pr.fields);
+                    origResult = validPR.map(pr => pr.fields);
+                }
+            }
+        }
+
         _rvIsPoPerPage = Array.isArray(effectiveResult);
         if (_rvIsPoPerPage) {
             _rvAllResults = _cloneJson(effectiveResult);

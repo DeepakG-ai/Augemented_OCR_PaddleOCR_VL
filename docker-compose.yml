@@ -12,7 +12,7 @@ services:
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "augocr", "-d", "augocr"]
+      test: [ "CMD", "pg_isready", "-U", "augocr", "-d", "augocr" ]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -23,7 +23,7 @@ services:
     ports:
       - "6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -41,7 +41,7 @@ services:
       - "9000:9000"
       - "9001:9001"
     healthcheck:
-      test: ["CMD", "sh", "-c", "test -d /data"]
+      test: [ "CMD", "sh", "-c", "test -d /data" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -50,7 +50,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["python", "-m", "uvicorn", "qwen_backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: [ "python", "-m", "uvicorn", "qwen_backend.main:app", "--host", "0.0.0.0", "--port", "8000" ]
     environment:
       DATABASE_URL: postgresql://augocr:augocr@postgres:5432/augocr
       REDIS_URL: redis://redis:6379/0
@@ -77,7 +77,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["python", "-m", "qwen_backend.worker", "--stage", "normalize", "--name", "normalize-worker"]
+    command: [ "python", "-m", "qwen_backend.worker", "--stage", "normalize", "--name", "normalize-worker" ]
+    restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://augocr:augocr@postgres:5432/augocr
       REDIS_URL: redis://redis:6379/0
@@ -97,7 +98,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["python", "-m", "qwen_backend.worker", "--stage", "ocr", "--name", "ocr-worker"]
+    command: [ "python", "-m", "qwen_backend.worker", "--stage", "ocr", "--name", "ocr-worker" ]
+    restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://augocr:augocr@postgres:5432/augocr
       REDIS_URL: redis://redis:6379/0
@@ -117,7 +119,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["python", "-m", "qwen_backend.worker", "--stage", "llm", "--name", "llm-worker"]
+    command: [ "python", "-m", "qwen_backend.worker", "--stage", "llm", "--name", "llm-worker" ]
+    restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://augocr:augocr@postgres:5432/augocr
       REDIS_URL: redis://redis:6379/0
@@ -140,7 +143,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["python", "-m", "qwen_backend.worker", "--stage", "postprocess", "--name", "postprocess-worker"]
+    command: [ "python", "-m", "qwen_backend.worker", "--stage", "postprocess", "--name", "postprocess-worker" ]
+    restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://augocr:augocr@postgres:5432/augocr
       REDIS_URL: redis://redis:6379/0
@@ -163,7 +167,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["python", "-m", "qwen_backend.worker", "--stage", "outbound", "--name", "outbound-worker"]
+    command: [ "python", "-m", "qwen_backend.worker", "--stage", "outbound", "--name", "outbound-worker" ]
+    restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://augocr:augocr@postgres:5432/augocr
       REDIS_URL: redis://redis:6379/0
@@ -182,8 +187,8 @@ services:
   phoenix:
     image: arizephoenix/phoenix:latest
     ports:
-      - "6006:6006"    # Phoenix UI + OTLP HTTP collector
-      - "4317:4317"    # OTLP gRPC collector
+      - "6006:6006" # Phoenix UI + OTLP HTTP collector
+      - "4317:4317" # OTLP gRPC collector
     environment:
       - PHOENIX_WORKING_DIR=/phoenix
     volumes:

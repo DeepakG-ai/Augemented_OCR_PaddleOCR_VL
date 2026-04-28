@@ -67,12 +67,12 @@ class ExtractorAdversarialTests(unittest.IsolatedAsyncioTestCase):
                 model="qwen3vl",
             )
 
-        self.assertEqual(calls, [1, 2])
+        self.assertEqual(calls, [1])
         self.assertTrue(output["cancelled"])
         self.assertEqual(output["last_completed_page"], 0)
-        self.assertEqual([pr["_page"] for pr in output["page_results"]], [1, 2])
+        self.assertEqual([pr["_page"] for pr in output["page_results"]], [1])
         self.assertIn("_error", output["page_results"][0])
-        self.assertEqual(output["result"]["line_items"], [{"item": 2}])
+        self.assertEqual(output["result"], {})
 
     async def test_extract_document_handles_zero_page_input(self) -> None:
         output = await extractor.extract_document(
@@ -89,20 +89,27 @@ class ExtractorAdversarialTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ocr_job_saves_empty_ocr_output(self) -> None:
         pool = object()
-        job = {"id": 12, "extraction_id": 22, "document_id": 32}
+        job = {"id": 12, "extraction_id": 22, "document_id": 32, "payload": {"scanned_page_numbers": [1]}}
         extraction_row = {"id": 22}
         empty_ocr = [{"page_number": 1, "words": []}]
+        page_rows = [{"page_number": 1, "source": "paddleocr", "char_count": 0, "word_geometry": []}]
 
         with patch.object(worker.db_mod, "get_extraction", new=AsyncMock(return_value=extraction_row)), \
+             patch.object(worker.db_mod, "get_pages", new=AsyncMock(return_value=page_rows)), \
              patch.object(worker.db_mod, "update_extraction_progress", new=AsyncMock()), \
              patch.object(worker, "_load_pages", new=AsyncMock(return_value=[{"page_number": 1, "image_b64": "abc"}])), \
              patch.object(worker.ocr_runner, "run_ocr_on_pages", new=AsyncMock(return_value=empty_ocr)), \
              patch.object(worker.db_mod, "save_ocr_data", new=AsyncMock()) as mock_save_ocr, \
              patch.object(worker.db_mod, "update_job_progress", new=AsyncMock()), \
+             patch.object(worker.db_mod, "is_cancel_requested", new=AsyncMock(return_value=False)), \
              patch.object(worker, "_maybe_enqueue_postprocess", new=AsyncMock()) as mock_enqueue:
             await worker._process_ocr(pool, job)
 
-        mock_save_ocr.assert_awaited_once_with(pool, 22, empty_ocr)
+        mock_save_ocr.assert_awaited_once_with(
+            pool,
+            22,
+            [{"page_number": 1, "source": "paddleocr", "char_count": 0, "word_count": 0, "words": []}],
+        )
         mock_enqueue.assert_awaited_once_with(pool, 22, 32)
 
 
@@ -152,6 +159,7 @@ class ResumeApiAdversarialTests(unittest.TestCase):
         queued_job = {"id": 900, "status": "queued"}
 
         with patch.object(main.db_mod, "get_extraction", new=AsyncMock(return_value=extraction)), \
+             patch.object(main.db_mod, "list_jobs_for_extraction", new=AsyncMock(return_value=[])), \
              patch.object(main.db_mod, "get_pages", new=AsyncMock(return_value=pages)), \
              patch.object(main.db_mod, "set_cancel_requested", new=AsyncMock()), \
              patch.object(main.db_mod, "enqueue_job", new=AsyncMock(return_value=queued_job)) as mock_enqueue, \
@@ -159,7 +167,10 @@ class ResumeApiAdversarialTests(unittest.TestCase):
             response = self.client.post("/jobs/extractions/123/resume")
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"job_id": 900, "extraction_id": 123, "status": "queued"})
+        self.assertEqual(
+            response.json(),
+            {"job_id": 900, "extraction_id": 123, "status": "queued", "detected_vendor": None},
+        )
         self.assertEqual(mock_enqueue.await_args.kwargs["payload"]["start_from_page"], 2)
         self.assertEqual(mock_enqueue.await_args.kwargs["payload"]["existing_page_results"], extraction["page_results"])
 
