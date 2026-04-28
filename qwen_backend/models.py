@@ -27,6 +27,20 @@ class VendorOut(BaseModel):
     created_at: datetime
 
 
+class VendorAliasCreate(BaseModel):
+    pattern: str = Field(..., min_length=1, max_length=256)
+    weight: int = Field(1, ge=1, le=10)
+
+
+class VendorAliasOut(BaseModel):
+    id: int
+    vendor_id: str
+    pattern: str
+    weight: int
+    source: str
+    created_at: datetime
+
+
 # -- Template -------------------------------------------------------------
 
 class TemplateCreate(BaseModel):

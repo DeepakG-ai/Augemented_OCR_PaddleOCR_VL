@@ -48,11 +48,19 @@ try:
         TemplateCreate,
         TemplateListOut,
         TemplateOut,
+        VendorAliasCreate,
+        VendorAliasOut,
         VendorCreate,
         VendorOut,
     )
     from .object_store import ARTIFACTS_BUCKET, DOCUMENTS_BUCKET, EXPORTS_BUCKET, get_store
-    from .phoenix_tracing import setup_phoenix
+    from .phoenix_tracing import (
+        setup_phoenix,
+        get_current_context,
+        attach_context,
+        detach_context,
+        trace_extraction_pipeline,
+    )
 except ImportError:
     import cache as cache_mod
     import db as db_mod
@@ -71,11 +79,19 @@ except ImportError:
         TemplateCreate,
         TemplateListOut,
         TemplateOut,
+        VendorAliasCreate,
+        VendorAliasOut,
         VendorCreate,
         VendorOut,
     )
     from object_store import ARTIFACTS_BUCKET, DOCUMENTS_BUCKET, EXPORTS_BUCKET, get_store
-    from phoenix_tracing import setup_phoenix
+    from phoenix_tracing import (
+        setup_phoenix,
+        get_current_context,
+        attach_context,
+        detach_context,
+        trace_extraction_pipeline,
+    )
 
 load_dotenv()
 
@@ -292,12 +308,42 @@ async def create_vendor(request: Request, body: VendorCreate):
     return VendorOut(**row)
 
 
+# -- Vendor Aliases ---------------------------------------------------------
+# Registered BEFORE DELETE /vendors/{vendor_id} so that
+# DELETE /vendors/aliases/{alias_id} is not swallowed by the broader route.
+
+@app.get("/vendors/{vendor_id}/aliases", response_model=list[VendorAliasOut])
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def list_aliases(request: Request, vendor_id: str):
+    pool = request.app.state.pool
+    return await db_mod.list_vendor_aliases(pool, vendor_id)
+
+
+@app.post("/vendors/{vendor_id}/aliases", response_model=VendorAliasOut, status_code=201)
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def add_alias(request: Request, vendor_id: str, body: VendorAliasCreate):
+    pool = request.app.state.pool
+    row = await db_mod.insert_vendor_alias(pool, vendor_id, body.pattern, body.weight, source="manual")
+    if row is None:
+        raise HTTPException(409, detail="Alias pattern already exists for this vendor")
+    return row
+
+
+@app.delete("/vendors/aliases/{alias_id}")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def delete_alias(request: Request, alias_id: int):
+    pool = request.app.state.pool
+    deleted = await db_mod.delete_vendor_alias(pool, alias_id)
+    if not deleted:
+        raise HTTPException(404, detail="Alias not found")
+    return {"status": "deleted", "alias_id": alias_id}
+
+
 @app.delete("/vendors/{vendor_id}")
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def delete_vendor(request: Request, vendor_id: str):
     pool = request.app.state.pool
     redis_client = request.app.state.redis
-    # Invalidate cache
     await cache_mod.invalidate_vendor_cache(redis_client, vendor_id)
     deleted = await db_mod.delete_vendor(pool, vendor_id)
     if not deleted:
@@ -796,7 +842,8 @@ async def resume_extraction(request: Request, extraction_id: int):
 
     existing_page_results = extraction.get("page_results") or []
     # Find pages that succeeded (no _error)
-    completed_page_nums = {pr["_page"] for pr in existing_page_results if "_error" not in pr}
+    completed_page_nums = {pr.get("_page") for pr in existing_page_results
+                           if "_error" not in pr and pr.get("_page") is not None}
     # Find the first page that still needs work (failed or never attempted)
     all_page_nums = {p["page_number"] for p in pages}
     missing_pages = sorted(all_page_nums - completed_page_nums)
@@ -1284,7 +1331,8 @@ async def queue_resume_extraction(request: Request, extraction_id: int):
         raise HTTPException(400, detail="No rendered pages available for this extraction")
 
     existing_page_results = extraction.get("page_results") or []
-    completed_page_nums = {pr["_page"] for pr in existing_page_results if "_error" not in pr}
+    completed_page_nums = {pr.get("_page") for pr in existing_page_results
+                           if "_error" not in pr and pr.get("_page") is not None}
     all_page_nums = {p["page_number"] for p in pages}
     missing_pages = sorted(all_page_nums - completed_page_nums)
     start_from = missing_pages[0] if missing_pages else len(pages) + 1
@@ -1301,6 +1349,8 @@ async def queue_resume_extraction(request: Request, extraction_id: int):
             "existing_page_results": existing_page_results,
         },
     )
+    if job is None:
+        raise HTTPException(409, detail="A resume job is already queued or running for this extraction")
     await db_mod.set_extraction_status(
         pool,
         extraction_id,
@@ -1311,6 +1361,12 @@ async def queue_resume_extraction(request: Request, extraction_id: int):
 
 
 # -- Extraction queries -----------------------------------------------------
+
+@app.get("/extractions/count")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def count_all_extractions(request: Request):
+    return {"count": await db_mod.count_all_extractions(request.app.state.pool)}
+
 
 @app.get("/extractions/{extraction_id}", response_model=ExtractionOut)
 @limiter.limit(f"{RATE_LIMIT}/minute")

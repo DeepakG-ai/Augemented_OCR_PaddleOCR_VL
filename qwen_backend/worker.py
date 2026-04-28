@@ -374,9 +374,9 @@ async def _process_llm(pool, job: dict) -> None:
         tmpl = await db_mod.get_template(pool, extraction_row["vendor_id"])
         log_ctx["template_id"] = (tmpl or {}).get("id")
         log_ctx["has_system_prompt"] = bool((tmpl or {}).get("system_prompt"))
-    req_header = extraction_row.get("header_fields") or (tmpl["header_fields"] if tmpl else [])
-    req_items = extraction_row.get("line_item_fields") or (tmpl["line_item_fields"] if tmpl else [])
-    req_format = extraction_row.get("format_type") or (tmpl["format_type"] if tmpl else "single_po_multipage")
+    req_header = extraction_row.get("header_fields") or ((tmpl.get("header_fields") or []) if tmpl else [])
+    req_items = extraction_row.get("line_item_fields") or ((tmpl.get("line_item_fields") or []) if tmpl else [])
+    req_format = extraction_row.get("format_type") or ((tmpl.get("format_type") or "single_po_multipage") if tmpl else "single_po_multipage")
     plog.event(
         "llm_request_configured",
         stage="llm",
@@ -426,7 +426,7 @@ async def _process_llm(pool, job: dict) -> None:
                 None,
                 None,
                 "processing",
-                0,
+                None,
                 page_results_partial=[page_result],
                 progress=progress,
             )
@@ -508,20 +508,21 @@ async def _process_postprocess(pool, job: dict) -> None:
     page_results = extraction_row.get("page_results")
 
     # ── Debug dump: save OCR + Qwen outputs for offline analysis ──
-    _project_root = os.path.dirname(os.path.dirname(__file__))
-    _debug_dir = os.path.join(_project_root, "bbox", "pdle_output")
-    _qwen_dir = os.path.join(_project_root, "bbox", "qwn_output")
-    os.makedirs(_debug_dir, exist_ok=True)
-    os.makedirs(_qwen_dir, exist_ok=True)
-    try:
-        if ocr_data:
-            with open(os.path.join(_debug_dir, f"ocr_{extraction_id}.json"), "w", encoding="utf-8") as _f:
-                _json.dump(ocr_data, _f, indent=2, ensure_ascii=False)
-        with open(os.path.join(_qwen_dir, f"qwen_{extraction_id}.json"), "w", encoding="utf-8") as _f:
-            _json.dump({"result": result, "page_results": page_results}, _f, indent=2, ensure_ascii=False)
-        logger.debug("Debug dump saved: ocr_%s.json / qwen_%s.json", extraction_id, extraction_id)
-    except Exception as _e:
-        logger.warning("Failed to save debug dump for extraction %s: %s", extraction_id, _e)
+    if os.getenv("DEBUG_DUMP_BBOX"):
+        _project_root = os.path.dirname(os.path.dirname(__file__))
+        _debug_dir = os.path.join(_project_root, "bbox", "pdle_output")
+        _qwen_dir = os.path.join(_project_root, "bbox", "qwn_output")
+        os.makedirs(_debug_dir, exist_ok=True)
+        os.makedirs(_qwen_dir, exist_ok=True)
+        try:
+            if ocr_data:
+                with open(os.path.join(_debug_dir, f"ocr_{extraction_id}.json"), "w", encoding="utf-8") as _f:
+                    _json.dump(ocr_data, _f, indent=2, ensure_ascii=False)
+            with open(os.path.join(_qwen_dir, f"qwen_{extraction_id}.json"), "w", encoding="utf-8") as _f:
+                _json.dump({"result": result, "page_results": page_results}, _f, indent=2, ensure_ascii=False)
+            logger.debug("Debug dump saved: ocr_%s.json / qwen_%s.json", extraction_id, extraction_id)
+        except Exception as _e:
+            logger.warning("Failed to save debug dump for extraction %s: %s", extraction_id, _e)
 
     # ── Build field_locations ──
     is_v3 = False
@@ -590,7 +591,7 @@ async def _process_postprocess(pool, job: dict) -> None:
         if sm_applied:
             # Persist the updated result with spatial memory overrides
             await db_mod.update_extraction_result(
-                pool, extraction_id, result, page_results, "processing", 0,
+                pool, extraction_id, result, page_results, "processing", None,
             )
             logger.info(
                 "Spatial memory: %d field(s) applied for extraction %d",
@@ -713,8 +714,22 @@ async def run_worker(stage: str, worker_name: str) -> None:
     pool = await db_mod.create_pool()
     await db_mod.init(pool)
     logger.info("Worker started stage=%s name=%s", stage, worker_name)
+    # Recover orphaned running jobs left by a previous crashed worker
+    recovered = await db_mod.recover_stale_jobs(pool, stage, stale_minutes=5)
+    if recovered:
+        logger.info("Startup recovery: reset %d stale '%s' job(s) to queued", recovered, stage)
+    last_recovery = time.monotonic()
+    RECOVERY_INTERVAL = 60.0  # seconds between periodic stale-job sweeps
     try:
         while True:
+            # Periodic stale-job recovery (handles jobs that get stuck mid-flight)
+            now = time.monotonic()
+            if now - last_recovery >= RECOVERY_INTERVAL:
+                recovered = await db_mod.recover_stale_jobs(pool, stage, stale_minutes=10)
+                if recovered:
+                    logger.info("Periodic recovery: reset %d stale '%s' job(s) to queued", recovered, stage)
+                last_recovery = now
+
             job = await db_mod.claim_job(pool, stage, worker_name)
             if not job:
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)

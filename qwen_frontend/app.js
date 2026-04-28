@@ -354,6 +354,9 @@ async function renderTemplatePage(app, vendorId) {
                 <div style="margin-top:12px" class="tpl-panel-title">Line Item Columns</div>
                 <div class="add-rule-row"><input class="add-rule-input" id="tplLineInput" placeholder="e.g. no, description, qty" onkeydown="if(event.key==='Enter')tplAddLine()"><button class="small-btn" onclick="tplAddLine()">+ Add</button></div>
                 <div id="tplLineList" class="rules-list" style="margin-top:4px"></div>
+                <div style="margin-top:16px" class="tpl-panel-title">Vendor Aliases <span style="font-size:9px;color:var(--text-dim);font-weight:normal;margin-left:4px">— words that identify this vendor in page 1</span></div>
+                <div id="tplAliasList" class="rules-list" style="margin-top:4px"></div>
+                <div class="add-rule-row" style="margin-top:4px"><input class="add-rule-input" id="tplAliasInput" placeholder="e.g. rd jet llc, jetro" onkeydown="if(event.key==='Enter')tplAddAlias()"><button class="small-btn" onclick="tplAddAlias()">+ Add</button></div>
             </div>
             <div class="tpl-panel">
                 <div class="tpl-panel-title">Prompt Instructions</div>
@@ -385,6 +388,7 @@ async function renderTemplatePage(app, vendorId) {
 
     tplRenderHeaders(); tplRenderLines(); tplRenderRules(); updateTplFormatHint(); updateNavActive();
     tplShowPrompt('system');
+    fetchVendorAliases(vendorId);
 }
 
 function tplAddHeader() {
@@ -434,6 +438,47 @@ function updateTplFormatHint() {
     };
     const el = document.getElementById('tplFormatHint');
     if (el) el.textContent = hints[document.getElementById('tplFormat').value] || '';
+}
+
+// -- Vendor Alias management ------------------------------------------------
+
+async function fetchVendorAliases(vendorId) {
+    try {
+        const aliases = await apiJSON(`/vendors/${vendorId}/aliases`);
+        tplRenderAliases(aliases);
+    } catch (e) { console.warn('Failed to load aliases', e); }
+}
+
+function tplRenderAliases(aliases) {
+    const el = document.getElementById('tplAliasList');
+    if (!el) return;
+    el.innerHTML = aliases.length
+        ? aliases.map(a => `<div class="rule-item"><div class="rule-dot" style="background:var(--amber)"></div><span style="flex:1;letter-spacing:0.06em">${escapeHtml(a.pattern)}</span><button class="rule-del" onclick="tplDeleteAlias(${a.id})">x</button></div>`).join('')
+        : '<div style="font-size:10px;color:var(--text-dim)">No aliases yet — add words unique to this vendor</div>';
+}
+
+async function tplAddAlias() {
+    const inp = document.getElementById('tplAliasInput');
+    const val = inp.value.trim();
+    if (!val) return;
+    try {
+        await apiJSON(`/vendors/${tplVendorId}/aliases`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pattern: val, weight: 1 }),
+        });
+        inp.value = '';
+        await fetchVendorAliases(tplVendorId);
+        showToast('Alias added');
+    } catch (e) { showToast('Failed: ' + e.message); }
+}
+
+async function tplDeleteAlias(aliasId) {
+    try {
+        await apiJSON(`/vendors/aliases/${aliasId}`, { method: 'DELETE' });
+        await fetchVendorAliases(tplVendorId);
+        showToast('Alias removed');
+    } catch (e) { showToast('Failed: ' + e.message); }
 }
 
 async function saveTplConfig() {
@@ -810,6 +855,7 @@ let _pipelineTimerInterval = null;
 const PIPELINE_STAGES = [
     { id: 'upload', label: 'Uploading', detail: 'Document stream received' },
     { id: 'detect', label: 'Detecting Vendor', detail: 'Reading page 1' },
+    { id: 'normalize', label: 'PDF Rendering', detail: 'Detecting digital PDF or scanned PDF boxes' },
     { id: 'ocr', label: 'OCR Bounding Box', detail: 'Digital PDF or scanned PDF routing' },
     { id: 'llm', label: 'Vision Extraction', detail: 'Qwen VL extraction' },
     { id: 'json', label: 'JSON Created', detail: 'Structured output assembled' },
@@ -962,9 +1008,9 @@ function updatePipelineFromSSE(jobState) {
     setPipelineStage('upload', 'done', 'Document stream received');
 
     // Define stage order for sequential markings
-    const stageMap = { normalize: 'ocr', ocr: 'ocr', llm: 'llm', postprocess: 'postprocess' };
+    const stageMap = { normalize: 'normalize', ocr: 'ocr', llm: 'llm', postprocess: 'postprocess' };
     const uiStage = stageMap[stage] || stage;
-    const stageOrder = ['upload', 'detect', 'ocr', 'llm', 'json', 'postprocess'];
+    const stageOrder = ['upload', 'detect', 'normalize', 'ocr', 'llm', 'json', 'postprocess'];
     const currentIdx = stageOrder.indexOf(uiStage);
 
     if (extraction.vendor_name) {
@@ -1370,7 +1416,12 @@ function setStatus(state) {
 // ══════════════════════════════════════════════════════════════════════
 async function renderHistoryPage(app) {
     let extractions = [];
-    try { extractions = await apiJSON('/extractions?limit=50'); } catch (e) { console.warn(e); }
+    let totalCount = 0;
+    try { 
+        extractions = await apiJSON('/extractions?limit=50'); 
+        const countRes = await apiJSON('/extractions/count');
+        totalCount = countRes.count || extractions.length;
+    } catch (e) { console.warn(e); }
 
     app.innerHTML = headerHTML() + `
     <div class="page-content">
@@ -1404,7 +1455,7 @@ async function renderHistoryPage(app) {
         </div>
     </div>
     <div class="bottom-bar">
-        <span style="font-size:10px;color:var(--text-dim);letter-spacing:0.1em">${extractions.length} EXTRACTION${extractions.length !== 1 ? 'S' : ''}</span>
+        <span style="font-size:10px;color:var(--text-dim);letter-spacing:0.1em">${totalCount} EXTRACTION${totalCount !== 1 ? 'S' : ''}</span>
     </div>
     <div class="detail-overlay" id="detailOverlay" onclick="if(event.target===this)this.classList.remove('open')">
         <div class="detail-box" id="detailBox"></div>

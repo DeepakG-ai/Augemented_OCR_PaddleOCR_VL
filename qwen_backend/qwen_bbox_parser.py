@@ -216,7 +216,7 @@ def build_field_locations(
             if not col_box:
                 col_box = anchor_lookup.get(col_name, {}).get("box")
                 if col_box:
-                    row_page = anchor_lookup[col_name]["page"]
+                    row_page = anchor_lookup.get(col_name, {}).get("page", row_page)
 
             if col_box:
                 locations[key_name] = {

@@ -459,7 +459,8 @@ async def extract_document(
     # Build set of already-successful page numbers (from previous runs)
     # so we skip them on retry instead of re-processing
     already_done: set[int] = {
-        pr["_page"] for pr in page_results if "_error" not in pr
+        pr.get("_page") for pr in page_results
+        if "_error" not in pr and pr.get("_page") is not None
     }
 
     # Remove any ERROR results from existing_page_results — they'll be retried
@@ -524,7 +525,10 @@ async def extract_document(
         for page_result in batch_results:
             page_results.append(page_result)
             if on_page_done:
-                await on_page_done(page_result["_page"], total, page_result)
+                try:
+                    await on_page_done(page_result["_page"], total, page_result)
+                except Exception as exc:
+                    logger.error("on_page_done callback failed page %s: %s", page_result.get("_page"), exc)
 
         # If ANY page in the batch failed, stop processing further batches
         if any("_error" in r for r in batch_results):
@@ -548,12 +552,18 @@ async def extract_document(
 
     # ── Build final result based on format ──
     if format_type == "po_per_page":
-        final = [pr.get("fields", pr) for pr in page_results if "_error" not in pr]
+        final = [
+            pr.get("fields") if pr.get("fields") is not None
+            else {k: v for k, v in pr.items() if not k.startswith("_")}
+            for pr in page_results if "_error" not in pr
+        ]
     elif format_type == "single_page" and len(page_results) == 1:
         if "_error" in page_results[0]:
             final = None
         else:
-            final = page_results[0].get("fields", page_results[0])
+            pr0 = page_results[0]
+            final = pr0.get("fields") if pr0.get("fields") is not None \
+                else {k: v for k, v in pr0.items() if not k.startswith("_")}
     else:
         # single_po_multipage — merge header from page 1 + line_items from all
         # merge_results already filters out _error pages internally

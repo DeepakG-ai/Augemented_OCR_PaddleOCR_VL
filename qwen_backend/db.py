@@ -227,6 +227,13 @@ async def init(pool: asyncpg.Pool) -> None:
         await conn.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS pages_extraction_page_number_idx
             ON pages (extraction_id, page_number);
+            
+            CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_idx 
+            ON jobs (extraction_id, job_type) 
+            WHERE status IN ('queued', 'running') AND extraction_id IS NOT NULL;
+            
+            CREATE UNIQUE INDEX IF NOT EXISTS integration_deliveries_unique_target_idx
+            ON integration_deliveries (extraction_id, contract_type, target_type);
         """)
         # Vendor aliases (Phase 2) + spatial memory (Phase 3) — idempotent creation.
         await conn.execute("""
@@ -741,7 +748,7 @@ async def update_extraction_result(
     result: Any,
     page_results: Any,
     status: str,
-    duration_ms: int,
+    duration_ms: int | None = None,
     error: str | None = None,
     page_results_partial: list[dict] | None = None,
     progress: dict | None = None,
@@ -771,7 +778,7 @@ async def update_extraction_result(
                 SET result       = $2::jsonb,
                     page_results = $3::jsonb,
                     status       = $4,
-                    duration_ms  = $5,
+                    duration_ms  = COALESCE($5, duration_ms),
                     error        = $6,
                     progress     = COALESCE($7::jsonb, progress),
                     updated_at   = NOW()
@@ -825,6 +832,11 @@ async def list_all_extractions(pool: asyncpg.Pool, limit: int = 50) -> list[dict
                          "field_locations", "ocr_data", "corrected_result", "correction_meta", "progress")
             results.append(d)
         return results
+
+
+async def count_all_extractions(pool: asyncpg.Pool) -> int:
+    async with pool.acquire() as conn:
+        return await conn.fetchval("SELECT COUNT(*) FROM extractions")
 
 
 async def get_extraction(pool: asyncpg.Pool, extraction_id: int) -> dict | None:
@@ -1284,12 +1296,14 @@ async def enqueue_job(
     payload: dict | None = None,
     priority: int = 100,
     max_attempts: int = 3,
-) -> dict:
+) -> dict | None:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO jobs (extraction_id, document_id, job_type, payload, priority, max_attempts)
             VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+            ON CONFLICT (extraction_id, job_type) WHERE status IN ('queued', 'running') AND extraction_id IS NOT NULL
+            DO NOTHING
             RETURNING id, extraction_id, document_id, job_type, status, payload, progress,
                       attempts, max_attempts, priority, locked_by, locked_at,
                       started_at, finished_at, error, created_at, updated_at
@@ -1301,7 +1315,7 @@ async def enqueue_job(
             priority,
             max_attempts,
         )
-        return _record(row, "payload", "progress") or {}
+        return _record(row, "payload", "progress") if row else None
 
 
 async def has_active_job(pool: asyncpg.Pool, extraction_id: int, job_type: str) -> bool:
@@ -1420,6 +1434,39 @@ async def fail_job(pool: asyncpg.Pool, job_id: int, error: str, retryable: bool 
             next_status,
             error,
         )
+
+
+async def recover_stale_jobs(pool: asyncpg.Pool, stage: str, stale_minutes: int = 10) -> int:
+    """Reset running jobs stuck longer than stale_minutes back to queued (or failed if exhausted).
+
+    Called on worker startup and periodically in the poll loop to reclaim orphaned jobs
+    left in 'running' state by a crashed or killed worker process.
+    Returns the number of jobs recovered.
+    """
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE jobs
+            SET status     = CASE
+                                 WHEN attempts >= max_attempts THEN 'failed'
+                                 ELSE 'queued'
+                             END,
+                locked_by  = NULL,
+                locked_at  = NULL,
+                error      = CASE
+                                 WHEN attempts >= max_attempts
+                                 THEN COALESCE(error, 'Worker crash — max attempts reached')
+                                 ELSE 'Worker crash — requeued'
+                             END,
+                updated_at = NOW()
+            WHERE job_type = $1
+              AND status   = 'running'
+              AND updated_at < NOW() - ($2 * INTERVAL '1 minute')
+            """,
+            stage,
+            stale_minutes,
+        )
+        return int(result.split()[-1]) if result else 0
 
 
 async def cancel_jobs_for_extraction(pool: asyncpg.Pool, extraction_id: int) -> dict:
