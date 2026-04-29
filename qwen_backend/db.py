@@ -266,6 +266,26 @@ async def init(pool: asyncpg.Pool) -> None:
             CREATE INDEX IF NOT EXISTS spatial_memory_lookup_idx
                 ON spatial_memory (vendor_id, layout_key, is_active);
         """)
+        # Qwen-learned label layout boxes — separate from spatial_memory (which
+        # is the human-review correction store). One row per
+        # (vendor, template, field_key) on page 1.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS qwen_layout_boxes (
+                id                          SERIAL PRIMARY KEY,
+                vendor_id                   TEXT NOT NULL REFERENCES vendors(id) ON DELETE CASCADE,
+                template_id                 INT NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+                field_key                   TEXT NOT NULL,
+                field_type                  TEXT NOT NULL CHECK (field_type IN ('header', 'line_item_column')),
+                normalized_box              JSONB NOT NULL,
+                page_number                 INT NOT NULL DEFAULT 1,
+                created_from_extraction_id  INT REFERENCES extractions(id) ON DELETE SET NULL,
+                created_at                  TIMESTAMPTZ DEFAULT NOW(),
+                updated_at                  TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(vendor_id, template_id, field_key)
+            );
+            CREATE INDEX IF NOT EXISTS qwen_layout_boxes_lookup_idx
+                ON qwen_layout_boxes (vendor_id, template_id);
+        """)
         # Migration: add field_locations and ocr_data to extractions if missing
         await conn.execute("""
             DO $$
@@ -565,6 +585,75 @@ async def deactivate_spatial_memory(
             )
         # Returns e.g. "UPDATE 3"
         return int(result.split()[-1]) if result else 0
+
+
+# -- Qwen layout boxes (auto-learned label geometry) -----------------------
+
+async def get_qwen_layout_boxes(
+    pool: asyncpg.Pool,
+    vendor_id: str,
+    template_id: int,
+) -> dict[str, dict]:
+    """Return all Qwen-learned label boxes for (vendor, template), keyed by field_key."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, vendor_id, template_id, field_key, field_type,
+                   normalized_box, page_number, created_from_extraction_id,
+                   created_at, updated_at
+            FROM qwen_layout_boxes
+            WHERE vendor_id = $1 AND template_id = $2
+            ORDER BY field_key
+            """,
+            vendor_id, template_id,
+        )
+        out: dict[str, dict] = {}
+        for r in rows:
+            d = dict(r)
+            _parse_jsonb(d, "normalized_box")
+            out[d["field_key"]] = d
+        return out
+
+
+async def upsert_qwen_layout_boxes(
+    pool: asyncpg.Pool,
+    vendor_id: str,
+    template_id: int,
+    extraction_id: int | None,
+    learned: dict[str, dict],
+) -> int:
+    """Upsert one row per learned field. `learned` shape:
+        {field_key: {"box": [x0,y0,x1,y1] in 0..1, "field_type": "header"|"line_item_column"}}
+    Returns the number of rows written.
+    """
+    if not learned:
+        return 0
+    written = 0
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            for field_key, entry in learned.items():
+                box = entry.get("box")
+                field_type = entry.get("field_type")
+                if box is None or field_type not in ("header", "line_item_column"):
+                    continue
+                await conn.execute(
+                    """
+                    INSERT INTO qwen_layout_boxes
+                        (vendor_id, template_id, field_key, field_type,
+                         normalized_box, page_number, created_from_extraction_id,
+                         created_at, updated_at)
+                    VALUES ($1, $2, $3, $4, $5::jsonb, 1, $6, NOW(), NOW())
+                    ON CONFLICT (vendor_id, template_id, field_key) DO UPDATE SET
+                        field_type = EXCLUDED.field_type,
+                        normalized_box = EXCLUDED.normalized_box,
+                        created_from_extraction_id = EXCLUDED.created_from_extraction_id,
+                        updated_at = NOW()
+                    """,
+                    vendor_id, template_id, field_key, field_type,
+                    json.dumps(box), extraction_id,
+                )
+                written += 1
+    return written
 
 
 # -- Template queries ------------------------------------------------------
