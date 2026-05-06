@@ -1,0 +1,15 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "AugOCR PostgreSQL",
+      "Group": "Servers",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "augocr",
+      "Username": "augocr",
+      "Password": "augocr",
+      "SSLMode": "prefer",
+      "PassFile": ""
+    }
+  }
+}

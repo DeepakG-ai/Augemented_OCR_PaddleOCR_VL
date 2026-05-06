@@ -152,7 +152,7 @@ If you prefer running the backend directly:
 
 ```bash
 # Create a virtual environment
-cd qwen_backend
+cd backend
 python -m venv .venv
 .venv\Scripts\activate  # Windows
 # source .venv/bin/activate  # Linux/Mac
@@ -177,7 +177,7 @@ MinIO is optional — the system falls back to a local `.local_object_store/` di
 
 ### 3. Configure Environment
 
-Edit `qwen_backend/.env`:
+Edit `backend/.env`:
 
 ```env
 DATABASE_URL=postgresql://augocr:augocr@localhost:5432/augocr
@@ -189,7 +189,7 @@ LLM_MODEL=qwen3vl
 ### 4. Start the API Server
 
 ```bash
-cd qwen_backend
+cd backend
 python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
@@ -197,19 +197,19 @@ python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 ```bash
 # Terminal 1
-python -m qwen_backend.worker --stage normalize
+python -m backend.worker --stage normalize
 
 # Terminal 2
-python -m qwen_backend.worker --stage ocr
+python -m backend.worker --stage ocr
 
 # Terminal 3
-python -m qwen_backend.worker --stage llm
+python -m backend.worker --stage llm
 
 # Terminal 4
-python -m qwen_backend.worker --stage postprocess
+python -m backend.worker --stage postprocess
 
 # Terminal 5
-python -m qwen_backend.worker --stage outbound
+python -m backend.worker --stage outbound
 ```
 
 ---
@@ -333,3 +333,11 @@ docker compose down
 docker volume rm augemented_ocr_paddleocr_vl_pgdata
 docker compose up --build
 ```
+
+
+Email: admin@augocr.com
+Password: admin
+
+User: augocr
+Password: augocr
+Database: augocr

@@ -39,21 +39,21 @@ docker compose up --build
 ### Without Docker (dev iteration)
 
 ```bash
-cd qwen_backend
+cd backend
 .venv/Scripts/python.exe -m pip install -r requirements.txt
 
 # API server (auto-reloads on file change)
 .venv/Scripts/python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 # Each worker in a separate terminal (run from project root)
-.venv/Scripts/python.exe -m qwen_backend.worker --stage normalize
-.venv/Scripts/python.exe -m qwen_backend.worker --stage ocr
-.venv/Scripts/python.exe -m qwen_backend.worker --stage llm
-.venv/Scripts/python.exe -m qwen_backend.worker --stage postprocess
-.venv/Scripts/python.exe -m qwen_backend.worker --stage outbound
+.venv/Scripts/python.exe -m backend.worker --stage normalize
+.venv/Scripts/python.exe -m backend.worker --stage ocr
+.venv/Scripts/python.exe -m backend.worker --stage llm
+.venv/Scripts/python.exe -m backend.worker --stage postprocess
+.venv/Scripts/python.exe -m backend.worker --stage outbound
 ```
 
-Required env in `qwen_backend/.env`:
+Required env in `backend/.env`:
 ```
 DATABASE_URL=postgresql://augocr:augocr@localhost:5432/augocr
 REDIS_URL=redis://localhost:6379/0
@@ -131,9 +131,9 @@ Schema is auto-created and migrated in `db.init()` at startup. Migrations are id
 
 ### Frontend
 
-Single-page vanilla JS app (`qwen_frontend/app.js`) served as static files by the FastAPI process. Five pages rendered into `#appRoot`: Vendors, Templates, Extraction, History, Review.
+Single-page vanilla JS app (`frontend/app.js`) served as static files by the FastAPI process. Five pages rendered into `#appRoot`: Vendors, Templates, Extraction, History, Review.
 
-- **Styles**: `qwen_frontend/styles.css` — Terminal UI theme. `JetBrains Mono` is the primary body font; `Rajdhani` is the display font for headers. Dark theme is the default (`:root`); light theme activates via `[data-theme="light"]` on `<html>`. Do not rewrite this file.
+- **Styles**: `frontend/styles.css` — Terminal UI theme. `JetBrains Mono` is the primary body font; `Rajdhani` is the display font for headers. Dark theme is the default (`:root`); light theme activates via `[data-theme="light"]` on `<html>`. Do not rewrite this file.
 - **Review page**: three-panel layout (fields / PDF viewer / JSON). Users draw bounding boxes to correct fields; saving corrections also writes spatial memory to the DB.
 
 ### Extraction result formats

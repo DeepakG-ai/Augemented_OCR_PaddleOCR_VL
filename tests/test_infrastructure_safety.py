@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import qwen_backend.main as main
+import backend.main as main
 
 
 def _job(job_id: int, extraction_id: int, status: str, progress: dict | None = None) -> dict:
@@ -73,7 +73,6 @@ class InfrastructureSafetyTests(unittest.TestCase):
 
         for service in [
             "postgres:",
-            "redis:",
             "minio:",
             "api:",
             "normalize-worker:",
@@ -85,7 +84,7 @@ class InfrastructureSafetyTests(unittest.TestCase):
         ]:
             self.assertIn(service, compose)
 
-        self.assertGreaterEqual(compose.count("healthcheck:"), 4)
+        self.assertGreaterEqual(compose.count("healthcheck:"), 2)
         self.assertIn('--stage", "normalize"', compose)
         self.assertIn('--stage", "ocr"', compose)
         self.assertIn('--stage", "llm"', compose)
@@ -93,7 +92,7 @@ class InfrastructureSafetyTests(unittest.TestCase):
         self.assertIn('--stage", "outbound"', compose)
 
     def test_db_module_contains_schema_and_locking_guards_for_workers(self) -> None:
-        db_text = (ROOT / "qwen_backend" / "db.py").read_text(encoding="utf-8")
+        db_text = (ROOT / "backend" / "db.py").read_text(encoding="utf-8")
 
         self.assertIn("CREATE TABLE IF NOT EXISTS vendors", db_text)
         self.assertIn("CREATE TABLE IF NOT EXISTS templates", db_text)

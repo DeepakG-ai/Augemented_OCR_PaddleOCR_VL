@@ -13,9 +13,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import qwen_backend.extractor as extractor
-import qwen_backend.main as main
-import qwen_backend.worker as worker
+import backend.extractor as extractor
+import backend.main as main
+import backend.worker as worker
 
 
 def _job(job_id: int, extraction_id: int, status: str = "queued") -> dict:
@@ -44,7 +44,7 @@ class ExtractorAdversarialTests(unittest.IsolatedAsyncioTestCase):
     async def test_extract_document_stops_future_batches_after_invalid_json_page(self) -> None:
         calls: list[int] = []
 
-        async def fake_call_llm(image_b64: str, system_prompt: str, user_message: str, llm_url: str, model: str, mime_type: str = "image/jpeg", page_num: int = 0, total_pages: int = 0):
+        async def fake_call_llm(image_b64: str, system_prompt: str, user_message: str, llm_url: str, model: str, mime_type: str = "image/jpeg", page_num: int = 0, total_pages: int = 0, **kwargs):
             calls.append(page_num)
             if page_num == 1:
                 raise ValueError("LLM returned invalid JSON")
@@ -110,7 +110,7 @@ class ExtractorAdversarialTests(unittest.IsolatedAsyncioTestCase):
             22,
             [{"page_number": 1, "source": "paddleocr", "char_count": 0, "word_count": 0, "words": []}],
         )
-        mock_enqueue.assert_awaited_once_with(pool, 22, 32)
+        mock_enqueue.assert_awaited_once_with(pool, 22, 32, unittest.mock.ANY)
 
 
 class WorkerFailurePathTests(unittest.IsolatedAsyncioTestCase):
@@ -120,7 +120,11 @@ class WorkerFailurePathTests(unittest.IsolatedAsyncioTestCase):
         async def stop_after_first_idle(_seconds: float) -> None:
             raise asyncio.CancelledError()
 
-        pool_obj = type("Pool", (), {"close": AsyncMock()})()
+        conn_mock = AsyncMock()
+        conn_mock.execute.return_value = "UPDATE 0"
+        ctx_mock = AsyncMock()
+        ctx_mock.__aenter__.return_value = conn_mock
+        pool_obj = type("Pool", (), {"close": AsyncMock(), "acquire": lambda self: ctx_mock})()
         with patch.object(worker.db_mod, "create_pool", new=AsyncMock(return_value=pool_obj)), \
              patch.object(worker.db_mod, "init", new=AsyncMock()), \
              patch.object(worker.db_mod, "claim_job", new=AsyncMock(side_effect=[job, None])), \

@@ -31,7 +31,7 @@ Core rules:
 | Review role | Human edits and manual drag boxes produce `corrected_result`, audit events, gold examples, and spatial memory. |
 | Spatial memory role | Store the field region. On the next document, read current words inside that region. Never reuse the old value. |
 | Gold examples role | Prompt hints for repeated formatting mistakes. Prompt injection uses the latest correction per field. |
-| Logging | `qwen_backend/logging_config.py` owns console logging and JSONL pipeline audit logging. |
+| Logging | `backend/logging_config.py` owns console logging and JSONL pipeline audit logging. |
 
 ## 2. Implemented vs Planned
 
@@ -54,7 +54,7 @@ Core rules:
 
 ```mermaid
 graph TB
-    UI["Browser SPA<br/>qwen_frontend"] --> API["FastAPI API<br/>qwen_backend.main"]
+    UI["Browser SPA<br/>frontend"] --> API["FastAPI API<br/>backend.main"]
     API --> PG["PostgreSQL<br/>metadata, jobs, results"]
     API --> RD["Redis<br/>prompt/result cache"]
     API --> MN["MinIO or local object store<br/>documents, pages, exports"]
@@ -269,7 +269,7 @@ examples do not accumulate in the prompt.
 There is one logging module:
 
 ```text
-qwen_backend/logging_config.py
+backend/logging_config.py
 ```
 
 It provides:
@@ -454,7 +454,7 @@ Deprecated legacy endpoints:
 
 ## 12. Frontend Behavior
 
-The SPA uses hash routing and lives in `qwen_frontend/app.js`.
+The SPA uses hash routing and lives in `frontend/app.js`.
 
 | Route | Purpose |
 |---|---|
@@ -493,7 +493,7 @@ flowchart LR
 
 This section lists production backend functions and their responsibilities.
 
-### `qwen_backend/processor.py`
+### `backend/processor.py`
 
 | Function | Responsibility |
 |---|---|
@@ -503,7 +503,7 @@ This section lists production backend functions and their responsibilities.
 | `pdf_to_images` | Async wrapper for PDF rendering. |
 | `image_file_to_b64` | Async wrapper for image normalization. |
 
-### `qwen_backend/pdf_extractor.py`
+### `backend/pdf_extractor.py`
 
 | Function | Responsibility |
 |---|---|
@@ -511,7 +511,7 @@ This section lists production backend functions and their responsibilities.
 | `page_is_digital` | Decide whether embedded text appears printable enough to treat as digital. |
 | `extract_words` | Convert pypdfium2 character boxes into word boxes in image pixel space. |
 
-### `qwen_backend/geometry.py`
+### `backend/geometry.py`
 
 | Function | Responsibility |
 |---|---|
@@ -521,7 +521,7 @@ This section lists production backend functions and their responsibilities.
 | `merge_scanned_into_geometry` | Fill scanned-page geometry entries with PaddleOCR words. |
 | `image_page_geometry` | Return an empty scanned placeholder for image uploads. |
 
-### `qwen_backend/ocr_runner.py`
+### `backend/ocr_runner.py`
 
 | Function | Responsibility |
 |---|---|
@@ -529,7 +529,7 @@ This section lists production backend functions and their responsibilities.
 | `_run_ocr_on_page` | OCR one rendered page and return text boxes. |
 | `run_ocr_on_pages` | Run OCR across pages using an executor and aggregate results. |
 
-### `qwen_backend/vendor_detector.py`
+### `backend/vendor_detector.py`
 
 | Function/Class | Responsibility |
 |---|---|
@@ -545,13 +545,13 @@ This section lists production backend functions and their responsibilities.
 | `_detect_fuzzy` | Score fuzzy matches and reject ambiguous margins. |
 | `detect_vendor` | Public detector: exact first, fuzzy second, unknown otherwise. |
 
-### `qwen_backend/layout_key.py`
+### `backend/layout_key.py`
 
 | Function | Responsibility |
 |---|---|
 | `compute_layout_key` | Return stable phase-one layout key `vendor_id:template_id`. |
 
-### `qwen_backend/spatial_memory.py`
+### `backend/spatial_memory.py`
 
 | Function | Responsibility |
 |---|---|
@@ -565,7 +565,7 @@ This section lists production backend functions and their responsibilities.
 | `save_from_corrections` | Persist manual drag-box field regions as spatial memory. |
 | `apply_to_extraction` | Read current text inside saved regions and override Qwen values. |
 
-### `qwen_backend/extractor.py`
+### `backend/extractor.py`
 
 | Function | Responsibility |
 |---|---|
@@ -577,7 +577,7 @@ This section lists production backend functions and their responsibilities.
 | `extract_document` | Orchestrate page-by-page extraction with resume/cancel support. |
 | `merge_results` | Merge page results according to document format. |
 
-### `qwen_backend/qwen_bbox_parser.py`
+### `backend/qwen_bbox_parser.py`
 
 | Function | Responsibility |
 |---|---|
@@ -586,7 +586,7 @@ This section lists production backend functions and their responsibilities.
 | `parse_qwen_page_result` | Extract `fields` and `boxes` from one Qwen page result. |
 | `build_field_locations` | Convert Qwen anchor/header boxes into review `field_locations`. |
 
-### `qwen_backend/text_matcher.py`
+### `backend/text_matcher.py`
 
 This is the legacy/fallback field-location engine used when Qwen v3 boxes are
 not available.
@@ -601,7 +601,7 @@ not available.
 | `_find_page_column_headers`, `_find_row_anchors`, `_build_row_bands`, `_confirm_column`, `_generate_header_variants`, `_find_column_header_in_ocr`, `_build_column_anchor_box`, `_reserve_source_boxes_for_hit` | Table header and row band detection. |
 | `compute_field_locations` | Public fallback that returns review `field_locations`. |
 
-### `qwen_backend/worker.py`
+### `backend/worker.py`
 
 | Function | Responsibility |
 |---|---|
@@ -618,7 +618,7 @@ not available.
 | `run_worker` | Poll and claim jobs, log completion/failure. |
 | `main` | CLI entrypoint for stage-specific worker process. |
 
-### `qwen_backend/main.py`
+### `backend/main.py`
 
 | Function/Class | Responsibility |
 |---|---|
@@ -648,7 +648,7 @@ not available.
 | `get_extraction_contract` | Return normalized contract. |
 | `download_extraction_excel`, `download_extraction_csv` | Return generated exports. |
 
-### `qwen_backend/db.py`
+### `backend/db.py`
 
 | Function group | Responsibility |
 |---|---|
@@ -771,8 +771,8 @@ These are known and should not be confused with intended final behavior:
 Focused checks used after recent changes:
 
 ```powershell
-.\.venv\Scripts\python.exe -m compileall -q qwen_backend
-node --check qwen_frontend\app.js
+.\.venv\Scripts\python.exe -m compileall -q backend
+node --check frontend\app.js
 .\.venv\Scripts\python.exe -m unittest tests.test_review_api tests.test_pipeline_integration_flow tests.test_vendor_detector
 ```
 

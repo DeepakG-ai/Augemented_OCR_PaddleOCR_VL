@@ -11,11 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import qwen_backend.extractor as extractor
+import backend.extractor as extractor
 
 
 class ExtractorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
-    async def test_extract_document_processes_pages_in_parallel_batches_of_two(self) -> None:
+    async def test_extract_document_processes_pages_in_sequential_batches_of_one(self) -> None:
         active = 0
         max_active = 0
         on_page_done_calls: list[int] = []
@@ -29,6 +29,7 @@ class ExtractorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             mime_type: str = "image/jpeg",
             page_num: int = 0,
             total_pages: int = 0,
+            **kwargs,
         ) -> dict:
             nonlocal active, max_active
             active += 1
@@ -64,7 +65,7 @@ class ExtractorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 on_page_done=on_page_done,
             )
 
-        self.assertEqual(max_active, 2)
+        self.assertEqual(max_active, 1)
         self.assertEqual(on_page_done_calls, [1, 2, 3, 4])
         self.assertEqual([pr["_page"] for pr in output["page_results"]], [1, 2, 3, 4])
         self.assertEqual(output["result"]["line_items"], [{"item": 1}, {"item": 2}, {"item": 3}, {"item": 4}])

@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import qwen_backend.worker as worker
+import backend.worker as worker
 
 
 class _FakeStore:
@@ -52,6 +52,10 @@ class WorkerFlowIntegrationTests(unittest.IsolatedAsyncioTestCase):
             {"page_number": 1, "words": [{"text": "ACME", "box": [1, 2, 30, 20], "score": 0.99}]},
             {"page_number": 2, "words": [{"text": "Widget", "box": [2, 22, 50, 40], "score": 0.97}]},
         ]
+        geometry_pages = [
+            {"page_number": 1, "source": "paddleocr", "char_count": 0, "word_count": 0, "words": []},
+            {"page_number": 2, "source": "paddleocr", "char_count": 0, "word_count": 0, "words": []},
+        ]
         llm_output = {
             "result": {
                 "vendor_name": "ACME",
@@ -81,7 +85,7 @@ class WorkerFlowIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "document_id": 31,
             "vendor_id": "V1",
             "vendor_name": "Vendor 1",
-            "template_id": None,
+            "template_id": 5,
             "filename": "invoice.pdf",
             "total_pages": 0,
             "format_type": "single_po_multipage",
@@ -196,6 +200,10 @@ class WorkerFlowIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(extraction_id, 21)
             return False
 
+        async def fake_is_postprocess_ready(_pool, extraction_id: int):
+            self.assertEqual(extraction_id, 21)
+            return extraction.get("result") is not None and extraction.get("ocr_data") is not None
+
         async def fake_save_field_locations(_pool, extraction_id: int, data: dict):
             self.assertEqual(extraction_id, 21)
             extraction["field_locations"] = data
@@ -230,9 +238,10 @@ class WorkerFlowIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with ExitStack() as stack:
             stack.enter_context(patch.object(worker, "get_store", return_value=store))
             stack.enter_context(patch.object(worker.processor, "pdf_to_images", new=AsyncMock(return_value=rendered_pages)))
+            stack.enter_context(patch.object(worker.geometry, "compute_pdf_geometry", return_value=geometry_pages))
             stack.enter_context(patch.object(worker.ocr_runner, "run_ocr_on_pages", new=AsyncMock(return_value=ocr_pages)))
             stack.enter_context(patch.object(worker.extractor, "extract_document", new=AsyncMock(return_value=llm_output)))
-            stack.enter_context(patch.object(worker.text_matcher, "compute_field_locations", return_value=field_locations))
+            stack.enter_context(patch.object(worker.qwen_layout_apply, "build_field_locations_from_layout", return_value=field_locations))
             stack.enter_context(patch.object(worker, "build_excel_bytes", return_value=b"excel-bytes"))
             stack.enter_context(patch.object(worker.db_mod, "get_document", new=AsyncMock(side_effect=fake_get_document)))
             stack.enter_context(patch.object(worker.db_mod, "update_document_status", new=AsyncMock(side_effect=fake_update_document_status)))
@@ -244,7 +253,12 @@ class WorkerFlowIntegrationTests(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(patch.object(worker.db_mod, "ensure_job", new=AsyncMock(side_effect=fake_ensure_job)))
             stack.enter_context(patch.object(worker.db_mod, "get_extraction", new=AsyncMock(side_effect=fake_get_extraction)))
             stack.enter_context(patch.object(worker.db_mod, "get_template", new=AsyncMock(return_value=None)))
+            stack.enter_context(patch.object(worker.db_mod, "get_gold_examples", new=AsyncMock(return_value=[])))
+            stack.enter_context(patch.object(worker.db_mod, "get_qwen_layout_boxes", new=AsyncMock(return_value={"vendor_name": {"normalized_box": [0.0, 0.0, 0.1, 0.05], "field_type": "header", "page_number": 1}})))
+            stack.enter_context(patch.object(worker.db_mod, "upsert_qwen_layout_boxes", new=AsyncMock(return_value=0)))
+            stack.enter_context(patch.object(worker.db_mod, "get_spatial_memory_for_layout", new=AsyncMock(return_value=[])))
             stack.enter_context(patch.object(worker.db_mod, "get_pages", new=AsyncMock(side_effect=fake_get_pages)))
+            stack.enter_context(patch.object(worker.db_mod, "is_postprocess_ready", new=AsyncMock(side_effect=fake_is_postprocess_ready)))
             stack.enter_context(patch.object(worker.db_mod, "save_ocr_data", new=AsyncMock(side_effect=fake_save_ocr_data)))
             stack.enter_context(patch.object(worker.db_mod, "update_extraction_result", new=AsyncMock(side_effect=fake_update_extraction_result)))
             stack.enter_context(patch.object(worker.db_mod, "is_cancel_requested", new=AsyncMock(side_effect=fake_is_cancel_requested)))
@@ -260,7 +274,8 @@ class WorkerFlowIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(extraction["total_pages"], 2)
         self.assertEqual(extraction["status"], "done")
         self.assertEqual(extraction["result"]["vendor_name"], "ACME")
-        self.assertEqual(extraction["ocr_data"], ocr_pages)
+        self.assertEqual([p["source"] for p in extraction["ocr_data"]], ["paddleocr", "paddleocr"])
+        self.assertEqual([p["words"] for p in extraction["ocr_data"]], [p["words"] for p in ocr_pages])
         self.assertEqual(extraction["field_locations"], field_locations)
         self.assertTrue(extraction["export_object_key"].endswith("purchase_order.xlsx"))
         self.assertEqual(ensured_jobs, ["ocr", "llm", "postprocess", "outbound"])

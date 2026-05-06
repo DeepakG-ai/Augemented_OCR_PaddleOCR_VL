@@ -70,7 +70,7 @@ Correct behavior:
 ### 4. Keep the current review UX
 
 - The existing drag-draw-select review flow must keep working.
-- The current review behavior in `qwen_frontend/app.js` already writes manual `field_locations`.
+- The current review behavior in `frontend/app.js` already writes manual `field_locations`.
 - Reuse that interaction pattern instead of building a second review UI.
 
 ### 5. Do not persist row-specific line-item values as reusable memory
@@ -83,21 +83,21 @@ Correct behavior:
 
 These files already contain relevant behavior:
 
-- `qwen_backend/pdf_extractor.py`
+- `backend/pdf_extractor.py`
   - contains a working `pypdfium2` prototype for digital detection and word extraction
-- `qwen_backend/ocr_runner.py`
+- `backend/ocr_runner.py`
   - current `PaddleOCR` word extraction
-- `qwen_backend/worker.py`
+- `backend/worker.py`
   - normalize, OCR, LLM, postprocess, outbound stages
-- `qwen_backend/extractor.py`
+- `backend/extractor.py`
   - system prompt builder and gold-example injection
-- `qwen_backend/main.py`
+- `backend/main.py`
   - review save endpoint and OCR fetch endpoint
-- `qwen_backend/db.py`
+- `backend/db.py`
   - tables for vendors, templates, extractions, review events, gold examples
-- `qwen_backend/qwen_bbox_parser.py`
+- `backend/qwen_bbox_parser.py`
   - current Qwen anchor/header bbox parser
-- `qwen_frontend/app.js`
+- `frontend/app.js`
   - current review page, drag-box selection, manual field location save
 
 Important current behaviors:
@@ -340,7 +340,7 @@ Spatial memory must be reusable across future extractions.
 ## Suggested Execution Order
 
 1. Create the new feature branch from the current `box-vis` baseline.
-2. Promote `qwen_backend/pdf_extractor.py` from prototype into reusable production code.
+2. Promote `backend/pdf_extractor.py` from prototype into reusable production code.
 3. Build a unified geometry service for `pypdfium2` and `PaddleOCR`.
 4. Add vendor detection from current document text.
 5. Change ingest flow so vendor can be detected before extraction starts.

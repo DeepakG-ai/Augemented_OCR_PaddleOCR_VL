@@ -29,8 +29,8 @@ import sys
 import os
 import time
 
-# Add qwen_backend to sys.path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "qwen_backend"))
+# Add backend to sys.path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 
 os.environ["PHOENIX_ENABLED"] = "true"
 os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = "http://localhost:4317"

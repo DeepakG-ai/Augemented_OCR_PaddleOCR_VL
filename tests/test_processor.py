@@ -3,10 +3,10 @@ import base64
 import os
 import sys
 
-# Ensure we can import from qwen_backend
+# Ensure we can import from backend
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from qwen_backend.processor import pdf_to_images
+from backend.processor import pdf_to_images
 
 async def main():
     input_dir = r"C:\Users\aigroup5\Downloads\PDF Samples\input"

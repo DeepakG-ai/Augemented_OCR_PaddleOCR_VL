@@ -9,11 +9,8 @@ from fastapi.testclient import TestClient
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BACKEND_DIR = ROOT / "qwen_backend"
-if str(BACKEND_DIR) not in sys.path:
-    sys.path.insert(0, str(BACKEND_DIR))
 
-import main
+import backend.main as main
 
 
 class ReviewApiTests(unittest.TestCase):
@@ -85,8 +82,7 @@ class ReviewApiTests(unittest.TestCase):
              patch.object(main.db_mod, "save_corrections", new=AsyncMock(return_value=True)) as mock_save, \
              patch.object(main.db_mod, "create_review_event", new=AsyncMock(return_value=77)), \
              patch.object(main.db_mod, "ensure_job", new=AsyncMock(return_value=None)), \
-             patch.object(main.db_mod, "save_gold_example", new=AsyncMock(return_value=55)), \
-             patch.object(main.cache_mod, "invalidate_vendor_cache", new=AsyncMock(return_value=None)):
+             patch.object(main.db_mod, "save_gold_example", new=AsyncMock(return_value=55)):
             response = self.client.put(
                 "/extractions/123/corrections",
                 json={
