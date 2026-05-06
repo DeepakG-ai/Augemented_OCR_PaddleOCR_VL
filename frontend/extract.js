@@ -112,14 +112,10 @@ async function extLoadVendorConfig() {
     if (v) {
         try {
             const tmpl = await apiJSON(`/vendors/${v.id}/template`);
-            document.getElementById('formatType').value = tmpl.format_type || 'single_po_multipage';
-            document.getElementById('promptInstructions').value = tmpl.prompt_instructions || '';
             extractionRules = [...(tmpl.extraction_rules || [])];
             headerFields = [...(tmpl.header_fields || [])];
             lineItemFields = [...(tmpl.line_item_fields || [])];
         } catch (e) {
-            document.getElementById('formatType').value = 'single_po_multipage';
-            document.getElementById('promptInstructions').value = '';
             extractionRules = []; headerFields = []; lineItemFields = [];
         }
     } else { extractionRules = []; headerFields = []; lineItemFields = []; }
@@ -179,7 +175,16 @@ async function saveTemplate() {
         showToast('Run extraction first so the system can detect the vendor');
         return;
     }
-    const payload = { format_type: document.getElementById('formatType').value, vendor_name: v.name, header_fields: headerFields, line_item_fields: lineItemFields, prompt_instructions: document.getElementById('promptInstructions').value || null, extraction_rules: extractionRules };
+    const formatEl = document.getElementById('formatType');
+    const promptEl = document.getElementById('promptInstructions');
+    const payload = {
+        format_type: formatEl ? formatEl.value : 'single_po_multipage',
+        vendor_name: v.name,
+        header_fields: headerFields,
+        line_item_fields: lineItemFields,
+        prompt_instructions: promptEl ? (promptEl.value || null) : null,
+        extraction_rules: extractionRules,
+    };
     try {
         const resp = await apiJSON(`/vendors/${v.id}/template`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
         showToast(`Template saved — hash: ${(resp.prompt_hash || 'none').slice(0, 12)}...`);
@@ -187,9 +192,12 @@ async function saveTemplate() {
 }
 
 function extUpdateFormatHint() {
-    const hints = { single_po_multipage: 'Page 1: header + line items. Pages 2-N: line items only, same PO.', po_per_page: 'Each page is a self-contained PO with its own header and line items.', single_page: 'Entire document is a single page. Extract all fields at once.' };
+    // Guard: these DOM elements only exist on the Template page, not the Extract page.
     const el = document.getElementById('formatHint');
-    if (el) el.textContent = hints[document.getElementById('formatType').value] || '';
+    if (!el) return;
+    const hints = { single_po_multipage: 'Page 1: header + line items. Pages 2-N: line items only, same PO.', po_per_page: 'Each page is a self-contained PO with its own header and line items.', single_page: 'Entire document is a single page. Extract all fields at once.' };
+    const formatEl = document.getElementById('formatType');
+    el.textContent = hints[formatEl ? formatEl.value : 'single_po_multipage'] || '';
 }
 
 
@@ -216,6 +224,7 @@ async function handleFile(file) {
     try {
         const formData = new FormData();
         formData.append('file', file);
+        formData.append('max_pages', '5'); // Quick preview; full pages load after extraction
         const resp = await apiJSON('/upload-preview', { method: 'POST', body: formData });
         extractionPages = resp.pages;
         totalPages = resp.total_pages;
@@ -358,7 +367,8 @@ function buildPipelineHTML() {
     `;
 }
 
-function showPipelinePanel() {
+function showPipelinePanel(options = {}) {
+    const selectedVendorName = options.selectedVendorName || null;
     const panel = document.getElementById('pipelinePanel');
     if (!panel) {
         // Inject pipeline HTML into the right panel
@@ -392,7 +402,11 @@ function showPipelinePanel() {
 
     // Mark upload as done immediately (file is already uploaded)
     setPipelineStage('upload', 'done', 'Document stream received');
-    setPipelineStage('detect', 'active', 'Reading page 1 for vendor');
+    if (selectedVendorName) {
+        setPipelineStage('detect', 'done', `Manual vendor selected: ${selectedVendorName}. Auto-detection skipped.`);
+    } else {
+        setPipelineStage('detect', 'active', 'Reading page 1 for vendor');
+    }
 
     // Start elapsed timer
     _pipelineStartTime = Date.now();
@@ -722,9 +736,13 @@ async function runExtract() {
     const cs = document.getElementById('conflictSection'); if (cs) cs.style.display = 'none';
     const rs = document.getElementById('resultSection'); if (rs) rs.style.display = 'none';
 
-    setDetectedVendorDisplay(null, 'Detecting vendor from page 1...');
+    if (v) {
+        setDetectedVendorDisplay(v.name, 'Manual vendor selected. Auto-detection will be skipped.');
+    } else {
+        setDetectedVendorDisplay(null, 'Detecting vendor from page 1...');
+    }
     showStopButton('extractBtn');
-    showPipelinePanel();
+    showPipelinePanel({ selectedVendorName: v ? v.name : null });
     const formData = new FormData();
     formData.append('file', loadedFile);
     if (v) formData.append('vendor_id', v.id);
@@ -736,8 +754,8 @@ async function runExtract() {
             setPipelineStage('detect', 'done', `Client Detected: ${payload.detected_vendor.vendor_name}`);
             db.activeVendorId = payload.detected_vendor.vendor_id;
         } else if (v) {
-            setDetectedVendorDisplay(v.name, 'Using pre-selected vendor');
-            setPipelineStage('detect', 'done', `Client: ${v.name}`);
+            setDetectedVendorDisplay(v.name, 'Manual vendor selected. Auto-detection skipped.');
+            setPipelineStage('detect', 'done', `Manual vendor selected: ${v.name}. Auto-detection skipped.`);
         }
         activeExtractionId = payload.extraction_id;
         await streamJob(payload.job_id);

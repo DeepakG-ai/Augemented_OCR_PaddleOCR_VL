@@ -344,6 +344,54 @@ function _isFieldChanged(key) {
     return String(origVal ?? '') !== String(currVal ?? '');
 }
 
+function _rvComparableValue(value) {
+    if (value == null) return '';
+    if (typeof value === 'string') return value.replace(/\s+/g, ' ').trim();
+    return JSON.stringify(value);
+}
+
+function _rvTypedOnlyChangedFields(payload, fieldLocs) {
+    const fields = [];
+
+    const collect = (current, original, locs, prefix = '') => {
+        const curr = current && typeof current === 'object' && !Array.isArray(current) ? current : {};
+        const orig = original && typeof original === 'object' && !Array.isArray(original) ? original : {};
+        const allKeys = new Set([...Object.keys(curr), ...Object.keys(orig)]);
+        for (const key of allKeys) {
+            if (key === 'line_items' || key.startsWith('_')) continue;
+            if (_rvComparableValue(curr[key]) === _rvComparableValue(orig[key])) continue;
+            const loc = locs && locs[key];
+            if (!loc || loc.strategy !== 'manual') {
+                fields.push(prefix ? `${prefix}: ${key}` : key);
+            }
+        }
+    };
+
+    if (Array.isArray(payload)) {
+        payload.forEach((record, idx) => {
+            const original = Array.isArray(_rvAllOriginalResults) ? _rvAllOriginalResults[idx] : {};
+            const locs = Array.isArray(fieldLocs) ? fieldLocs[idx] : {};
+            collect(record, original, locs, `document ${idx + 1}`);
+        });
+    } else {
+        collect(payload, _rvSingleOriginalResult, fieldLocs || {});
+    }
+
+    return fields;
+}
+
+function _rvConfirmTypedOnlyChanges(fields) {
+    if (!fields.length) return true;
+    const preview = fields.slice(0, 6).join(', ');
+    const extra = fields.length > 6 ? ` and ${fields.length - 6} more` : '';
+    return window.confirm(
+        `Manual typed edits will override Qwen's final JSON value for: ${preview}${extra}.\n\n` +
+        `These typed edits will NOT create spatial memory because no value box was selected on the document.\n\n` +
+        `Use the draw/select button when you want future same-layout PDFs to reuse a field location.\n\n` +
+        `Continue saving these value-only corrections?`
+    );
+}
+
 function rvRenderFields() {
     const el = document.getElementById('rvFieldsList');
     if (!el) return;
@@ -1189,6 +1237,10 @@ async function rvConfirm() {
             _rvPersistCurrentRecord();
             const payload = _rvCurrentPayload();
             const finalFieldLocs = _rvIsPoPerPage ? _rvAllFieldLocs : _rvFieldLocs;
+            const typedOnlyFields = _rvTypedOnlyChangedFields(payload, finalFieldLocs);
+            if (!_rvConfirmTypedOnlyChanges(typedOnlyFields)) {
+                return;
+            }
             await apiJSON(`/extractions/${_rvExtractionId}/corrections`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },

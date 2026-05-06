@@ -32,8 +32,8 @@ _JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?", re.MULTILINE)
 _FENCE_END_RE  = re.compile(r"\n?```\s*$", re.MULTILINE)
 
 
-def _build_bbox_system_prompt() -> str:
-    return """\
+def _build_bbox_system_prompt(total_fields: int) -> str:
+    return f"""\
 You are a Document Layout Analyzer.
 Your ONLY task: locate the exact position of where specific label text and table column header text appears in the document image.
 
@@ -51,9 +51,8 @@ There are exactly two types of fields:
 - If you find multiple occurrences of the same field name in the document, map to the one that is contextually correct. eg: material_no is user requested, u found 2 words, header or line item header. don't map everywhere u see. 
 </rules>
 
-<critical> Count the number of fields which user mentioned FIRST, then extract that exact number of boxes. </critical>
+<critical> The user requested EXACTLY {total_fields} fields. You MUST return exactly {total_fields} keys in the "boxes" object. </critical>
 """
-
 
 def _build_bbox_user_message(
     header_field_keys: list[str],
@@ -74,7 +73,9 @@ def _build_bbox_user_message(
     for i, k in enumerate(all_keys):
         comma = "," if i < len(all_keys) - 1 else ""
         example += f"    \"{k}\": null{comma}\n"
-    example += "  }\n}"
+    example += "  },\n"
+    example += f"  \"all_{len(all_keys)}_requested_fields_returned\": true\n"
+    example += "}"
 
     return f"""Locate each label and table column header listed below in this document image.
 Return their bounding box coordinates in bbox_2d format [x1, y1, x2, y2], normalized to a 0-1000 grid.
@@ -85,6 +86,7 @@ Strictly return the LABEL text region only — NOT its value.
 Return JSON in exactly this shape:
 {example}
 
+Critical Verification: Before finishing, verify that you have returned a bounding box (or null) for all {len(all_keys)} requested fields. If you have, set "all_{len(all_keys)}_requested_fields_returned" to true, otherwise false.
 Strictly return ONLY valid JSON matching the structure above."""
 
 
@@ -120,7 +122,7 @@ async def learn_layout_for_vendor(
             "line_item_column_keys": line_item_column_keys,
         },
     ) as prompt_ctx:
-        system_prompt = _build_bbox_system_prompt()
+        system_prompt = _build_bbox_system_prompt(len(all_requested))
         user_message  = _build_bbox_user_message(header_field_keys, line_item_column_keys)
         prompt_ctx["output"] = {
             "system_prompt": system_prompt,

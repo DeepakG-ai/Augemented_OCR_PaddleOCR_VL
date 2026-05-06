@@ -219,6 +219,27 @@ async def _submit_ingestion_job(
     metadata: dict | None = None,
     trace_context: dict | None = None,
 ) -> dict:
+    tmpl = await db_mod.get_template(pool, vendor_id)
+    if not tmpl:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "reason": "no_template",
+                "vendor_id": vendor_id,
+                "hint": "Create a template with at least one field for this vendor before extracting.",
+            },
+        )
+    all_tmpl_fields = list(tmpl.get("header_fields") or []) + list(tmpl.get("line_item_fields") or [])
+    if not all_tmpl_fields:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "reason": "no_fields",
+                "vendor_id": vendor_id,
+                "hint": "The template for this vendor has no fields. Add at least one header or line item field before extracting.",
+            },
+        )
+
     object_key = f"documents/{vendor_id}/{uuid4().hex}_{filename}"
     mime_type = _guess_mime_type(filename)
     store.put_bytes(DOCUMENTS_BUCKET, object_key, file_bytes, mime_type)
@@ -238,9 +259,8 @@ async def _submit_ingestion_job(
         metadata=document_metadata,
     )
 
-    tmpl = await db_mod.get_template(pool, vendor_id)
-    template_id = tmpl["id"] if tmpl else None
-    resolved_format_type = format_type or (tmpl["format_type"] if tmpl else "single_po_multipage")
+    template_id = tmpl["id"]
+    resolved_format_type = format_type or tmpl["format_type"]
     extraction = await db_mod.create_extraction(
         pool,
         vendor_id=vendor_id,
@@ -341,10 +361,6 @@ async def create_vendor(request: Request, body: VendorCreate):
     # Auto-insert vendor name as a detection alias
     try:
         await db_mod.insert_vendor_alias(pool, body.id, body.name.lower(), weight=1, source="auto_from_name")
-        # Also insert the vendor_id itself as an alias (e.g. "robert_scott" -> "robert scott")
-        alias_from_id = body.id.replace("_", " ").replace("-", " ").lower()
-        if alias_from_id != body.name.lower():
-            await db_mod.insert_vendor_alias(pool, body.id, alias_from_id, weight=1, source="auto_from_id")
     except Exception as exc:
         logger.warning("Failed to auto-insert vendor alias for %s: %s", body.id, exc)
     return VendorOut(**row)
@@ -564,6 +580,20 @@ async def save_template(request: Request, vendor_id: str, body: TemplateCreate):
 
         tmpl = await db_mod.get_template(pool, vendor_id)
         logger.info("Template saved OK vendor=%s hash=%s", vendor_id, prompt_hash[:12])
+
+        # Remove stale layout boxes and spatial memory for fields no longer in template
+        valid_fields = list(body.header_fields or []) + list(body.line_item_fields or [])
+        if tmpl:
+            stale_boxes = await db_mod.delete_stale_qwen_layout_boxes(
+                pool, vendor_id, tmpl["id"], valid_fields
+            )
+            stale_mem = await db_mod.delete_stale_spatial_memory(pool, vendor_id, valid_fields)
+            if stale_boxes or stale_mem:
+                logger.info(
+                    "Template change cleanup: vendor=%s removed %d layout boxes, %d spatial memory rows",
+                    vendor_id, stale_boxes, stale_mem,
+                )
+
         return TemplateSaveResponse(
             template_id=tmpl["id"],
             prompt_hash=prompt_hash,
@@ -1371,16 +1401,18 @@ async def list_all_extractions(request: Request, limit: int = 50):
 async def upload_preview(
     request: Request,
     file: UploadFile = File(...),
+    max_pages: int = Form(20),
 ):
     """
     Upload a PDF/image and get rendered page images back for preview.
     No extraction or LLM call. Just page rendering.
+    Capped at max_pages (default 20) to avoid slow rendering of large scanned PDFs.
     """
     file_bytes = await file.read()
     filename = file.filename or "unknown"
 
     if filename.lower().endswith(".pdf"):
-        pages = await processor.pdf_to_images(file_bytes)
+        pages = await processor.pdf_to_images(file_bytes, max_pages=max_pages)
     elif filename.lower().endswith((".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".webp")):
         pages = await processor.image_file_to_b64(file_bytes)
     else:
@@ -1602,24 +1634,30 @@ async def save_extraction_corrections(request: Request, extraction_id: int):
         diff=correction_diff,
     )
 
-    # Auto-create gold example if any fields were actually changed
+    # Auto-create gold example if any header fields were actually changed.
+    # Exclude all line-item data: "line_items" (single PO) and "doc_N_line_items" (po_per_page).
+    # Old table rows as few-shot examples add noise, not signal (AGENTS.md §7).
     gold_id = None
     vendor_id = extraction.get("vendor_id")
-    if correction_diff and vendor_id:
+    header_only_diff = {
+        k: v for k, v in (correction_diff or {}).items()
+        if k != "line_items" and not k.endswith("_line_items")
+    }
+    if header_only_diff and vendor_id:
         try:
             gold_id = await db_mod.save_gold_example(
                 pool, vendor_id, extraction_id,
                 original_result, corrected_result,
-                correction_diff=correction_diff,
+                correction_diff=header_only_diff,
             )
             logger.info("Gold example %d created for vendor=%s extraction=%d (changed: %s)",
-                        gold_id, vendor_id, extraction_id, ", ".join(correction_diff.keys()))
+                        gold_id, vendor_id, extraction_id, ", ".join(header_only_diff.keys()))
             plog.event(
                 "gold_correction_saved",
                 stage="review",
                 **base,
                 gold_example_id=gold_id,
-                changed_fields=list(correction_diff.keys()),
+                changed_fields=list(header_only_diff.keys()),
                 latest_per_field=True,
             )
 

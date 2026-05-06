@@ -1365,6 +1365,55 @@ async def get_gold_examples(
         return [{"correction_diff": latest}] if latest else []
 
 
+async def delete_stale_qwen_layout_boxes(
+    pool: asyncpg.Pool,
+    vendor_id: str,
+    template_id: int,
+    valid_field_keys: list[str],
+) -> int:
+    """Delete qwen_layout_boxes rows for fields no longer in the template."""
+    async with pool.acquire() as conn:
+        if valid_field_keys:
+            result = await conn.execute(
+                """
+                DELETE FROM qwen_layout_boxes
+                WHERE vendor_id = $1 AND template_id = $2
+                  AND field_key != ALL($3::text[])
+                """,
+                vendor_id, template_id, valid_field_keys,
+            )
+        else:
+            result = await conn.execute(
+                "DELETE FROM qwen_layout_boxes WHERE vendor_id = $1 AND template_id = $2",
+                vendor_id, template_id,
+            )
+        return int(result.split()[-1])
+
+
+async def delete_stale_spatial_memory(
+    pool: asyncpg.Pool,
+    vendor_id: str,
+    valid_field_keys: list[str],
+) -> int:
+    """Delete spatial_memory rows for fields no longer in the template."""
+    async with pool.acquire() as conn:
+        if valid_field_keys:
+            result = await conn.execute(
+                """
+                DELETE FROM spatial_memory
+                WHERE vendor_id = $1
+                  AND field_key != ALL($2::text[])
+                """,
+                vendor_id, valid_field_keys,
+            )
+        else:
+            result = await conn.execute(
+                "DELETE FROM spatial_memory WHERE vendor_id = $1",
+                vendor_id,
+            )
+        return int(result.split()[-1])
+
+
 async def get_latest_gold_correction_fields(
     pool: asyncpg.Pool,
     vendor_id: str,

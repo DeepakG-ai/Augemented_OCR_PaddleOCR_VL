@@ -106,7 +106,7 @@ async def _load_detection_aliases(pool) -> list[dict]:
     if not aliases:
         logger.warning("No vendor aliases configured in DB - falling back to vendor names")
 
-    # Vendor names and ids are always valid candidates. Explicit
+    # Vendor names are always valid candidates. Explicit
     # vendor_aliases are additive; they are never generated from document text.
     vendors = await db_mod.list_vendors(pool)
     for v in vendors:
@@ -118,16 +118,6 @@ async def _load_detection_aliases(pool) -> list[dict]:
                 "weight": 1,
             }
         )
-        id_pattern = v["id"].replace("_", " ").replace("-", " ")
-        if _normalize_text(id_pattern) != _normalize_text(v["name"]):
-            aliases.append(
-                {
-                    "vendor_id": v["id"],
-                    "vendor_name": v["name"],
-                    "pattern": id_pattern,
-                    "weight": 1,
-                }
-            )
     return aliases
 
 

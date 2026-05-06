@@ -68,7 +68,15 @@ class ExtractorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(max_active, 1)
         self.assertEqual(on_page_done_calls, [1, 2, 3, 4])
         self.assertEqual([pr["_page"] for pr in output["page_results"]], [1, 2, 3, 4])
-        self.assertEqual(output["result"]["line_items"], [{"item": 1}, {"item": 2}, {"item": 3}, {"item": 4}])
+        self.assertEqual(
+            output["result"]["line_items"], 
+            [
+                {"_page": 1, "item": 1}, 
+                {"_page": 2, "item": 2}, 
+                {"_page": 3, "item": 3}, 
+                {"_page": 4, "item": 4}
+            ]
+        )
         self.assertFalse(output["cancelled"])
         self.assertEqual(output["last_completed_page"], 4)
 

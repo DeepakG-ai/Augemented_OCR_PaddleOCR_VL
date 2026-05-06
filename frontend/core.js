@@ -23,6 +23,8 @@ let activeExtractionId = null;
 let activeJobId = null;
 let activeExtractButtonId = 'extractBtn';
 let detectedVendorName = null;
+let activeFormatType = 'single_po_multipage';
+let activePromptInstructions = null;
 
 // ── REVIEW STATE (cross-file: written by extract.js, read by review.js)
 let reviewFieldLocations = {};   // {fieldName: {page, box, matched_text, score, strategy}}
