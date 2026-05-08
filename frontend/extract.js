@@ -665,7 +665,15 @@ async function streamJob(jobId) {
     _activeStreamAbort = controller;
     activeJobId = jobId;
 
-    const response = await fetch(`${API}/jobs/${jobId}/stream`, { signal: controller.signal });
+    const token = localStorage.getItem('auth_token');
+    const headers = token ? { 'Authorization': `Bearer ${token}` } : {};
+    const response = await fetch(`${API}/jobs/${jobId}/stream`, { signal: controller.signal, headers });
+    if (response.status === 401) {
+        localStorage.removeItem('auth_token');
+        localStorage.removeItem('auth_user');
+        window.location.hash = '#/login';
+        throw new Error('HTTP 401: not authenticated');
+    }
     if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
 
     const reader = response.body.getReader();
@@ -839,18 +847,36 @@ function downloadResult() {
     a.download = `extraction_${Date.now()}.json`; a.click();
 }
 
+async function _downloadAuthed(path, fallbackName) {
+    const res = await apiFetch(path);
+    const blob = await res.blob();
+    let filename = fallbackName;
+    const cd = res.headers.get('content-disposition') || '';
+    const m = cd.match(/filename="?([^"]+)"?/i);
+    if (m) filename = m[1];
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+
 function downloadExcel() {
     if (!activeExtractionId) {
         showToast('No active extraction selected.');
         return;
     }
-    // The backend uses Content-Disposition headers for proper filename
-    window.open(`${API}/extractions/${activeExtractionId}/export.xlsx`, '_blank');
+    _downloadAuthed(`/extractions/${activeExtractionId}/export.xlsx`, `extraction_${activeExtractionId}.xlsx`)
+        .catch(err => showToast(`Download failed: ${err.message}`));
 }
 
 function downloadCsv() {
     if (activeExtractionId) {
-        window.open(`${API}/extractions/${activeExtractionId}/export.csv`, '_blank');
+        _downloadAuthed(`/extractions/${activeExtractionId}/export.csv`, `extraction_${activeExtractionId}.csv`)
+            .catch(err => showToast(`Download failed: ${err.message}`));
         return;
     }
 

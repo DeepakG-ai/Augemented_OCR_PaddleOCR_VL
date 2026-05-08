@@ -188,7 +188,10 @@ async function renderReviewPage(app, extractionId) {
         }
         try { _rvPages = await apiJSON(`/extractions/${extractionId}/pages`); } catch (e2) { _rvPages = []; }
     } catch (e) {
-        // API failed — fall back to in-memory state if available
+        // Auth/ownership failure — do not fall back to cached state.
+        // 401: token expired (apiFetch already reloads); 403: wrong tenant.
+        if (e.message && (e.message.includes('401') || e.message.includes('403'))) throw e;
+        // Other API failure — fall back to in-memory state if available
         console.warn('Failed to fetch extraction from API, using in-memory fallback:', e.message);
         _rvVendorId = null;
         const fallbackResult = reviewResult || {};
@@ -223,6 +226,7 @@ async function renderReviewPage(app, extractionId) {
         const ocrResp = await apiJSON(`/extractions/${extractionId}/ocr`);
         _rvOcrData = ocrResp.ocr_pages || [];
     } catch (e) {
+        if (e.message && (e.message.includes('401') || e.message.includes('403'))) throw e;
         console.warn('OCR data not available for click-to-select:', e.message);
     }
 
@@ -231,6 +235,7 @@ async function renderReviewPage(app, extractionId) {
             const corrections = await apiJSON(`/vendors/${encodeURIComponent(_rvVendorId)}/gold-corrections`);
             _rvExistingCorrectionFields = corrections.fields || {};
         } catch (e) {
+            if (e.message && (e.message.includes('401') || e.message.includes('403'))) throw e;
             console.warn('Saved correction metadata not available:', e.message);
             _rvExistingCorrectionFields = {};
         }
@@ -241,6 +246,7 @@ async function renderReviewPage(app, extractionId) {
         const smResp = await apiJSON(`/extractions/${extractionId}/spatial-memory-fields`);
         _rvExistingSpatialFields = smResp.fields || {};
     } catch (e) {
+        if (e.message && (e.message.includes('401') || e.message.includes('403'))) throw e;
         console.warn('Spatial memory fields not available:', e.message);
         _rvExistingSpatialFields = {};
     }

@@ -81,7 +81,7 @@ def _best_window_score(pattern: str, text_blob: str) -> tuple[float, str | None]
     best_score = 0.0
     best_window: str | None = None
     for window in _text_windows(text_blob, len(pattern_words)):
-        score = fuzz.WRatio(pattern, window)
+        score = fuzz.token_sort_ratio(pattern, window)
         if score > best_score:
             best_score = float(score)
             best_window = window
@@ -101,14 +101,14 @@ def _effective_fuzzy_score(pattern: str, window: str, raw_score: float) -> float
     return max(0.0, min(100.0, score))
 
 
-async def _load_detection_aliases(pool) -> list[dict]:
-    aliases = await db_mod.get_all_aliases_for_detection(pool)
+async def _load_detection_aliases(pool, user_id: str | None = None) -> list[dict]:
+    aliases = await db_mod.get_all_aliases_for_detection(pool, user_id=user_id)
     if not aliases:
         logger.warning("No vendor aliases configured in DB - falling back to vendor names")
 
     # Vendor names are always valid candidates. Explicit
     # vendor_aliases are additive; they are never generated from document text.
-    vendors = await db_mod.list_vendors(pool)
+    vendors = await db_mod.list_vendors(pool, user_id=user_id)
     for v in vendors:
         aliases.append(
             {
@@ -234,8 +234,13 @@ def _detect_fuzzy(aliases: list[dict], text_blob: str) -> VendorMatch | None:
 async def detect_vendor(
     pool,
     page_words: list[dict],
+    user_id: str | None = None,
 ) -> VendorMatch | None:
-    """Detect vendor from page-1 words using exact matching, then RapidFuzz."""
+    """Detect vendor from page-1 words using exact matching, then RapidFuzz.
+
+    Pass user_id to restrict matching to vendors owned by that user (tenant isolation).
+    Pass None (admin) to match across all vendors.
+    """
     if not page_words:
         logger.warning("No words provided for vendor detection")
         return None
@@ -245,7 +250,7 @@ async def detect_vendor(
         logger.warning("Empty text blob for vendor detection")
         return None
 
-    aliases = await _load_detection_aliases(pool)
+    aliases = await _load_detection_aliases(pool, user_id=user_id)
     if not aliases:
         logger.warning("No vendors found for detection")
         return None

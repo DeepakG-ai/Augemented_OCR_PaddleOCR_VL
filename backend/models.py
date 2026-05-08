@@ -17,6 +17,42 @@ from pydantic import BaseModel, ConfigDict, Field
 class VendorCreate(BaseModel):
     id: str = Field(..., min_length=1, max_length=64, description="Unique vendor slug")
     name: str = Field(..., min_length=1, max_length=256, description="Display name")
+    user_id: str | None = Field(
+        None,
+        description="Owner user_id — admin-only override; clients always own vendors they create.",
+    )
+
+
+# -- Auth ------------------------------------------------------------------
+
+class LoginRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=256)
+    password: str = Field(..., min_length=1, max_length=256)
+
+
+class UserOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    email: str
+    role: str
+    is_active: bool = True
+    created_at: datetime | None = None
+
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserOut
+
+
+class UserCreate(BaseModel):
+    email: str = Field(..., min_length=3, max_length=256)
+    password: str = Field(..., min_length=8, max_length=256)
+    role: str = Field("client", pattern=r"^(admin|client)$")
+
+
+class UserResetPassword(BaseModel):
+    new_password: str = Field(..., min_length=8, max_length=256)
 
 
 class VendorOut(BaseModel):

@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(grep -nE \"innerHTML.*=.*\\\\\\\\$\\\\\\\\{[a-zA-Z_]+\\(\\\\\\\\.[a-zA-Z_]+\\)*\\\\\\\\}|innerHTML.*\\\\\\\\$\\\\\\\\{r\\\\\\\\.|innerHTML.*\\\\\\\\$\\\\\\\\{e\\\\\\\\.\" qwen_frontend/app.js)"
+      "Bash(grep -nE \"innerHTML.*=.*\\\\\\\\$\\\\\\\\{[a-zA-Z_]+\\(\\\\\\\\.[a-zA-Z_]+\\)*\\\\\\\\}|innerHTML.*\\\\\\\\$\\\\\\\\{r\\\\\\\\.|innerHTML.*\\\\\\\\$\\\\\\\\{e\\\\\\\\.\" qwen_frontend/app.js)",
+      "Bash(.venv/Scripts/python.exe -m pip install \"python-jose[cryptography]==3.3.0\" \"passlib[bcrypt]==1.7.4\")",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/test_auth.py -v)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/ -v)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/test_db_vendor_filtering.py tests/test_auth.py::JwtTokenTests::test_tampered_signature_is_rejected -v)"
     ]
   }
 }

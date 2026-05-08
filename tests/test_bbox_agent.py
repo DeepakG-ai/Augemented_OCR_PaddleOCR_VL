@@ -24,11 +24,12 @@ def _b64(data: bytes = b"fake-image") -> str:
     return base64.b64encode(data).decode("ascii")
 
 
-def _make_response(boxes: dict) -> MagicMock:
+def _make_response(boxes: dict, usage: dict | None = None) -> MagicMock:
     resp = MagicMock()
     resp.raise_for_status = MagicMock()
     resp.json.return_value = {
-        "choices": [{"message": {"content": json.dumps({"boxes": boxes})}}]
+        "choices": [{"message": {"content": json.dumps({"boxes": boxes})}}],
+        "usage": usage or {},
     }
     return resp
 
@@ -63,6 +64,47 @@ class BboxAgentParsingTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(box["y0"], 0.2,  places=5)
         self.assertAlmostEqual(box["x1"], 0.4,  places=5)
         self.assertAlmostEqual(box["y1"], 0.26, places=5)
+
+    async def test_records_llm_usage_when_pool_provided(self):
+        mock_resp = _make_response(
+            {"supplier": [100, 200, 400, 260]},
+            usage={"prompt_tokens": 1200, "completion_tokens": 80, "total_tokens": 1280},
+        )
+        pool = object()
+        with patch("backend.bbox_agent.httpx.AsyncClient") as MockClient, \
+             patch.object(bbox_agent.db_mod, "record_llm_usage", new=AsyncMock(return_value={"id": 1})) as mock_record:
+            MockClient.return_value.__aenter__ = AsyncMock(return_value=MockClient.return_value)
+            MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value.post = AsyncMock(return_value=mock_resp)
+            result = await bbox_agent.learn_layout_for_vendor(
+                page1_image_b64=_b64(),
+                page1_width=800,
+                page1_height=1024,
+                header_field_keys=["supplier"],
+                line_item_column_keys=[],
+                llm_url="http://localhost:8001/v1/chat/completions",
+                model="qwen3vl",
+                pipeline_context={
+                    "document_id": 42,
+                    "extraction_id": 99,
+                    "vendor_id": "ROBERT_SCOTT",
+                    "job_id": 7,
+                },
+                pool=pool,
+            )
+
+        self.assertIn("supplier", result)
+        mock_record.assert_awaited_once()
+        args, kwargs = mock_record.await_args
+        self.assertIs(args[0], pool)
+        self.assertEqual(kwargs["doc_id"], 42)
+        self.assertEqual(kwargs["extraction_id"], 99)
+        self.assertEqual(kwargs["vendor_id"], "ROBERT_SCOTT")
+        self.assertEqual(kwargs["page_num"], 1)
+        self.assertEqual(kwargs["call_type"], "bbox_agent")
+        self.assertEqual(kwargs["prompt_tokens"], 1200)
+        self.assertEqual(kwargs["completion_tokens"], 80)
+        self.assertEqual(kwargs["total_tokens"], 1280)
 
     async def test_field_type_header_vs_line_item(self):
         result = await self._call(

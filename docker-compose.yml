@@ -47,6 +47,9 @@ services:
       MINIO_SECRET_KEY: minioadmin
       MINIO_SECURE: "false"
       PHOENIX_COLLECTOR_ENDPOINT: http://phoenix:4317
+      SECRET_KEY: ${SECRET_KEY}
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
     depends_on:
       postgres:
         condition: service_healthy

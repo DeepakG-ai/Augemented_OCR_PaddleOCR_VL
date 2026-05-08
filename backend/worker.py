@@ -634,6 +634,7 @@ async def _process_llm(pool, job: dict) -> None:
                         llm_url=LLM_URL,
                         model=LLM_MODEL,
                         pipeline_context=base,
+                        pool=pool,
                     )
                     bbox_trace["output"] = {
                         "fields_learned": list((learned or {}).keys()),
@@ -711,6 +712,7 @@ async def _process_llm(pool, job: dict) -> None:
                 start_from_page=job.get("payload", {}).get("start_from_page", 1),
                 existing_page_results=job.get("payload", {}).get("existing_page_results"),
                 pipeline_context=base,
+                pool=pool,
             )
             _result = output.get("result")
             log_ctx["page_results"] = len(output.get("page_results") or [])

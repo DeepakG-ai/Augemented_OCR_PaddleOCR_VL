@@ -28,6 +28,15 @@ async def create_pool() -> asyncpg.Pool:
 # -- Schema bootstrap ------------------------------------------------------
 
 _SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email       TEXT UNIQUE NOT NULL,
+    hashed_pw   TEXT NOT NULL,
+    role        TEXT NOT NULL DEFAULT 'client',
+    is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS vendors (
     id           TEXT PRIMARY KEY,
     name         TEXT NOT NULL,
@@ -164,6 +173,24 @@ CREATE TABLE IF NOT EXISTS integration_deliveries (
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id                SERIAL PRIMARY KEY,
+    ts                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    request_id        TEXT,
+    doc_id            TEXT,
+    extraction_id     INT REFERENCES extractions(id) ON DELETE SET NULL,
+    vendor_id         TEXT REFERENCES vendors(id) ON DELETE SET NULL,
+    page_num          INTEGER,
+    total_pages       INTEGER,
+    call_type         TEXT,
+    model             TEXT,
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens      INTEGER NOT NULL DEFAULT 0,
+    duration_ms       REAL,
+    llm_url           TEXT
+);
 """
 
 
@@ -230,6 +257,44 @@ async def init(pool: asyncpg.Pool) -> None:
             
             CREATE UNIQUE INDEX IF NOT EXISTS integration_deliveries_unique_target_idx
             ON integration_deliveries (extraction_id, contract_type, target_type);
+
+            CREATE INDEX IF NOT EXISTS llm_usage_doc_ts_idx
+            ON llm_usage (doc_id, ts DESC);
+
+            CREATE INDEX IF NOT EXISTS llm_usage_vendor_ts_idx
+            ON llm_usage (vendor_id, ts DESC);
+        """)
+        # Auth migration: add user_id column to vendors for per-client isolation
+        await conn.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='vendors' AND column_name='user_id'
+                ) THEN
+                    ALTER TABLE vendors ADD COLUMN user_id UUID REFERENCES users(id) ON DELETE SET NULL;
+                END IF;
+            END $$;
+            CREATE INDEX IF NOT EXISTS vendors_user_id_idx ON vendors (user_id);
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.table_constraints
+                    WHERE table_name='users' AND constraint_name='users_role_check'
+                ) THEN
+                    ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('admin', 'client'));
+                END IF;
+            END $$;
+        """)
+        # Migration: add extraction_id to llm_usage if the table predates this column.
+        await conn.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'llm_usage' AND column_name = 'extraction_id'
+                ) THEN
+                    ALTER TABLE llm_usage ADD COLUMN extraction_id INT
+                        REFERENCES extractions(id) ON DELETE SET NULL;
+                END IF;
+            END $$;
         """)
         # Vendor aliases (Phase 2) + spatial memory (Phase 3) — idempotent creation.
         await conn.execute("""
@@ -378,6 +443,370 @@ def _record(row: asyncpg.Record | None, *json_keys: str) -> dict | None:
     return d
 
 
+# -- LLM usage queries -----------------------------------------------------
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def record_llm_usage(
+    pool: asyncpg.Pool,
+    *,
+    doc_id: str | int | None = None,
+    document_id: str | int | None = None,
+    extraction_id: int | None = None,
+    vendor_id: str | None = None,
+    page_num: int | None = None,
+    total_pages: int | None = None,
+    call_type: str = "unknown",
+    model: str = "unknown",
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    total_tokens: int = 0,
+    duration_ms: float | None = None,
+    llm_url: str = "",
+    request_id: str | None = None,
+) -> dict:
+    """Persist one LLM call's usage counters.
+
+    llama.cpp returns usage in the OpenAI-compatible response body. This
+    helper stores those reported counters as-is, with a computed total only
+    when the server omits total_tokens.
+    """
+    prompt_tokens = _int_or_zero(prompt_tokens)
+    completion_tokens = _int_or_zero(completion_tokens)
+    total_tokens = _int_or_zero(total_tokens) or (prompt_tokens + completion_tokens)
+    extraction_id = _int_or_none(extraction_id)
+    page_num = _int_or_none(page_num)
+    total_pages = _int_or_none(total_pages)
+    resolved_doc_id = doc_id if doc_id is not None else document_id
+    resolved_doc_id_str = str(resolved_doc_id) if resolved_doc_id is not None else None
+    request_id_str = str(request_id) if request_id is not None else None
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO llm_usage
+                (request_id, doc_id, extraction_id, vendor_id, page_num, total_pages,
+                 call_type, model, prompt_tokens, completion_tokens, total_tokens,
+                 duration_ms, llm_url)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            RETURNING id, ts, request_id, doc_id, extraction_id, vendor_id,
+                      page_num, total_pages, call_type, model, prompt_tokens,
+                      completion_tokens, total_tokens, duration_ms, llm_url
+            """,
+            request_id_str,
+            resolved_doc_id_str,
+            extraction_id,
+            vendor_id,
+            page_num,
+            total_pages,
+            call_type,
+            model,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            duration_ms,
+            llm_url,
+        )
+        return dict(row)
+
+
+async def get_llm_usage_document_summary(
+    pool: asyncpg.Pool,
+    *,
+    limit: int = 50,
+    vendor_id: str | None = None,
+) -> list[dict]:
+    """Return token totals grouped per document for manager reporting."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                COALESCE(doc_id, extraction_id::TEXT, 'unknown') AS doc_id,
+                vendor_id,
+                SUM(prompt_tokens)::BIGINT AS total_input_tokens,
+                SUM(completion_tokens)::BIGINT AS total_output_tokens,
+                SUM(total_tokens)::BIGINT AS grand_total,
+                COUNT(*)::INT AS llm_calls,
+                ROUND(AVG(duration_ms))::INT AS avg_call_ms,
+                MIN(ts) AS first_seen_at,
+                MAX(ts) AS last_seen_at
+            FROM llm_usage
+            WHERE ($1::TEXT IS NULL OR vendor_id = $1)
+            GROUP BY COALESCE(doc_id, extraction_id::TEXT, 'unknown'), vendor_id
+            ORDER BY MAX(ts) DESC
+            LIMIT $2
+            """,
+            vendor_id,
+            max(1, min(limit, 500)),
+        )
+        return [dict(r) for r in rows]
+
+
+async def get_llm_usage_daily_summary(
+    pool: asyncpg.Pool,
+    *,
+    limit: int = 30,
+    vendor_id: str | None = None,
+    user_id: str | None = None,
+    date_from: Any = None,
+    date_to: Any = None,
+) -> list[dict]:
+    """Return token totals grouped by day, optionally scoped to one vendor or user."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                DATE(lu.ts) AS day,
+                SUM(lu.prompt_tokens)::BIGINT AS input_tokens,
+                SUM(lu.completion_tokens)::BIGINT AS output_tokens,
+                SUM(lu.total_tokens)::BIGINT AS total_tokens,
+                COUNT(DISTINCT COALESCE(lu.doc_id, lu.extraction_id::TEXT, 'unknown'))::INT AS docs_processed,
+                COUNT(*)::INT AS llm_calls,
+                ROUND(AVG(lu.duration_ms))::INT AS avg_call_ms
+            FROM llm_usage lu
+            LEFT JOIN vendors v ON v.id = lu.vendor_id
+            WHERE ($1::TEXT IS NULL OR lu.vendor_id = $1)
+              AND ($2::UUID IS NULL OR v.user_id = $2)
+              AND ($4::TIMESTAMPTZ IS NULL OR lu.ts >= $4)
+              AND ($5::TIMESTAMPTZ IS NULL OR lu.ts < $5)
+            GROUP BY DATE(lu.ts)
+            ORDER BY day DESC
+            LIMIT $3
+            """,
+            vendor_id,
+            user_id,
+            max(1, min(limit, 366)),
+            date_from,
+            date_to,
+        )
+        return [dict(r) for r in rows]
+
+
+async def get_client_daily_summary(
+    pool: asyncpg.Pool,
+    user_id: str,
+    *,
+    limit: int = 30,
+    date_from: Any = None,
+    date_to: Any = None,
+) -> list[dict]:
+    """Return daily LLM usage for one client user's vendors."""
+    return await get_llm_usage_daily_summary(
+        pool,
+        limit=limit,
+        user_id=user_id,
+        date_from=date_from,
+        date_to=date_to,
+    )
+
+
+async def get_usage_by_client(pool: asyncpg.Pool) -> list[dict]:
+    """Return token/page usage aggregated per user for the admin client-breakdown view."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            WITH extraction_totals AS (
+                SELECT
+                    v.user_id,
+                    COUNT(e.id) FILTER (WHERE e.status = 'done')::INT AS total_extractions,
+                    COALESCE(SUM(e.total_pages) FILTER (WHERE e.status = 'done'), 0)::BIGINT AS total_pages
+                FROM vendors v
+                LEFT JOIN extractions e ON e.vendor_id = v.id
+                GROUP BY v.user_id
+            ),
+            usage_totals AS (
+                SELECT
+                    v.user_id,
+                    COALESCE(SUM(lu.prompt_tokens), 0)::BIGINT AS total_input_tokens,
+                    COALESCE(SUM(lu.completion_tokens), 0)::BIGINT AS total_output_tokens,
+                    COALESCE(SUM(lu.total_tokens), 0)::BIGINT AS grand_total,
+                    COUNT(lu.id)::INT AS total_llm_calls
+                FROM vendors v
+                LEFT JOIN llm_usage lu ON lu.vendor_id = v.id
+                GROUP BY v.user_id
+            )
+            SELECT
+                u.id::TEXT AS user_id,
+                u.email,
+                u.role,
+                u.is_active,
+                COALESCE(et.total_extractions, 0)::INT AS total_extractions,
+                COALESCE(et.total_pages, 0)::BIGINT AS total_pages,
+                COALESCE(ut.total_input_tokens, 0)::BIGINT AS total_input_tokens,
+                COALESCE(ut.total_output_tokens, 0)::BIGINT AS total_output_tokens,
+                COALESCE(ut.grand_total, 0)::BIGINT AS grand_total,
+                COALESCE(ut.total_llm_calls, 0)::INT AS total_llm_calls
+            FROM users u
+            LEFT JOIN extraction_totals et ON et.user_id = u.id
+            LEFT JOIN usage_totals ut ON ut.user_id = u.id
+            ORDER BY grand_total DESC
+            """
+        )
+        return [dict(r) for r in rows]
+
+
+async def get_client_document_usage(
+    pool: asyncpg.Pool,
+    user_id: str,
+    limit: int = 50,
+    date_from: Any = None,
+    date_to: Any = None,
+) -> list[dict]:
+    """Return per-document token usage for a specific client user (admin only)."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                e.id AS extraction_id,
+                e.filename,
+                v.id AS vendor_id,
+                v.name AS vendor_name,
+                e.total_pages,
+                e.status,
+                e.created_at,
+                COALESCE(SUM(lu.prompt_tokens), 0)::BIGINT AS total_input_tokens,
+                COALESCE(SUM(lu.completion_tokens), 0)::BIGINT AS total_output_tokens,
+                COALESCE(SUM(lu.total_tokens), 0)::BIGINT AS grand_total,
+                COUNT(lu.id)::INT AS llm_calls,
+                COUNT(DISTINCT lu.page_num) FILTER (
+                    WHERE lu.call_type = 'extraction' AND lu.page_num IS NOT NULL
+                )::INT AS billable_pages,
+                COALESCE(SUM(lu.duration_ms), 0)::REAL AS total_latency_ms
+            FROM extractions e
+            JOIN vendors v ON v.id = e.vendor_id AND v.user_id = $1::UUID
+            LEFT JOIN llm_usage lu ON lu.extraction_id = e.id
+            WHERE ($3::TIMESTAMPTZ IS NULL OR e.created_at >= $3)
+              AND ($4::TIMESTAMPTZ IS NULL OR e.created_at < $4)
+            GROUP BY e.id, e.filename, v.id, v.name, e.total_pages, e.status, e.created_at
+            ORDER BY e.created_at DESC
+            LIMIT $2
+            """,
+            user_id,
+            max(1, min(limit, 500)),
+            date_from,
+            date_to,
+        )
+        return [dict(r) for r in rows]
+
+
+async def get_extraction_page_usage(pool: asyncpg.Pool, extraction_id: int) -> list[dict]:
+    """Return per-page token breakdown for a single extraction (admin drill-down)."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                page_num,
+                call_type,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                duration_ms,
+                ts
+            FROM llm_usage
+            WHERE extraction_id = $1
+            ORDER BY page_num ASC, ts ASC
+            """,
+            extraction_id,
+        )
+        return [dict(r) for r in rows]
+
+
+async def list_llm_usage_calls(
+    pool: asyncpg.Pool,
+    *,
+    limit: int = 100,
+    doc_id: str | None = None,
+    vendor_id: str | None = None,
+) -> list[dict]:
+    """Return recent raw LLM usage rows, one row per model call."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, ts, request_id, doc_id, extraction_id, vendor_id,
+                   page_num, total_pages, call_type, model, prompt_tokens,
+                   completion_tokens, total_tokens, duration_ms, llm_url
+            FROM llm_usage
+            WHERE ($1::TEXT IS NULL OR doc_id = $1)
+              AND ($2::TEXT IS NULL OR vendor_id = $2)
+            ORDER BY ts DESC
+            LIMIT $3
+            """,
+            doc_id,
+            vendor_id,
+            max(1, min(limit, 1000)),
+        )
+        return [dict(r) for r in rows]
+
+
+async def get_usage_stats(
+    pool: asyncpg.Pool,
+    user_id: str | None = None,
+    date_from: Any = None,
+    date_to: Any = None,
+) -> dict:
+    """Return aggregate usage counters for the dashboard, optionally scoped to one user."""
+    async with pool.acquire() as conn:
+        ext_row = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*)::INT AS total_pdfs,
+                COUNT(*) FILTER (WHERE e.status = 'done')::INT AS total_extractions,
+                COALESCE(SUM(e.total_pages), 0)::BIGINT AS all_pages,
+                COALESCE(SUM(e.total_pages) FILTER (WHERE e.status = 'done'), 0)::BIGINT AS total_pages
+            FROM extractions e
+            LEFT JOIN vendors v ON v.id = e.vendor_id
+            WHERE ($1::UUID IS NULL OR v.user_id = $1)
+              AND ($2::TIMESTAMPTZ IS NULL OR e.created_at >= $2)
+              AND ($3::TIMESTAMPTZ IS NULL OR e.created_at < $3)
+            """,
+            user_id,
+            date_from,
+            date_to,
+        )
+        llm_row = await conn.fetchrow(
+            """
+            SELECT
+                COALESCE(SUM(lu.prompt_tokens), 0)::BIGINT     AS total_input_tokens,
+                COALESCE(SUM(lu.completion_tokens), 0)::BIGINT AS total_output_tokens,
+                COALESCE(SUM(lu.total_tokens), 0)::BIGINT      AS grand_total,
+                COUNT(lu.id)::INT                               AS total_llm_calls,
+                COUNT(DISTINCT (lu.extraction_id, lu.page_num)) FILTER (
+                    WHERE lu.call_type = 'extraction'
+                      AND lu.extraction_id IS NOT NULL
+                      AND lu.page_num IS NOT NULL
+                )::INT AS billable_pages
+            FROM llm_usage lu
+            LEFT JOIN vendors v ON v.id = lu.vendor_id
+            WHERE ($1::UUID IS NULL OR v.user_id = $1)
+              AND ($2::TIMESTAMPTZ IS NULL OR lu.ts >= $2)
+              AND ($3::TIMESTAMPTZ IS NULL OR lu.ts < $3)
+            """,
+            user_id,
+            date_from,
+            date_to,
+        )
+    stats = {**dict(ext_row), **dict(llm_row)}
+    stats["failed_pages"] = max(
+        int(stats.get("all_pages") or 0) - int(stats.get("billable_pages") or 0),
+        0,
+    )
+    return stats
+
+
 # -- Vendor queries --------------------------------------------------------
 
 async def get_vendor(pool: asyncpg.Pool, vendor_id: str) -> dict | None:
@@ -388,25 +817,126 @@ async def get_vendor(pool: asyncpg.Pool, vendor_id: str) -> dict | None:
         return dict(row) if row else None
 
 
-async def list_vendors(pool: asyncpg.Pool) -> list[dict]:
+async def list_vendors(pool: asyncpg.Pool, user_id: str | None = None) -> list[dict]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, name, status, created_at FROM vendors ORDER BY created_at DESC"
+            """
+            SELECT id, name, status, user_id, created_at FROM vendors
+            WHERE ($1::UUID IS NULL OR user_id = $1)
+            ORDER BY created_at DESC
+            """,
+            user_id,
         )
         return [dict(r) for r in rows]
 
 
-async def upsert_vendor(pool: asyncpg.Pool, vendor_id: str, name: str) -> dict:
+async def upsert_vendor(
+    pool: asyncpg.Pool,
+    vendor_id: str,
+    name: str,
+    user_id: str | None = None,
+) -> dict:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            INSERT INTO vendors (id, name) VALUES ($1, $2)
+            INSERT INTO vendors (id, name, user_id) VALUES ($1, $2, $3)
             ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name
-            RETURNING id, name, status, created_at
+            RETURNING id, name, status, user_id, created_at
             """,
-            vendor_id, name,
+            vendor_id, name, user_id,
         )
         return dict(row)
+
+
+async def get_vendor_owner(pool: asyncpg.Pool, vendor_id: str) -> str | None:
+    """Return the user_id that owns this vendor, or None if vendor missing/unowned."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT user_id FROM vendors WHERE id = $1", vendor_id,
+        )
+        if not row or row["user_id"] is None:
+            return None
+        return str(row["user_id"])
+
+
+async def get_alias_vendor_id(pool: asyncpg.Pool, alias_id: int) -> str | None:
+    """Return the vendor_id that owns this alias row, or None if alias missing."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT vendor_id FROM vendor_aliases WHERE id = $1", alias_id,
+        )
+        return row["vendor_id"] if row else None
+
+
+# -- User queries ----------------------------------------------------------
+
+async def create_user(
+    pool: asyncpg.Pool,
+    email: str,
+    hashed_pw: str,
+    role: str = "client",
+) -> dict:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO users (email, hashed_pw, role)
+            VALUES ($1, $2, $3)
+            RETURNING id, email, role, is_active, created_at
+            """,
+            email.lower().strip(), hashed_pw, role,
+        )
+        return dict(row)
+
+
+async def get_user_by_email(pool: asyncpg.Pool, email: str) -> dict | None:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, email, hashed_pw, role, is_active, created_at
+            FROM users WHERE email = $1
+            """,
+            email.lower().strip(),
+        )
+        return dict(row) if row else None
+
+
+async def get_user_by_id(pool: asyncpg.Pool, user_id: str) -> dict | None:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, email, role, is_active, created_at
+            FROM users WHERE id = $1
+            """,
+            user_id,
+        )
+        return dict(row) if row else None
+
+
+async def list_users(pool: asyncpg.Pool) -> list[dict]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, email, role, is_active, created_at
+            FROM users ORDER BY created_at DESC
+            """
+        )
+        return [dict(r) for r in rows]
+
+
+async def deactivate_user(pool: asyncpg.Pool, user_id: str) -> bool:
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE users SET is_active = FALSE WHERE id = $1", user_id,
+        )
+        return result.endswith(" 1")
+
+
+async def reset_user_password(pool: asyncpg.Pool, user_id: str, hashed_pw: str) -> bool:
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE users SET hashed_pw = $1 WHERE id = $2", hashed_pw, user_id,
+        )
+        return result.endswith(" 1")
 
 
 async def delete_vendor(pool: asyncpg.Pool, vendor_id: str) -> bool:
@@ -476,8 +1006,10 @@ async def delete_vendor_alias(pool: asyncpg.Pool, alias_id: int) -> bool:
         return result == "DELETE 1"
 
 
-async def get_all_aliases_for_detection(pool: asyncpg.Pool) -> list[dict]:
-    """Load all active vendor aliases with vendor name for detection scoring."""
+async def get_all_aliases_for_detection(
+    pool: asyncpg.Pool, user_id: str | None = None
+) -> list[dict]:
+    """Load vendor aliases for detection, optionally scoped to a single user's vendors."""
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -485,8 +1017,10 @@ async def get_all_aliases_for_detection(pool: asyncpg.Pool) -> list[dict]:
             FROM vendor_aliases va
             JOIN vendors v ON v.id = va.vendor_id
             WHERE va.vendor_id <> '_auto'
+              AND ($1::UUID IS NULL OR v.user_id = $1)
             ORDER BY va.vendor_id, va.weight DESC
-            """
+            """,
+            user_id,
         )
         return [dict(r) for r in rows]
 
@@ -719,7 +1253,7 @@ async def upsert_template(
         return d
 
 
-async def list_all_templates(pool: asyncpg.Pool) -> list[dict]:
+async def list_all_templates(pool: asyncpg.Pool, user_id: str | None = None) -> list[dict]:
     """Return all templates joined with vendor name for the saved-templates page."""
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -729,8 +1263,10 @@ async def list_all_templates(pool: asyncpg.Pool) -> list[dict]:
                    t.extraction_rules, t.prompt_hash, t.created_at, t.updated_at
             FROM templates t
             JOIN vendors v ON v.id = t.vendor_id
+            WHERE ($1::UUID IS NULL OR v.user_id = $1)
             ORDER BY t.updated_at DESC
-            """
+            """,
+            user_id,
         )
         results = []
         for r in rows:
@@ -904,7 +1440,11 @@ async def list_extractions(pool: asyncpg.Pool, vendor_id: str, limit: int = 20) 
         return results
 
 
-async def list_all_extractions(pool: asyncpg.Pool, limit: int = 50) -> list[dict]:
+async def list_all_extractions(
+    pool: asyncpg.Pool,
+    limit: int = 50,
+    user_id: str | None = None,
+) -> list[dict]:
     """Global extraction history with vendor_name joined."""
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -912,9 +1452,10 @@ async def list_all_extractions(pool: asyncpg.Pool, limit: int = 50) -> list[dict
             SELECT {_EXTRACTION_COLS}
             FROM extractions e
             LEFT JOIN vendors v ON v.id = e.vendor_id
+            WHERE ($2::UUID IS NULL OR v.user_id = $2)
             ORDER BY e.created_at DESC LIMIT $1
             """,
-            limit,
+            limit, user_id,
         )
         results = []
         for r in rows:
@@ -925,9 +1466,16 @@ async def list_all_extractions(pool: asyncpg.Pool, limit: int = 50) -> list[dict
         return results
 
 
-async def count_all_extractions(pool: asyncpg.Pool) -> int:
+async def count_all_extractions(pool: asyncpg.Pool, user_id: str | None = None) -> int:
     async with pool.acquire() as conn:
-        return await conn.fetchval("SELECT COUNT(*) FROM extractions")
+        return await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM extractions e
+            LEFT JOIN vendors v ON v.id = e.vendor_id
+            WHERE ($1::UUID IS NULL OR v.user_id = $1)
+            """,
+            user_id,
+        )
 
 
 async def get_extraction(pool: asyncpg.Pool, extraction_id: int) -> dict | None:

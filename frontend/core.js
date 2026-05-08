@@ -55,7 +55,21 @@ if (localStorage.getItem('theme') === 'light') {
 
 // ── API HELPERS ────────────────────────────────────────────────────────
 async function apiFetch(path, opts = {}) {
+    const token = localStorage.getItem('auth_token');
+    if (token) {
+        opts.headers = { ...(opts.headers || {}), 'Authorization': `Bearer ${token}` };
+    }
     const res = await fetch(`${API}${path}`, opts);
+    if (res.status === 401) {
+        // Token missing/expired — clear all state and force a full reload so
+        // in-memory JS variables (loadedFile, activeExtractionId, reviewResult…)
+        // don't survive the redirect.
+        localStorage.removeItem('auth_token');
+        localStorage.removeItem('auth_user');
+        window.location.replace(window.location.pathname + '#/login');
+        window.location.reload();
+        throw new Error('HTTP 401: not authenticated');
+    }
     if (!res.ok) { const b = await res.text(); throw new Error(`HTTP ${res.status}: ${b}`); }
     return res;
 }
@@ -125,6 +139,17 @@ async function router() {
     const route = getRoute();
     const app = document.getElementById('appRoot');
 
+    // Auth guard — anything other than /login requires a token
+    const token = localStorage.getItem('auth_token');
+    if (!token && route !== '/login') {
+        window.location.hash = '#/login';
+        return;
+    }
+    if (token && route === '/login') {
+        window.location.hash = '#/vendors';
+        return;
+    }
+
     // Clean up review SVG overlay when leaving the review page
     if (!route.startsWith('/review/')) {
         const svg = document.getElementById('rvMappingSvg');
@@ -144,6 +169,14 @@ async function router() {
         if (t.dataset.route && route.startsWith(t.dataset.route)) t.classList.add('active');
     });
 
+    if (route === '/login') {
+        await renderLoginPage(app);
+        return;
+    }
+    // Clear the previous page content synchronously so it disappears immediately
+    // on navigation, before async data fetches run. Without this, the old page
+    // stays visible for the duration of the first API call (~100ms).
+    app.innerHTML = headerHTML();
     if (route === '/' || route === '/vendors') {
         app.className = 'app';
         await renderVendorsPage(app);
@@ -160,6 +193,16 @@ async function router() {
     } else if (route === '/history') {
         app.className = 'app';
         await renderHistoryPage(app);
+    } else if (route === '/dashboard') {
+        app.className = 'app';
+        await renderDashboardPage(app);
+    } else if (route.startsWith('/admin/client/')) {
+        app.className = 'app';
+        const userId = decodeURIComponent(route.split('/admin/client/')[1] || '');
+        await renderClientDashboardPage(app, userId);
+    } else if (route === '/admin/users') {
+        app.className = 'app';
+        await renderAdminUsersPage(app);
     } else if (route === '/review') {
         // Bare /review (no ID) — redirect to last extraction's review
         if (reviewExtractionId) {
@@ -198,6 +241,16 @@ window.addEventListener('hashchange', router);
 // ── HEADER HTML ────────────────────────────────────────────────────────
 function headerHTML() {
     const themeLabel = localStorage.getItem('theme') === 'light' ? 'DARK' : 'LIGHT';
+    let user = null;
+    try { user = JSON.parse(localStorage.getItem('auth_user') || 'null'); } catch (e) { user = null; }
+    const userBlock = user ? `
+            <div style="display:flex;align-items:center;gap:8px;padding-left:10px;border-left:1px solid var(--border)">
+                <span style="font-size:10px;color:var(--text-dim);letter-spacing:0.08em" title="${escapeHtml(user.email || '')}">
+                    ${escapeHtml(user.email || '')}${user.role === 'admin' ? ' · ADMIN' : ''}
+                </span>
+                <button class="theme-toggle-btn" onclick="logout()">Logout</button>
+            </div>` : '';
+    const isAdmin = user && user.role === 'admin';
     return `
     <header class="header">
         <div class="logo" onclick="navigate('#/')">Augmented <span>OCR</span></div>
@@ -207,6 +260,8 @@ function headerHTML() {
             <a class="nav-tab" data-route="/extract" href="#/extract">Extraction</a>
             <a class="nav-tab" data-route="/history" href="#/history">History</a>
             <a class="nav-tab" data-route="/review" href="#/review">Review</a>
+            <a class="nav-tab" data-route="/dashboard" href="#/dashboard">Dashboard</a>
+            ${isAdmin ? `<a class="nav-tab" data-route="/admin/users" href="#/admin/users" style="color:var(--blue)">Users</a>` : ''}
         </nav>
         <div class="header-right">
             <button class="theme-toggle-btn" id="themeToggleBtn" onclick="toggleTheme()">${themeLabel}</button>
@@ -214,6 +269,7 @@ function headerHTML() {
                 <div class="status-dot" id="hdrDot"></div>
                 <span class="status-label" id="hdrStatus">System Status: <span>OPTIMAL</span></span>
             </div>
+            ${userBlock}
         </div>
     </header>`;
 }
@@ -225,12 +281,16 @@ function updateNavActive() {
         t.classList.remove('active');
         const r = t.dataset.route;
         if (r === '/vendors' && (route === '/' || route === '/vendors')) t.classList.add('active');
+        else if (r === '/dashboard' && route.startsWith('/admin/client/')) t.classList.add('active');
         else if (r && route.startsWith(r)) t.classList.add('active');
     });
 }
 
 // ── INIT ───────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
-    if (!window.location.hash) window.location.hash = '#/vendors';
+    if (!window.location.hash) {
+        const token = localStorage.getItem('auth_token');
+        window.location.hash = token ? '#/vendors' : '#/login';
+    }
     router();
 });

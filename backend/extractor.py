@@ -323,12 +323,20 @@ _JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?", re.MULTILINE)
 _FENCE_END_RE = re.compile(r"\n?```\s*$", re.MULTILINE)
 
 
+def _usage_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 async def call_llm(
     image_b64: str, system_prompt: str, user_message: str,
     llm_url: str, model: str, mime_type: str = "image/jpeg",
     page_num: int = 0, total_pages: int = 0,
     pipeline_context: dict | None = None,
     cancel_event: asyncio.Event | None = None,
+    pool: Any | None = None,
 ) -> dict:
     """POST to LLM, strip markdown fences, return parsed JSON dict.
 
@@ -388,19 +396,48 @@ async def call_llm(
 
         resp_json = resp.json()
         trace_ctx["response"] = resp_json["choices"][0]["message"]["content"]
-        trace_ctx["usage"] = resp_json.get("usage", {})
+        usage = resp_json.get("usage") or {}
+        prompt_tokens = _usage_int(usage.get("prompt_tokens"))
+        completion_tokens = _usage_int(usage.get("completion_tokens"))
+        total_tokens = _usage_int(usage.get("total_tokens")) or (prompt_tokens + completion_tokens)
+        duration_ms = (time.perf_counter() - start) * 1000
+        trace_ctx["usage"] = usage
         if pipeline_context is not None:
             plog.event(
                 "qwen_http_completed",
                 stage="llm",
-                duration_ms=(time.perf_counter() - start) * 1000,
+                duration_ms=duration_ms,
                 page=page_num,
                 total_pages=total_pages,
                 model=model,
-                usage=resp_json.get("usage", {}),
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                usage=usage,
                 response_chars=len(trace_ctx["response"]),
                 **pipeline_context,
             )
+        if pool is not None:
+            context = pipeline_context or {}
+            try:
+                await db_mod.record_llm_usage(
+                    pool,
+                    doc_id=context.get("doc_id") or context.get("document_id"),
+                    extraction_id=context.get("extraction_id"),
+                    vendor_id=context.get("vendor_id"),
+                    page_num=page_num,
+                    total_pages=total_pages,
+                    call_type="extraction",
+                    model=model,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                    duration_ms=duration_ms,
+                    llm_url=llm_url,
+                    request_id=context.get("request_id") or context.get("job_id"),
+                )
+            except Exception as exc:
+                logger.warning("Failed to record LLM usage for extraction page %s: %s", page_num, exc)
 
     raw: str = resp_json["choices"][0]["message"]["content"].strip()
     raw = _JSON_FENCE_RE.sub("", raw)
@@ -474,6 +511,7 @@ async def extract_document(
     start_from_page: int = 1,
     existing_page_results: list[dict] | None = None,
     pipeline_context: dict | None = None,
+    pool: Any | None = None,
 ) -> dict:
     """
     Process pages in parallel batches of 2 (matches --parallel 2 on llama-server).
@@ -534,6 +572,7 @@ async def extract_document(
                     page_num=page_num, total_pages=total,
                     pipeline_context=pipeline_context,
                     cancel_event=cancel_event,
+                    pool=pool,
                 )
                 result["_page"] = page_num
                 result["_total_pages"] = total

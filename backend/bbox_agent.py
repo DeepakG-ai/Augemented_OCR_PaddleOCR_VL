@@ -14,15 +14,18 @@ import json
 import logging
 import re
 import time
+from typing import Any
 
 import httpx
 
 if __package__:
     from .config import LLM_TEMPERATURE, LLM_TOP_P, LLM_MAX_TOKENS_BBOX
+    from . import db as db_mod
     from . import logging_config as plog
     from .phoenix_tracing import trace_span, trace_llm_call as _trace_llm
 else:
     from config import LLM_TEMPERATURE, LLM_TOP_P, LLM_MAX_TOKENS_BBOX  # type: ignore[no-redef]
+    import db as db_mod  # type: ignore[no-redef]
     import logging_config as plog  # type: ignore[no-redef]
     from phoenix_tracing import trace_span, trace_llm_call as _trace_llm  # type: ignore[no-redef]
 
@@ -30,6 +33,13 @@ logger = logging.getLogger(__name__)
 
 _JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?", re.MULTILINE)
 _FENCE_END_RE  = re.compile(r"\n?```\s*$", re.MULTILINE)
+
+
+def _usage_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _build_bbox_system_prompt(total_fields: int) -> str:
@@ -100,6 +110,7 @@ async def learn_layout_for_vendor(
     llm_url: str,
     model: str,
     pipeline_context: dict | None = None,
+    pool: Any | None = None,
 ) -> dict[str, dict]:
     """Call Qwen3-VL on page 1 to locate field labels.
 
@@ -164,8 +175,45 @@ async def learn_layout_for_vendor(
                 resp.raise_for_status()
             resp_json = resp.json()
             raw: str = resp_json["choices"][0]["message"]["content"].strip()
+            usage = resp_json.get("usage") or {}
+            prompt_tokens = _usage_int(usage.get("prompt_tokens"))
+            completion_tokens = _usage_int(usage.get("completion_tokens"))
+            total_tokens = _usage_int(usage.get("total_tokens")) or (prompt_tokens + completion_tokens)
+            llm_duration_ms = int((time.perf_counter() - start) * 1000)
             llm_ctx["response"] = raw
-            llm_ctx["usage"] = resp_json.get("usage", {})
+            llm_ctx["usage"] = usage
+            if pipeline_context:
+                plog.event(
+                    "bbox_agent_llm_completed",
+                    stage="llm",
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                    elapsed_ms=llm_duration_ms,
+                    model=model,
+                    **pipeline_context,
+                )
+            if pool is not None:
+                context = pipeline_context or {}
+                try:
+                    await db_mod.record_llm_usage(
+                        pool,
+                        doc_id=context.get("doc_id") or context.get("document_id"),
+                        extraction_id=context.get("extraction_id"),
+                        vendor_id=context.get("vendor_id"),
+                        page_num=1,
+                        total_pages=1,
+                        call_type="bbox_agent",
+                        model=model,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=total_tokens,
+                        duration_ms=llm_duration_ms,
+                        llm_url=llm_url,
+                        request_id=context.get("request_id") or context.get("job_id"),
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to record bbox-agent LLM usage: %s", exc)
         except Exception as exc:
             logger.warning("BBox agent HTTP error for model=%s: %s", model, exc)
             if pipeline_context:

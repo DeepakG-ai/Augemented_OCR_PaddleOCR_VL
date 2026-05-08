@@ -16,12 +16,12 @@ import os
 import time
 import traceback
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import AsyncGenerator
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -38,16 +38,32 @@ try:
     from .contracts import build_purchase_order_contract
     from . import logging_config as plog
     from .logging_config import configure_logging
+    from .auth import (
+        assert_alias_access,
+        assert_extraction_access,
+        assert_job_access,
+        assert_vendor_access,
+        create_access_token,
+        get_current_user,
+        hash_password,
+        require_admin,
+        verify_password,
+    )
     from .models import (
         ExtractionJobStartOut,
         ExtractionOut,
         HealthOut,
         JobOut,
         JobStatusOut,
+        LoginRequest,
         TemplateSaveResponse,
         TemplateCreate,
         TemplateListOut,
         TemplateOut,
+        TokenOut,
+        UserCreate,
+        UserOut,
+        UserResetPassword,
         VendorAliasCreate,
         VendorAliasOut,
         VendorCreate,
@@ -78,16 +94,32 @@ except ImportError:
     from contracts import build_purchase_order_contract
     import logging_config as plog
     from logging_config import configure_logging
+    from auth import (  # type: ignore[no-redef]
+        assert_alias_access,
+        assert_extraction_access,
+        assert_job_access,
+        assert_vendor_access,
+        create_access_token,
+        get_current_user,
+        hash_password,
+        require_admin,
+        verify_password,
+    )
     from models import (
         ExtractionJobStartOut,
         ExtractionOut,
         HealthOut,
         JobOut,
         JobStatusOut,
+        LoginRequest,
         TemplateSaveResponse,
         TemplateCreate,
         TemplateListOut,
         TemplateOut,
+        TokenOut,
+        UserCreate,
+        UserOut,
+        UserResetPassword,
         VendorAliasCreate,
         VendorAliasOut,
         VendorCreate,
@@ -169,12 +201,36 @@ class MaxUploadSizeMiddleware(BaseHTTPMiddleware):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: create DB pool + object store + Phoenix. Shutdown: close pool."""
+    """Startup: create DB pool + object store + Phoenix + bootstrap admin. Shutdown: close pool."""
     logger.info("Starting up -- creating DB pool")
     app.state.pool = await db_mod.create_pool()
     await db_mod.init(app.state.pool)
     app.state.store = get_store()
     setup_phoenix()
+
+    # Bootstrap admin user from env vars on first startup
+    admin_email = (os.getenv("ADMIN_EMAIL") or "").strip()
+    admin_pw = os.getenv("ADMIN_PASSWORD") or ""
+    if admin_email and admin_pw:
+        if admin_pw.startswith("CHANGE_ME"):
+            logger.error(
+                "ADMIN_PASSWORD is set to a placeholder value — bootstrap admin NOT created. "
+                "Set a real password in .env before starting the application."
+            )
+        else:
+            existing = await db_mod.get_user_by_email(app.state.pool, admin_email)
+            if not existing:
+                try:
+                    await db_mod.create_user(
+                        app.state.pool,
+                        admin_email,
+                        hash_password(admin_pw),
+                        role="admin",
+                    )
+                    logger.info("Bootstrap admin user created: %s", admin_email)
+                except Exception as exc:
+                    logger.warning("Failed to bootstrap admin user %s: %s", admin_email, exc)
+
     logger.info("DB pool, object store, and Phoenix ready")
     yield
     logger.info("Shutting down -- closing connections")
@@ -306,7 +362,15 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(MaxUploadSizeMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:3002",
+        "http://localhost:8000",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:3002",
+        "http://127.0.0.1:8000",
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -344,20 +408,152 @@ async def health(request: Request):
     return HealthOut(status="ok", db=db_status)
 
 
+# -- Auth -------------------------------------------------------------------
+
+@app.post("/auth/login", response_model=TokenOut)
+@limiter.limit("20/minute")
+async def login(request: Request, body: LoginRequest):
+    pool = request.app.state.pool
+    user = await db_mod.get_user_by_email(pool, body.email)
+    if not user or not user.get("is_active", True):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not verify_password(body.password, user["hashed_pw"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = create_access_token(str(user["id"]), user["role"], user["email"])
+    return TokenOut(
+        access_token=token,
+        user=UserOut(
+            id=str(user["id"]),
+            email=user["email"],
+            role=user["role"],
+            is_active=user.get("is_active", True),
+            created_at=user.get("created_at"),
+        ),
+    )
+
+
+@app.get("/auth/me", response_model=UserOut)
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def auth_me(request: Request, user: dict = Depends(get_current_user)):
+    pool = request.app.state.pool
+    record = await db_mod.get_user_by_id(pool, user["id"])
+    if not record:
+        raise HTTPException(status_code=404, detail="User not found")
+    return UserOut(
+        id=str(record["id"]),
+        email=record["email"],
+        role=record["role"],
+        is_active=record.get("is_active", True),
+        created_at=record.get("created_at"),
+    )
+
+
+# -- Admin: User Management -------------------------------------------------
+
+@app.get("/admin/users", response_model=list[UserOut])
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_list_users(request: Request, user: dict = Depends(require_admin)):
+    rows = await db_mod.list_users(request.app.state.pool)
+    return [
+        UserOut(
+            id=str(r["id"]),
+            email=r["email"],
+            role=r["role"],
+            is_active=r.get("is_active", True),
+            created_at=r.get("created_at"),
+        )
+        for r in rows
+    ]
+
+
+@app.post("/admin/users", response_model=UserOut, status_code=201)
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_create_user(
+    request: Request,
+    body: UserCreate,
+    user: dict = Depends(require_admin),
+):
+    pool = request.app.state.pool
+    existing = await db_mod.get_user_by_email(pool, body.email)
+    if existing:
+        raise HTTPException(status_code=409, detail="Email already registered")
+    created = await db_mod.create_user(
+        pool, body.email, hash_password(body.password), role=body.role,
+    )
+    return UserOut(
+        id=str(created["id"]),
+        email=created["email"],
+        role=created["role"],
+        is_active=created.get("is_active", True),
+        created_at=created.get("created_at"),
+    )
+
+
+@app.delete("/admin/users/{user_id}")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_deactivate_user(
+    request: Request,
+    user_id: str,
+    user: dict = Depends(require_admin),
+):
+    if user_id == user["id"]:
+        raise HTTPException(status_code=400, detail="Cannot deactivate yourself")
+    ok = await db_mod.deactivate_user(request.app.state.pool, user_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"status": "deactivated", "user_id": user_id}
+
+
+@app.patch("/admin/users/{user_id}/password")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_reset_user_password(
+    request: Request,
+    user_id: str,
+    body: UserResetPassword,
+    user: dict = Depends(require_admin),
+):
+    if user_id == user["id"]:
+        raise HTTPException(status_code=400, detail="Cannot reset your own password via this endpoint")
+    ok = await db_mod.reset_user_password(
+        request.app.state.pool, user_id, hash_password(body.new_password)
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"status": "password_reset", "user_id": user_id}
+
+
 # -- Vendors ----------------------------------------------------------------
 
 @app.get("/vendors", response_model=list[VendorOut])
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def list_vendors(request: Request):
-    rows = await db_mod.list_vendors(request.app.state.pool)
+async def list_vendors(request: Request, user: dict = Depends(get_current_user)):
+    filter_user = None if user["role"] == "admin" else user["id"]
+    rows = await db_mod.list_vendors(request.app.state.pool, user_id=filter_user)
     return [VendorOut(**r) for r in rows]
 
 
 @app.post("/vendors", response_model=VendorOut)
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def create_vendor(request: Request, body: VendorCreate):
+async def create_vendor(request: Request, body: VendorCreate, user: dict = Depends(get_current_user)):
     pool = request.app.state.pool
-    row = await db_mod.upsert_vendor(pool, body.id, body.name)
+
+    # If vendor already exists, the caller must own it (admin bypasses).
+    existing = await db_mod.get_vendor(pool, body.id)
+    if existing:
+        await assert_vendor_access(pool, body.id, user)
+
+    if user["role"] == "admin":
+        owner_id = body.user_id
+        if not owner_id and not existing:
+            raise HTTPException(
+                status_code=400,
+                detail="Admin must specify user_id when creating a new vendor",
+            )
+    else:
+        # Clients always own vendors they create; ignore any user_id in body.
+        owner_id = user["id"]
+
+    row = await db_mod.upsert_vendor(pool, body.id, body.name, user_id=owner_id)
     # Auto-insert vendor name as a detection alias
     try:
         await db_mod.insert_vendor_alias(pool, body.id, body.name.lower(), weight=1, source="auto_from_name")
@@ -372,15 +568,22 @@ async def create_vendor(request: Request, body: VendorCreate):
 
 @app.get("/vendors/{vendor_id}/aliases", response_model=list[VendorAliasOut])
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def list_aliases(request: Request, vendor_id: str):
+async def list_aliases(request: Request, vendor_id: str, user: dict = Depends(get_current_user)):
     pool = request.app.state.pool
+    await assert_vendor_access(pool, vendor_id, user)
     return await db_mod.list_vendor_aliases(pool, vendor_id)
 
 
 @app.post("/vendors/{vendor_id}/aliases", response_model=VendorAliasOut, status_code=201)
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def add_alias(request: Request, vendor_id: str, body: VendorAliasCreate):
+async def add_alias(
+    request: Request,
+    vendor_id: str,
+    body: VendorAliasCreate,
+    user: dict = Depends(get_current_user),
+):
     pool = request.app.state.pool
+    await assert_vendor_access(pool, vendor_id, user)
     row = await db_mod.insert_vendor_alias(pool, vendor_id, body.pattern, body.weight, source="manual")
     if row is None:
         raise HTTPException(409, detail="Alias pattern already exists for this vendor")
@@ -389,8 +592,9 @@ async def add_alias(request: Request, vendor_id: str, body: VendorAliasCreate):
 
 @app.delete("/vendors/aliases/{alias_id}")
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def delete_alias(request: Request, alias_id: int):
+async def delete_alias(request: Request, alias_id: int, user: dict = Depends(get_current_user)):
     pool = request.app.state.pool
+    await assert_alias_access(pool, alias_id, user)
     deleted = await db_mod.delete_vendor_alias(pool, alias_id)
     if not deleted:
         raise HTTPException(404, detail="Alias not found")
@@ -399,8 +603,9 @@ async def delete_alias(request: Request, alias_id: int):
 
 @app.delete("/vendors/{vendor_id}")
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def delete_vendor(request: Request, vendor_id: str):
+async def delete_vendor(request: Request, vendor_id: str, user: dict = Depends(get_current_user)):
     pool = request.app.state.pool
+    await assert_vendor_access(pool, vendor_id, user)
     deleted = await db_mod.delete_vendor(pool, vendor_id)
     if not deleted:
         raise HTTPException(404, detail="Vendor not found")
@@ -411,7 +616,11 @@ async def delete_vendor(request: Request, vendor_id: str):
 
 @app.post("/detect-vendor")
 @limiter.limit("10/minute")
-async def detect_vendor_endpoint(request: Request, file: UploadFile = File(...)):
+async def detect_vendor_endpoint(
+    request: Request,
+    file: UploadFile = File(...),
+    user: dict = Depends(get_current_user),
+):
     """Detect vendor from uploaded PDF/image by analyzing page-1 text.
 
     Renders page 1 only, extracts text via pypdfium2 (digital) or PaddleOCR
@@ -465,7 +674,8 @@ async def detect_vendor_endpoint(request: Request, file: UploadFile = File(...))
         page_words = ocr_pages[0].get("words", []) if ocr_pages else []
         page_source = "paddleocr"
 
-    match = await vendor_detector.detect_vendor(pool, page_words)
+    detect_user_id = None if user.get("role") == "admin" else user["id"]
+    match = await vendor_detector.detect_vendor(pool, page_words, user_id=detect_user_id)
     if match is None:
         raise HTTPException(
             status_code=409,
@@ -478,6 +688,9 @@ async def detect_vendor_endpoint(request: Request, file: UploadFile = File(...))
             },
         )
 
+    # Defense-in-depth: confirm detected vendor belongs to this user
+    await assert_vendor_access(pool, match.vendor_id, user)
+
     return {
         "detected": True,
         "vendor_id": match.vendor_id,
@@ -488,7 +701,8 @@ async def detect_vendor_endpoint(request: Request, file: UploadFile = File(...))
     }
 @app.get("/vendors/{vendor_id}/template", response_model=TemplateOut)
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def get_template(request: Request, vendor_id: str):
+async def get_template(request: Request, vendor_id: str, user: dict = Depends(get_current_user)):
+    await assert_vendor_access(request.app.state.pool, vendor_id, user)
     tmpl_row = await db_mod.get_template(request.app.state.pool, vendor_id)
     if not tmpl_row:
         raise HTTPException(404, detail="No template configured for this vendor")
@@ -511,17 +725,23 @@ async def get_template(request: Request, vendor_id: str):
 
 @app.get("/vendors/{vendor_id}/gold-corrections")
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def get_vendor_gold_corrections(request: Request, vendor_id: str):
+async def get_vendor_gold_corrections(
+    request: Request, vendor_id: str, user: dict = Depends(get_current_user),
+):
     """Return latest saved gold correction per field for UI warnings."""
+    await assert_vendor_access(request.app.state.pool, vendor_id, user)
     fields = await db_mod.get_latest_gold_correction_fields(request.app.state.pool, vendor_id)
     return {"vendor_id": vendor_id, "fields": fields}
 
 
 @app.get("/extractions/{extraction_id}/spatial-memory-fields")
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def get_spatial_memory_fields(request: Request, extraction_id: int):
+async def get_spatial_memory_fields(
+    request: Request, extraction_id: int, user: dict = Depends(get_current_user),
+):
     """Return field keys that have active spatial memory for this extraction's vendor+layout."""
     pool = request.app.state.pool
+    await assert_extraction_access(pool, extraction_id, user)
     extraction = await db_mod.get_extraction(pool, extraction_id)
     if not extraction:
         raise HTTPException(404, detail="Extraction not found")
@@ -544,13 +764,32 @@ async def get_spatial_memory_fields(request: Request, extraction_id: int):
 
 @app.post("/vendors/{vendor_id}/template", response_model=TemplateSaveResponse)
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def save_template(request: Request, vendor_id: str, body: TemplateCreate):
+async def save_template(
+    request: Request,
+    vendor_id: str,
+    body: TemplateCreate,
+    user: dict = Depends(get_current_user),
+):
     pool = request.app.state.pool
+
+    # If vendor exists, the caller must own it; if it doesn't, the client
+    # auto-creates it as their own (admins must create vendors via POST /vendors).
+    existing = await db_mod.get_vendor(pool, vendor_id)
+    if existing:
+        await assert_vendor_access(pool, vendor_id, user)
+        owner_id = None  # preserve existing owner via upsert
+    else:
+        if user["role"] == "admin":
+            raise HTTPException(
+                status_code=400,
+                detail="Admin must create the vendor via POST /vendors before saving a template",
+            )
+        owner_id = user["id"]
 
     # Auto-upsert vendor — frontend may have created vendor locally while offline.
     # Use vendor_name from body if provided, otherwise fall back to vendor_id as name.
     vendor_name = (body.vendor_name or vendor_id).upper()
-    await db_mod.upsert_vendor(pool, vendor_id, vendor_name)
+    await db_mod.upsert_vendor(pool, vendor_id, vendor_name, user_id=owner_id)
 
     logger.info(
         "Saving template for vendor=%s format=%s headers=%s items=%s",
@@ -615,6 +854,7 @@ async def extract(
     header_fields: str = Form(None),       # JSON string list, optional
     line_item_fields: str = Form(None),    # JSON string list, optional
     format_type: str = Form(None),         # optional, falls back to template
+    _user: dict = Depends(get_current_user),
 ):
     """
     Upload a PDF/image, extract fields via LLM.
@@ -629,7 +869,7 @@ async def extract(
 # -- Cancel / Resume --------------------------------------------------------
 
 @app.post("/extract/cancel/{extraction_id}")
-async def cancel_extraction(extraction_id: int):
+async def cancel_extraction(extraction_id: int, _user: dict = Depends(get_current_user)):
     """Set the cancellation flag for a running extraction."""
     raise HTTPException(
         status_code=410,
@@ -848,11 +1088,15 @@ async def ingest_document(
     header_fields: str = Form(None),
     line_item_fields: str = Form(None),
     source_ref: str = Form(None),
+    user: dict = Depends(get_current_user),
 ):
     if source_type not in {"ui", "rest", "email", "s3", "sftp", "partner"}:
         raise HTTPException(400, detail=f"Unsupported source_type '{source_type}'")
 
     pool = request.app.state.pool
+    # If caller pre-selected a vendor, enforce ownership before doing any work.
+    if vendor_id:
+        await assert_vendor_access(pool, vendor_id, user)
     file_bytes = await file.read()
     filename = file.filename or "unknown"
     detected_vendor = None
@@ -948,8 +1192,9 @@ async def ingest_document(
                         log_ctx["sample_words"] = [w.get("text") for w in page_words[:12]]
                     page_source = "paddleocr"
 
+                _detect_uid = None if user.get("role") == "admin" else user["id"]
                 with plog.timed("vendor_matched", stage="vendor_detection", filename=filename, word_count=len(page_words)) as log_ctx:
-                    match = await _vd.detect_vendor(pool, page_words)
+                    match = await _vd.detect_vendor(pool, page_words, user_id=_detect_uid)
                     if match is not None:
                         log_ctx["vendor_id"] = match.vendor_id
                         log_ctx["vendor_name"] = match.vendor_name
@@ -993,6 +1238,10 @@ async def ingest_document(
                         },
                     )
                 vendor_id = match.vendor_id
+                # Enforce ownership on the detected vendor — clients can't
+                # ingest into a vendor they don't own, even if the document
+                # text matches that vendor's aliases.
+                await assert_vendor_access(pool, vendor_id, user)
                 detected_vendor = {
                     "vendor_id": match.vendor_id,
                     "vendor_name": match.vendor_name,
@@ -1061,8 +1310,9 @@ async def ingest_document(
 
 @app.get("/jobs/{job_id}", response_model=JobStatusOut)
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def get_job_status(request: Request, job_id: int):
+async def get_job_status(request: Request, job_id: int, user: dict = Depends(get_current_user)):
     pool = request.app.state.pool
+    await assert_job_access(pool, job_id, user)
     job = await db_mod.get_job(pool, job_id)
     if not job:
         raise HTTPException(404, detail="Job not found")
@@ -1078,7 +1328,9 @@ async def get_job_status(request: Request, job_id: int):
 
 
 @app.get("/jobs/{job_id}/stream")
-async def stream_job_status_sse(request: Request, job_id: int):
+async def stream_job_status_sse(
+    request: Request, job_id: int, user: dict = Depends(get_current_user),
+):
     """SSE stream for real-time job progress.
 
     One persistent connection replaces client-side polling.
@@ -1087,8 +1339,11 @@ async def stream_job_status_sse(request: Request, job_id: int):
     only included in the terminal event to keep progress messages tiny.
 
     No rate limiter — this is one long-lived connection, not repeated requests.
+    Auth: accepts Bearer header OR ?token= query param (EventSource cannot
+    set headers).
     """
     pool = request.app.state.pool
+    await assert_job_access(pool, job_id, user)
     job = await db_mod.get_job(pool, job_id)
     if not job:
         raise HTTPException(404, detail="Job not found")
@@ -1184,8 +1439,11 @@ async def stream_job_status_sse(request: Request, job_id: int):
 
 @app.post("/jobs/extractions/{extraction_id}/cancel")
 @limiter.limit("10/minute")
-async def request_job_cancel(request: Request, extraction_id: int):
+async def request_job_cancel(
+    request: Request, extraction_id: int, user: dict = Depends(get_current_user),
+):
     pool = request.app.state.pool
+    await assert_extraction_access(pool, extraction_id, user)
     extraction = await db_mod.get_extraction(pool, extraction_id)
     if not extraction:
         raise HTTPException(404, detail="Extraction not found")
@@ -1206,8 +1464,11 @@ async def request_job_cancel(request: Request, extraction_id: int):
 
 @app.post("/jobs/extractions/{extraction_id}/resume", response_model=ExtractionJobStartOut)
 @limiter.limit("10/minute")
-async def queue_resume_extraction(request: Request, extraction_id: int):
+async def queue_resume_extraction(
+    request: Request, extraction_id: int, user: dict = Depends(get_current_user),
+):
     pool = request.app.state.pool
+    await assert_extraction_access(pool, extraction_id, user)
     extraction = await db_mod.get_extraction(pool, extraction_id)
     if not extraction:
         raise HTTPException(404, detail="Extraction not found")
@@ -1257,14 +1518,22 @@ async def queue_resume_extraction(request: Request, extraction_id: int):
 
 @app.get("/extractions/count")
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def count_all_extractions(request: Request):
-    return {"count": await db_mod.count_all_extractions(request.app.state.pool)}
+async def count_all_extractions(request: Request, user: dict = Depends(get_current_user)):
+    filter_user = None if user["role"] == "admin" else user["id"]
+    return {
+        "count": await db_mod.count_all_extractions(
+            request.app.state.pool, user_id=filter_user,
+        )
+    }
 
 
 @app.get("/extractions/{extraction_id}", response_model=ExtractionOut)
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def get_extraction(request: Request, extraction_id: int):
+async def get_extraction(
+    request: Request, extraction_id: int, user: dict = Depends(get_current_user),
+):
     pool = request.app.state.pool
+    await assert_extraction_access(pool, extraction_id, user)
 
     row = await db_mod.get_extraction(pool, extraction_id)
     if not row:
@@ -1275,13 +1544,16 @@ async def get_extraction(request: Request, extraction_id: int):
 
 @app.delete("/extractions/{extraction_id}")
 @limiter.limit("20/minute")
-async def delete_extraction(request: Request, extraction_id: int):
+async def delete_extraction(
+    request: Request, extraction_id: int, user: dict = Depends(get_current_user),
+):
     """
     Delete one extraction (history row + related artifacts), not the whole DB/vendor.
     """
     pool = request.app.state.pool
     store = request.app.state.store
 
+    await assert_extraction_access(pool, extraction_id, user)
     extraction = await db_mod.get_extraction(pool, extraction_id)
     if not extraction:
         raise HTTPException(404, detail="Extraction not found")
@@ -1354,13 +1626,16 @@ async def delete_extraction(request: Request, extraction_id: int):
 
 @app.get("/extractions/{extraction_id}/pages")
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def get_extraction_pages(request: Request, extraction_id: int):
+async def get_extraction_pages(
+    request: Request, extraction_id: int, user: dict = Depends(get_current_user),
+):
     """
     Return all rendered page images for an extraction.
     Frontend uses this to populate the page viewer after upload.
     Each item: {page_number, image_b64, width, height}
     """
     pool = request.app.state.pool
+    await assert_extraction_access(pool, extraction_id, user)
 
     extraction = await db_mod.get_extraction(pool, extraction_id)
     if not extraction:
@@ -1371,7 +1646,11 @@ async def get_extraction_pages(request: Request, extraction_id: int):
 
 @app.get("/vendors/{vendor_id}/extractions", response_model=list[ExtractionOut])
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def list_vendor_extractions(request: Request, vendor_id: str, limit: int = 20):
+async def list_vendor_extractions(
+    request: Request, vendor_id: str, limit: int = 20,
+    user: dict = Depends(get_current_user),
+):
+    await assert_vendor_access(request.app.state.pool, vendor_id, user)
     rows = await db_mod.list_extractions(request.app.state.pool, vendor_id, limit)
     return [ExtractionOut(**r) for r in rows]
 
@@ -1380,8 +1659,9 @@ async def list_vendor_extractions(request: Request, vendor_id: str, limit: int =
 
 @app.get("/templates", response_model=list[TemplateListOut])
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def list_all_templates(request: Request):
-    rows = await db_mod.list_all_templates(request.app.state.pool)
+async def list_all_templates(request: Request, user: dict = Depends(get_current_user)):
+    filter_user = None if user["role"] == "admin" else user["id"]
+    rows = await db_mod.list_all_templates(request.app.state.pool, user_id=filter_user)
     return [TemplateListOut(**r) for r in rows]
 
 
@@ -1389,8 +1669,13 @@ async def list_all_templates(request: Request):
 
 @app.get("/extractions", response_model=list[ExtractionOut])
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def list_all_extractions(request: Request, limit: int = 50):
-    rows = await db_mod.list_all_extractions(request.app.state.pool, limit)
+async def list_all_extractions(
+    request: Request, limit: int = 50, user: dict = Depends(get_current_user),
+):
+    filter_user = None if user["role"] == "admin" else user["id"]
+    rows = await db_mod.list_all_extractions(
+        request.app.state.pool, limit, user_id=filter_user,
+    )
     return [ExtractionOut(**r) for r in rows]
 
 
@@ -1402,6 +1687,7 @@ async def upload_preview(
     request: Request,
     file: UploadFile = File(...),
     max_pages: int = Form(20),
+    user: dict = Depends(get_current_user),
 ):
     """
     Upload a PDF/image and get rendered page images back for preview.
@@ -1425,9 +1711,13 @@ async def upload_preview(
 
 @app.get("/extractions/{extraction_id}/ocr")
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def get_extraction_ocr(request: Request, extraction_id: int):
+async def get_extraction_ocr(
+    request: Request, extraction_id: int, user: dict = Depends(get_current_user),
+):
     """Return PaddleOCR word data for the click-to-select correction UI."""
-    ocr_data = await db_mod.get_ocr_data(request.app.state.pool, extraction_id)
+    pool = request.app.state.pool
+    await assert_extraction_access(pool, extraction_id, user)
+    ocr_data = await db_mod.get_ocr_data(pool, extraction_id)
     if ocr_data is None:
         raise HTTPException(404, detail="No OCR data found for this extraction")
     return {"extraction_id": extraction_id, "ocr_pages": ocr_data}
@@ -1435,7 +1725,9 @@ async def get_extraction_ocr(request: Request, extraction_id: int):
 
 @app.get("/extractions/{extraction_id}/geometry")
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def get_extraction_geometry(request: Request, extraction_id: int):
+async def get_extraction_geometry(
+    request: Request, extraction_id: int, user: dict = Depends(get_current_user),
+):
     """Return unified per-page geometry with source classification.
 
     Each page entry includes: page_number, source ('pypdfium'|'paddleocr'),
@@ -1443,6 +1735,7 @@ async def get_extraction_geometry(request: Request, extraction_id: int):
     Falls back to ocr_data if page-level geometry is not available.
     """
     pool = request.app.state.pool
+    await assert_extraction_access(pool, extraction_id, user)
     pages = await db_mod.get_pages(pool, extraction_id)
     if not pages:
         raise HTTPException(404, detail="No pages found for this extraction")
@@ -1542,13 +1835,17 @@ def _compute_correction_diff(original, corrected) -> dict:
 
 @app.put("/extractions/{extraction_id}/corrections")
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def save_extraction_corrections(request: Request, extraction_id: int):
+async def save_extraction_corrections(
+    request: Request, extraction_id: int, user: dict = Depends(get_current_user),
+):
     """Persist user corrections from the Review page.
 
     Saves to corrected_result (original result stays immutable).
     Auto-creates a gold example for this vendor if fields were changed.
     Invalidates prompt cache so next extraction uses the gold example.
     """
+    pool_for_check = request.app.state.pool
+    await assert_extraction_access(pool_for_check, extraction_id, user)
     body = await request.json()
     corrected_result = body.get("corrected_result")
     field_locations = body.get("field_locations", {})
@@ -1745,17 +2042,26 @@ async def save_extraction_corrections(request: Request, extraction_id: int):
 
 @app.get("/extractions/{extraction_id}/reviews")
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def get_extraction_reviews(request: Request, extraction_id: int):
-    extraction = await db_mod.get_extraction(request.app.state.pool, extraction_id)
+async def get_extraction_reviews(
+    request: Request, extraction_id: int, user: dict = Depends(get_current_user),
+):
+    pool = request.app.state.pool
+    await assert_extraction_access(pool, extraction_id, user)
+    extraction = await db_mod.get_extraction(pool, extraction_id)
     if not extraction:
         raise HTTPException(404, detail="Extraction not found")
-    return {"extraction_id": extraction_id, "reviews": await db_mod.list_review_events(request.app.state.pool, extraction_id)}
+    return {"extraction_id": extraction_id, "reviews": await db_mod.list_review_events(pool, extraction_id)}
 
 
 @app.get("/extractions/{extraction_id}/trace")
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def get_extraction_trace(request: Request, extraction_id: int, limit: int | None = None):
-    extraction = await db_mod.get_extraction(request.app.state.pool, extraction_id)
+async def get_extraction_trace(
+    request: Request, extraction_id: int, limit: int | None = None,
+    user: dict = Depends(get_current_user),
+):
+    pool = request.app.state.pool
+    await assert_extraction_access(pool, extraction_id, user)
+    extraction = await db_mod.get_extraction(pool, extraction_id)
     if not extraction:
         raise HTTPException(404, detail="Extraction not found")
     events = plog.read_extraction_events(extraction_id, limit=limit)
@@ -1765,10 +2071,233 @@ async def get_extraction_trace(request: Request, extraction_id: int, limit: int 
     }
 
 
+USAGE_INPUT_USD_PER_1K = float(os.getenv("USAGE_INPUT_USD_PER_1K", "0.006"))
+USAGE_OUTPUT_USD_PER_1K = float(os.getenv("USAGE_OUTPUT_USD_PER_1K", "0.018"))
+
+
+def _parse_usage_date(value: str | None, name: str) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"{name} must be YYYY-MM-DD") from exc
+
+
+def _usage_date_range(
+    date_from: str | None,
+    date_to: str | None,
+    *,
+    default_today: bool = False,
+) -> tuple[datetime | None, datetime | None, str | None, str | None]:
+    start_day = _parse_usage_date(date_from, "date_from")
+    end_day = _parse_usage_date(date_to, "date_to")
+    if default_today and start_day is None and end_day is None:
+        start_day = date.today()
+        end_day = start_day
+    if start_day and end_day and end_day < start_day:
+        raise HTTPException(status_code=400, detail="date_to must be on or after date_from")
+
+    start_dt = datetime.combine(start_day, datetime.min.time(), tzinfo=UTC) if start_day else None
+    end_exclusive_day = end_day + timedelta(days=1) if end_day else None
+    end_dt = datetime.combine(end_exclusive_day, datetime.min.time(), tzinfo=UTC) if end_exclusive_day else None
+    return (
+        start_dt,
+        end_dt,
+        start_day.isoformat() if start_day else None,
+        end_day.isoformat() if end_day else None,
+    )
+
+
+def _usage_cost_estimate(input_tokens: int | float | None, output_tokens: int | float | None) -> float:
+    input_cost = (float(input_tokens or 0) / 1000.0) * USAGE_INPUT_USD_PER_1K
+    output_cost = (float(output_tokens or 0) / 1000.0) * USAGE_OUTPUT_USD_PER_1K
+    return round(input_cost + output_cost, 6)
+
+
+@app.get("/user/stats")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_user_stats(request: Request, user: dict = Depends(get_current_user)):
+    """Usage stats scoped to the current user's vendors (works for both clients and admin)."""
+    pool = request.app.state.pool
+    uid = None if user["role"] == "admin" else user["id"]
+    stats = await db_mod.get_usage_stats(pool, user_id=uid)
+    days = await db_mod.get_llm_usage_daily_summary(pool, limit=30, user_id=uid)
+    return {"stats": stats, "days": days}
+
+
+@app.get("/admin/stats")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_admin_stats(request: Request, user: dict = Depends(require_admin)):
+    """Aggregate dashboard stats (all users) for the admin dashboard."""
+    pool = request.app.state.pool
+    stats = await db_mod.get_usage_stats(pool)
+    days = await db_mod.get_llm_usage_daily_summary(pool, limit=30)
+    return {"stats": stats, "days": days}
+
+
+@app.get("/admin/usage/clients")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_admin_usage_clients(request: Request, _: dict = Depends(require_admin)):
+    """Per-client token/page breakdown for the admin client-usage view."""
+    return await db_mod.get_usage_by_client(request.app.state.pool)
+
+
+@app.get("/admin/usage/clients/{client_user_id}/documents")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_client_documents_usage(
+    request: Request,
+    client_user_id: str,
+    limit: int = 50,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    range: str | None = None,
+    user: dict = Depends(require_admin),
+):
+    """Per-document token breakdown for a specific client (admin only)."""
+    start_dt, end_dt, _, _ = _usage_date_range(
+        date_from,
+        date_to,
+        default_today=(range != "all"),
+    )
+    return await db_mod.get_client_document_usage(
+        request.app.state.pool,
+        client_user_id,
+        limit=limit,
+        date_from=start_dt,
+        date_to=end_dt,
+    )
+
+
+@app.get("/admin/usage/clients/{client_user_id}/dashboard")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_client_usage_dashboard(
+    request: Request,
+    client_user_id: str,
+    limit: int = 100,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    range: str | None = None,
+    user: dict = Depends(require_admin),
+):
+    """Full client-scoped usage dashboard for admins."""
+    pool = request.app.state.pool
+    start_dt, end_dt, start_label, end_label = _usage_date_range(
+        date_from,
+        date_to,
+        default_today=(range != "all"),
+    )
+    client = await db_mod.get_user_by_id(pool, client_user_id)
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    stats = await db_mod.get_usage_stats(
+        pool,
+        user_id=client_user_id,
+        date_from=start_dt,
+        date_to=end_dt,
+    )
+    days = await db_mod.get_client_daily_summary(
+        pool,
+        client_user_id,
+        limit=30,
+        date_from=start_dt,
+        date_to=end_dt,
+    )
+    documents = await db_mod.get_client_document_usage(
+        pool,
+        client_user_id,
+        limit=limit,
+        date_from=start_dt,
+        date_to=end_dt,
+    )
+
+    input_tokens = int(stats.get("total_input_tokens") or 0)
+    output_tokens = int(stats.get("total_output_tokens") or 0)
+    return {
+        "client": {
+            "user_id": client["id"],
+            "email": client["email"],
+            "role": client.get("role"),
+            "is_active": client.get("is_active"),
+        },
+        "date_from": start_label,
+        "date_to": end_label,
+        "range": range or ("custom" if date_from or date_to else "today"),
+        "stats": {
+            "todays_pdfs": int(stats.get("total_pdfs") or 0),
+            "total_extractions": int(stats.get("total_extractions") or 0),
+            "total_pages": int(stats.get("all_pages") or stats.get("total_pages") or 0),
+            "billable_pages": int(stats.get("billable_pages") or 0),
+            "failed_pages": int(stats.get("failed_pages") or 0),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "grand_total": int(stats.get("grand_total") or 0),
+            "llm_calls": int(stats.get("total_llm_calls") or 0),
+            "cost_estimate": _usage_cost_estimate(input_tokens, output_tokens),
+            "currency": "USD",
+        },
+        "days": days,
+        "documents": documents,
+    }
+
+
+@app.get("/admin/usage/extractions/{extraction_id}/pages")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_extraction_page_usage(
+    request: Request,
+    extraction_id: int,
+    user: dict = Depends(require_admin),
+):
+    """Per-page token breakdown for a single extraction (admin drill-down)."""
+    return await db_mod.get_extraction_page_usage(request.app.state.pool, extraction_id)
+
+
+@app.get("/admin/usage")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_admin_usage(
+    request: Request,
+    limit: int = 50,
+    vendor_id: str | None = None,
+    doc_id: str | None = None,
+    include_calls: bool = False,
+    user: dict = Depends(require_admin),
+):
+    """Return persisted LLM token usage summaries.
+
+    The counters come directly from llama.cpp's OpenAI-compatible
+    response["usage"] payload, so local Qwen3-VL image token counts should be
+    reported separately from cloud-provider token formulas.
+    """
+    pool = request.app.state.pool
+    documents = await db_mod.get_llm_usage_document_summary(pool, limit=limit, vendor_id=vendor_id)
+    days = await db_mod.get_llm_usage_daily_summary(pool, limit=30, vendor_id=vendor_id)
+    payload = {
+        "documents": documents,
+        "days": days,
+        "notes": {
+            "source": "llama.cpp response.usage from /v1/chat/completions",
+            "comparison_rule": "Compare local vs cloud by cost per document, not raw image prompt tokens.",
+        },
+    }
+    if include_calls:
+        payload["calls"] = await db_mod.list_llm_usage_calls(
+            pool,
+            limit=limit,
+            doc_id=doc_id,
+            vendor_id=vendor_id,
+        )
+    return payload
+
+
 @app.get("/extractions/{extraction_id}/contract")
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def get_extraction_contract(request: Request, extraction_id: int):
-    extraction = await db_mod.get_extraction(request.app.state.pool, extraction_id)
+async def get_extraction_contract(
+    request: Request, extraction_id: int, user: dict = Depends(get_current_user),
+):
+    pool = request.app.state.pool
+    await assert_extraction_access(pool, extraction_id, user)
+    extraction = await db_mod.get_extraction(pool, extraction_id)
     if not extraction:
         raise HTTPException(404, detail="Extraction not found")
     return build_purchase_order_contract(extraction)
@@ -1776,8 +2305,11 @@ async def get_extraction_contract(request: Request, extraction_id: int):
 
 @app.get("/extractions/{extraction_id}/export.xlsx")
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def download_extraction_excel(request: Request, extraction_id: int):
+async def download_extraction_excel(
+    request: Request, extraction_id: int, user: dict = Depends(get_current_user),
+):
     pool = request.app.state.pool
+    await assert_extraction_access(pool, extraction_id, user)
     extraction = await db_mod.get_extraction(pool, extraction_id)
     if not extraction:
         raise HTTPException(404, detail="Extraction not found")
@@ -1795,8 +2327,11 @@ async def download_extraction_excel(request: Request, extraction_id: int):
 
 @app.get("/extractions/{extraction_id}/export.csv")
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def download_extraction_csv(request: Request, extraction_id: int):
+async def download_extraction_csv(
+    request: Request, extraction_id: int, user: dict = Depends(get_current_user),
+):
     pool = request.app.state.pool
+    await assert_extraction_access(pool, extraction_id, user)
     extraction = await db_mod.get_extraction(pool, extraction_id)
     if not extraction:
         raise HTTPException(404, detail="Extraction not found")

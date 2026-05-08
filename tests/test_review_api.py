@@ -96,6 +96,56 @@ class ReviewApiTests(unittest.TestCase):
         self.assertEqual(response.json()["extraction_id"], 123)
         self.assertEqual(mock_save.await_count, 1)
 
+    def test_admin_usage_returns_manager_summaries(self) -> None:
+        document_rows = [
+            {
+                "doc_id": "42",
+                "vendor_id": "ROBERT_SCOTT",
+                "total_input_tokens": 1643,
+                "total_output_tokens": 461,
+                "grand_total": 2104,
+                "llm_calls": 1,
+                "avg_call_ms": 31500,
+            }
+        ]
+        daily_rows = [
+            {
+                "day": "2026-05-07",
+                "input_tokens": 1643,
+                "output_tokens": 461,
+                "total_tokens": 2104,
+                "docs_processed": 1,
+                "llm_calls": 1,
+                "avg_call_ms": 31500,
+            }
+        ]
+        call_rows = [
+            {
+                "id": 1,
+                "doc_id": "42",
+                "vendor_id": "ROBERT_SCOTT",
+                "page_num": 1,
+                "call_type": "extraction",
+                "prompt_tokens": 1643,
+                "completion_tokens": 461,
+                "total_tokens": 2104,
+            }
+        ]
+
+        with patch.object(main.db_mod, "get_llm_usage_document_summary", new=AsyncMock(return_value=document_rows)) as mock_docs, \
+             patch.object(main.db_mod, "get_llm_usage_daily_summary", new=AsyncMock(return_value=daily_rows)) as mock_days, \
+             patch.object(main.db_mod, "list_llm_usage_calls", new=AsyncMock(return_value=call_rows)) as mock_calls:
+            response = self.client.get("/admin/usage?include_calls=true&doc_id=42&vendor_id=ROBERT_SCOTT")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["documents"], document_rows)
+        self.assertEqual(payload["days"], daily_rows)
+        self.assertEqual(payload["calls"], call_rows)
+        mock_docs.assert_awaited_once()
+        mock_days.assert_awaited_once()
+        mock_calls.assert_awaited_once()
+
 
 if __name__ == "__main__":
     unittest.main()
