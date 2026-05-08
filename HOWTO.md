@@ -341,3 +341,15 @@ Password: admin
 User: augocr
 Password: augocr
 Database: augocr
+
+
+
+
+# All tests (headless)
+npm run test:e2e
+
+# With visible browser
+npm run test:e2e:headed
+
+# Interactive UI
+npm run test:e2e:ui
