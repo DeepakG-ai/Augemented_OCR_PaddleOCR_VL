@@ -218,6 +218,8 @@ let _expandedDoc     = null; // extractionId currently expanded
 let _clientDashboardFilters = {}; // userId -> {preset, date_from, date_to}
 let _clientDashboardData = null;
 let _activeClientDashboardUser = null;
+let _userDocsFilter = { preset: 'today', date_from: _todayISO(), date_to: _todayISO() };
+let _userDocsData = [];
 
 function _renderClientTable(clients) {
     if (!clients || clients.length === 0) {
@@ -331,9 +333,15 @@ async function togglePageUsage(extractionId) {
         _expandedDoc = extractionId;
         _refreshClientTable();
         _refreshClientDashboardDocs();
+        _refreshUserDocsDashboard();
         if (!_pageUsageCache[extractionId]) {
+            const authUser = (() => { try { return JSON.parse(localStorage.getItem('auth_user') || 'null'); } catch { return null; } })();
+            const isAdmin = authUser && authUser.role === 'admin';
+            const pageUrl = isAdmin
+                ? `/admin/usage/extractions/${extractionId}/pages`
+                : `/user/extractions/${extractionId}/pages`;
             try {
-                _pageUsageCache[extractionId] = await apiJSON(`/admin/usage/extractions/${extractionId}/pages`);
+                _pageUsageCache[extractionId] = await apiJSON(pageUrl);
             } catch (e) {
                 _pageUsageCache[extractionId] = [];
                 showToast('Failed to load page data: ' + e.message);
@@ -342,6 +350,13 @@ async function togglePageUsage(extractionId) {
     }
     _refreshClientTable();
     _refreshClientDashboardDocs();
+    _refreshUserDocsDashboard();
+}
+
+function _refreshUserDocsDashboard() {
+    const el = document.getElementById('userDocsTableBody');
+    if (!el) return;
+    el.innerHTML = _userDocsData.map(d => _renderDocRow(d)).join('');
 }
 
 let _clientsData = [];
@@ -356,6 +371,92 @@ function _refreshClientDashboardDocs() {
     const el = document.getElementById('clientDashboardDocsBody');
     if (!el || !_clientDashboardData) return;
     el.innerHTML = (_clientDashboardData.documents || []).map(d => _renderDocRow(d)).join('');
+}
+
+// ── CLIENT: OWN PDF USAGE FILTERS ────────────────────────────────────
+
+function _userDocsQuery(filter) {
+    const params = new URLSearchParams();
+    params.set('limit', '200');
+    if (filter.preset === 'all') {
+        params.set('range', 'all');
+    } else {
+        if (filter.date_from) params.set('date_from', filter.date_from);
+        if (filter.date_to)   params.set('date_to', filter.date_to);
+    }
+    return params.toString();
+}
+
+function _renderUserDocsFilterRow(filter) {
+    function btn(label, preset) {
+        const active = filter.preset === preset;
+        return `<button class="small-btn" onclick="setUserDocsRange('${preset}')"
+                style="${active ? 'background:var(--blue);color:#fff' : ''}">${label}</button>`;
+    }
+    return `
+    <div style="display:flex;align-items:end;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:14px 0">
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+            ${btn('Today', 'today')}
+            ${btn('7D', '7d')}
+            ${btn('30D', '30d')}
+            ${btn('All', 'all')}
+        </div>
+        <div style="display:flex;align-items:end;gap:8px;flex-wrap:wrap">
+            <label style="font-size:9px;color:var(--text-dim);letter-spacing:0.1em">FROM
+                <input id="userDateFrom" type="date" value="${escapeHtml(filter.date_from || '')}"
+                       style="display:block;margin-top:4px;background:var(--bg1);border:1px solid var(--border);color:var(--text);padding:6px 8px;font-family:var(--mono);font-size:11px">
+            </label>
+            <label style="font-size:9px;color:var(--text-dim);letter-spacing:0.1em">TO
+                <input id="userDateTo" type="date" value="${escapeHtml(filter.date_to || '')}"
+                       style="display:block;margin-top:4px;background:var(--bg1);border:1px solid var(--border);color:var(--text);padding:6px 8px;font-family:var(--mono);font-size:11px">
+            </label>
+            <button class="small-btn" onclick="applyUserDocsDates()">Apply</button>
+        </div>
+    </div>`;
+}
+
+function setUserDocsRange(preset) {
+    const today = _todayISO();
+    if (preset === 'today')     _userDocsFilter = { preset, date_from: today, date_to: today };
+    else if (preset === '7d')   _userDocsFilter = { preset, date_from: _shiftDateISO(6), date_to: today };
+    else if (preset === '30d')  _userDocsFilter = { preset, date_from: _shiftDateISO(29), date_to: today };
+    else                        _userDocsFilter = { preset: 'all', date_from: '', date_to: '' };
+    renderDashboardPage(document.getElementById('appRoot'));
+}
+
+function applyUserDocsDates() {
+    const from = document.getElementById('userDateFrom')?.value || '';
+    const to   = document.getElementById('userDateTo')?.value || '';
+    _userDocsFilter = { preset: 'custom', date_from: from, date_to: to };
+    renderDashboardPage(document.getElementById('appRoot'));
+}
+
+function _renderUserDocsTable(docs) {
+    if (!docs || docs.length === 0) {
+        return `<div style="padding:18px;color:var(--text-dim);font-size:11px">No PDFs found for this date range.</div>`;
+    }
+    return `
+    <div style="overflow-x:auto">
+        <table style="width:100%;border-collapse:collapse;font-size:10px">
+            <thead>
+                <tr style="border-bottom:1px solid var(--border);color:var(--text-dim);letter-spacing:0.07em">
+                    <th style="text-align:left;padding:8px;font-weight:500">FILENAME</th>
+                    <th style="text-align:left;padding:8px;font-weight:500">VENDOR</th>
+                    <th style="text-align:left;padding:8px;font-weight:500">DATE</th>
+                    <th style="text-align:right;padding:8px;font-weight:500">BILLABLE PAGES</th>
+                    <th style="text-align:right;padding:8px;font-weight:500">STATUS</th>
+                    <th style="text-align:right;padding:8px;font-weight:500">INPUT</th>
+                    <th style="text-align:right;padding:8px;font-weight:500">OUTPUT</th>
+                    <th style="text-align:right;padding:8px;font-weight:500">TOTAL</th>
+                    <th style="text-align:right;padding:8px;font-weight:500">LATENCY</th>
+                    <th style="text-align:center;padding:8px;font-weight:500">DETAIL</th>
+                </tr>
+            </thead>
+            <tbody id="userDocsTableBody">
+                ${docs.map(d => _renderDocRow(d)).join('')}
+            </tbody>
+        </table>
+    </div>`;
 }
 
 // ── MAIN RENDER ───────────────────────────────────────────────────────
@@ -381,12 +482,17 @@ async function renderDashboardPage(app) {
         console.warn('Dashboard fetch error:', e);
     }
 
-    // Admin also fetches per-client breakdown
+    // Admin also fetches per-client breakdown; clients fetch their own docs
     _clientsData = [];
+    _userDocsData = [];
     _pageUsageCache  = {};
     _expandedDoc     = null;
     if (isAdmin) {
         try { _clientsData = await apiJSON('/admin/usage/clients'); } catch (e) { console.warn(e); }
+    } else {
+        try {
+            _userDocsData = await apiJSON(`/user/documents?${_userDocsQuery(_userDocsFilter)}`);
+        } catch (e) { console.warn(e); }
     }
 
     const totalInput  = Number(stats.total_input_tokens  || 0);
@@ -432,6 +538,19 @@ async function renderDashboardPage(app) {
         </div>
 
         ${_renderDailyTable(days)}
+
+        ${!isAdmin ? `
+        <!-- Per-document PDF usage (client only) -->
+        <div style="margin-top:24px;background:var(--bg1);border:1px solid var(--border);border-radius:4px;overflow:hidden">
+            <div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
+                <span style="font-size:9px;letter-spacing:0.14em;color:var(--text-dim)">PDF USAGE</span>
+                <span style="font-size:9px;color:var(--text-dim)">${_userDocsData.length} PDF${_userDocsData.length !== 1 ? 's' : ''}</span>
+            </div>
+            <div style="padding:0 16px">
+                ${_renderUserDocsFilterRow(_userDocsFilter)}
+            </div>
+            ${_renderUserDocsTable(_userDocsData)}
+        </div>` : ''}
 
         ${isAdmin ? `
         <!-- Per-client breakdown (admin only) -->

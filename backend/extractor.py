@@ -85,8 +85,8 @@ _FORMAT_DESCRIPTIONS: dict[str, str] = {
 }
 
 
-# v4.0 = two-agent split: Fields Agent returns {fields} only, no boxes
-PROMPT_VERSION = "v4.0"
+# v5.0 = single agent: page 1 returns {fields, boxes}, page 2+ returns {fields} only
+PROMPT_VERSION = "v5.0"
 
 # ── System Prompt (built once, stored in DB + Redis) ─────────────────
 
@@ -97,6 +97,7 @@ def build_system_prompt(
     rules: list[str],
     format_type: str,
     gold_examples: list[dict] | None = None,
+    include_boxes: bool = False,
 ) -> str:
     """Build the reusable system prompt. Stored in DB and cached in Redis.
 
@@ -104,6 +105,8 @@ def build_system_prompt(
         gold_examples: Optional list of human-verified correct extractions
             for this vendor. Injected as few-shot examples so the LLM learns
             from past corrections.
+        include_boxes: If True (page 1), instruct the LLM to also return
+            bounding boxes for field labels alongside extracted values.
     """
 
     fmt_desc = _FORMAT_DESCRIPTIONS.get(format_type, _FORMAT_DESCRIPTIONS["single_page"])
@@ -140,14 +143,34 @@ Use these as hints for formatting issues or re-occurring mistakes:
 {examples_json}
 </verified_examples>"""
 
+    # ── Page 1: return both fields AND boxes ──
+    if include_boxes:
+        return_keys = """Return two top-level keys:
+- `fields`: extracted values
+- `boxes`: bounding box of the LABEL text for each field"""
+
+        bbox_rules = """
+<bbox_rules>
+- For each header field, return the bounding box of the LABEL text (e.g., the words "PO Number:"), NOT the value next to it.
+- For each line item column, return the bounding box of the COLUMN HEADER text in the table header row.
+- Coordinates use bbox_2d format: [x1, y1, x2, y2] in a 0-1000 normalized grid relative to the full page image.
+- If a label or column header is not visible on this page, set its box to null.
+- "po_number" refers to the Purchase Order Number field, NOT a postal PO Box address.
+- "bill_to" refers to the billing address label, not the address text itself.
+</bbox_rules>"""
+    else:
+        return_keys = """Return one top-level key:
+- `fields`: extracted values"""
+        bbox_rules = ""
+
     return f"""You are a highly accurate document data extraction assistant.
 This request is processed one page at a time.
 
-Return one top-level key:
-- `fields`: extracted values
+{return_keys}
 {context_section}
 {rules_section}
 {gold_section}
+{bbox_rules}
 <document_format>
 {fmt_desc}
 </document_format>
@@ -175,10 +198,14 @@ def build_user_message(
     line_item_fields: list[str],
     page_num: int,
     total_pages: int,
+    include_boxes: bool = False,
 ) -> str:
     """
     Build the user message for a single page.
-    Same message for every page. Two modes based on whether fields are provided.
+
+    Args:
+        include_boxes: If True (page 1 only), ask the LLM to also return
+            a ``boxes`` dict with label bounding boxes alongside ``fields``.
     """
 
     if header_fields or line_item_fields:
@@ -191,7 +218,13 @@ def build_user_message(
         if line_item_fields:
             fields_template["line_items"] = [{col: None for col in line_item_fields}]
 
-        full_template = {"fields": fields_template}
+        # ── Build JSON shape: page 1 includes boxes, page 2+ fields only ──
+        if include_boxes:
+            all_keys = list(header_fields) + list(line_item_fields)
+            boxes_template = {k: None for k in all_keys}
+            full_template: dict[str, Any] = {"fields": fields_template, "boxes": boxes_template}
+        else:
+            full_template = {"fields": fields_template}
 
         header_section = ""
         if header_fields:
@@ -209,11 +242,24 @@ def build_user_message(
 {line_list}
 </line_item_columns>"""
 
+        # ── Extra instruction for page 1 boxes ──
+        bbox_instruction = ""
+        if include_boxes:
+            bbox_instruction = """
+<bbox_instructions>
+Also return a "boxes" object with the bounding box of each LABEL or COLUMN HEADER text.
+- For header fields: locate the LABEL text (e.g. "PO Number:", "Ship To:"), NOT the value.
+- For line item columns: locate the COLUMN HEADER text in the table header row (e.g. "Qty", "Unit Price").
+- Coordinates: [x1, y1, x2, y2] in a 0-1000 normalized grid.
+- Set to null if the label is not visible.
+</bbox_instructions>"""
+
         return f"""Extract the header fields AND all visible line item rows from this purchase order page (page {page_num} of {total_pages}).
 
 If any field is empty or not visible, return null.
 {header_section}
 {line_section}
+{bbox_instruction}
 
 Return JSON in exactly this shape:
 {json.dumps(full_template, indent=2)}
@@ -512,6 +558,7 @@ async def extract_document(
     existing_page_results: list[dict] | None = None,
     pipeline_context: dict | None = None,
     pool: Any | None = None,
+    system_prompt_page1: str | None = None,
 ) -> dict:
     """
     Process pages in parallel batches of 2 (matches --parallel 2 on llama-server).
@@ -556,18 +603,24 @@ async def extract_document(
     # Helper — runs inside asyncio.gather, never raises
     async def _process_page(page: dict) -> dict:
         page_num = page["page_number"]
+        # Page 1 uses a different prompt that also requests bounding boxes
+        is_page1 = page_num == 1
+        effective_prompt = system_prompt_page1 if (is_page1 and system_prompt_page1) else system_prompt
 
         with trace_page_extraction(page_num, total) as page_ctx:
             # Build user message with tracing
             with trace_build_user_message(page_num, total) as msg_ctx:
-                user_msg = build_user_message(header_fields, line_item_fields, page_num, total)
+                user_msg = build_user_message(
+                    header_fields, line_item_fields, page_num, total,
+                    include_boxes=is_page1,
+                )
                 msg_ctx["user_message"] = user_msg
 
             page_ctx["user_message"] = user_msg
 
             try:
                 result = await call_llm(
-                    page["image_b64"], system_prompt, user_msg, llm_url, model,
+                    page["image_b64"], effective_prompt, user_msg, llm_url, model,
                     mime_type=page.get("mime_type", "image/jpeg"),
                     page_num=page_num, total_pages=total,
                     pipeline_context=pipeline_context,

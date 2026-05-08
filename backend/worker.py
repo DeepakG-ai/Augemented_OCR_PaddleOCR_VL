@@ -19,7 +19,6 @@ if __package__:
     from . import ocr_runner
     from . import logging_config as plog
     from . import processor
-    from . import bbox_agent
     from . import qwen_layout_apply
     from . import page_logger
     from .contracts import build_purchase_order_contract
@@ -42,7 +41,6 @@ else:
     import ocr_runner
     import logging_config as plog
     import processor
-    import bbox_agent  # type: ignore[no-redef]
     import qwen_layout_apply  # type: ignore[no-redef]
     import page_logger  # type: ignore[no-redef]
     from contracts import build_purchase_order_contract
@@ -573,84 +571,29 @@ async def _process_llm(pool, job: dict) -> None:
         attributes=base,
     ) as prompt_trace:
         gold_examples = await db_mod.get_gold_examples(pool, extraction_row["vendor_id"])
-        system_prompt = extractor.build_system_prompt(
-            req_header,
-            req_items,
-            tmpl["prompt_instructions"] if tmpl else None,
-            tmpl["extraction_rules"] if tmpl else [],
-            req_format,
+        _prompt_args = dict(
+            header_fields=req_header,
+            line_item_fields=req_items,
+            instructions=tmpl["prompt_instructions"] if tmpl else None,
+            rules=tmpl["extraction_rules"] if tmpl else [],
+            format_type=req_format,
             gold_examples=gold_examples,
         )
+        # Page 2+ system prompt: fields only (current behaviour)
+        system_prompt = extractor.build_system_prompt(**_prompt_args, include_boxes=False)
+        # Page 1 system prompt: fields + bounding boxes
+        system_prompt_page1 = extractor.build_system_prompt(**_prompt_args, include_boxes=True)
         prompt_trace["output"] = {
             "prompt_version": getattr(extractor, "PROMPT_VERSION", "unknown"),
             "gold_examples_count": len(gold_examples),
             "prompt_length": len(system_prompt),
+            "prompt_page1_length": len(system_prompt_page1),
             "system_prompt": system_prompt,
         }
     if gold_examples:
         logger.info("LLM prompt includes %d gold example(s) for vendor=%s", len(gold_examples), extraction_row["vendor_id"])
 
     pages = await _load_pages(pool, extraction_id)
-
-    # ── BBox Agent: learn label positions BEFORE Fields Agent runs ──
-    # Runs when new fields are detected (not yet in DB).
-    # When triggered, sends ALL fields (old + new) so the LLM gets full
-    # layout context, and the upsert overwrites old values in DB.
-    if tmpl and pages:
-        vendor_id_llm = extraction_row["vendor_id"]
-        template_id_llm = tmpl["id"]
-        known = await db_mod.get_qwen_layout_boxes(pool, vendor_id_llm, template_id_llm)
-        missing_header = [f for f in req_header if f not in known]
-        missing_columns = [f for f in req_items if f not in known]
-        plog.event(
-            "bbox_agent_layout_check",
-            stage="llm",
-            **base,
-            missing_header=missing_header,
-            missing_columns=missing_columns,
-            will_run=bool(missing_header or missing_columns),
-        )
-        if missing_header or missing_columns:
-            # New fields detected → re-run with ALL fields so the LLM sees
-            # the complete layout, then overwrite everything in DB.
-            with plog.timed("bbox_agent_learn_layout", stage="llm", **base) as _bc:
-                with trace_named_step(
-                    "bbox_agent.learn_layout",
-                    kind="AGENT",
-                    input_data={
-                        "trigger_missing_header": missing_header,
-                        "trigger_missing_columns": missing_columns,
-                        "all_header_fields": req_header,
-                        "all_line_item_columns": req_items,
-                    },
-                    attributes=base,
-                ) as bbox_trace:
-                    learned = await bbox_agent.learn_layout_for_vendor(
-                        page1_image_b64=pages[0]["image_b64"],
-                        page1_width=pages[0].get("width") or 0,
-                        page1_height=pages[0].get("height") or 0,
-                        header_field_keys=req_header,
-                        line_item_column_keys=req_items,
-                        llm_url=LLM_URL,
-                        model=LLM_MODEL,
-                        pipeline_context=base,
-                        pool=pool,
-                    )
-                    bbox_trace["output"] = {
-                        "fields_learned": list((learned or {}).keys()),
-                        "learned_layout_boxes": learned or {},
-                    }
-                _bc["fields_learned"] = len(learned) if learned else 0
-            if learned:
-                await db_mod.upsert_qwen_layout_boxes(
-                    pool, vendor_id_llm, template_id_llm, extraction_id, learned,
-                )
-                logger.info(
-                    "BBox Agent: learned %d field(s) for vendor=%s (full re-run, %d new triggers)",
-                    len(learned), vendor_id_llm, len(missing_header) + len(missing_columns),
-                )
-        else:
-            logger.debug("BBox Agent: skip for vendor=%s — all fields have boxes", vendor_id_llm)
 
     cancel_event = asyncio.Event()
     start = time.perf_counter()
@@ -713,6 +656,7 @@ async def _process_llm(pool, job: dict) -> None:
                 existing_page_results=job.get("payload", {}).get("existing_page_results"),
                 pipeline_context=base,
                 pool=pool,
+                system_prompt_page1=system_prompt_page1,
             )
             _result = output.get("result")
             log_ctx["page_results"] = len(output.get("page_results") or [])
@@ -729,6 +673,59 @@ async def _process_llm(pool, job: dict) -> None:
             "last_completed_page": output.get("last_completed_page", 0),
             "result": _result_summary(output.get("result")),
         }
+
+    # ── Extract boxes from page 1 result and save to qwen_layout_boxes ──
+    _page_results = output.get("page_results") or []
+    if tmpl and _page_results:
+        _p1 = next((pr for pr in _page_results if pr.get("_page") == 1 and "_error" not in pr), None)
+        _p1_boxes = (_p1 or {}).get("boxes")
+        if isinstance(_p1_boxes, dict) and _p1_boxes:
+            vendor_id_llm = extraction_row["vendor_id"]
+            template_id_llm = tmpl["id"]
+            # Page 1 dimensions for FACTOR=32 alignment correction
+            _p1_page = next((pg for pg in pages if pg["page_number"] == 1), None)
+            _p1w = (_p1_page or {}).get("width") or 0
+            _p1h = (_p1_page or {}).get("height") or 0
+            learned_boxes: dict = {}
+            if _p1w > 0 and _p1h > 0:
+                FACTOR = 32
+                w_bar = max(FACTOR, int(round(_p1w / FACTOR) * FACTOR))
+                h_bar = max(FACTOR, int(round(_p1h / FACTOR) * FACTOR))
+                req_items_set = set(req_items)
+                for field_key, raw_box in _p1_boxes.items():
+                    if not isinstance(raw_box, list) or len(raw_box) != 4:
+                        continue
+                    # 0-1000 grid -> aligned pixel space -> 0-1 normalized
+                    x0_px = (raw_box[0] / 1000.0) * w_bar
+                    y0_px = (raw_box[1] / 1000.0) * h_bar
+                    x1_px = (raw_box[2] / 1000.0) * w_bar
+                    y1_px = (raw_box[3] / 1000.0) * h_bar
+                    nx0 = max(0.0, x0_px / _p1w)
+                    ny0 = max(0.0, y0_px / _p1h)
+                    nx1 = min(1.0, x1_px / _p1w)
+                    ny1 = min(1.0, y1_px / _p1h)
+                    if nx1 <= nx0 or ny1 <= ny0:
+                        continue
+                    field_type = "line_item_column" if field_key in req_items_set else "header"
+                    learned_boxes[field_key] = {
+                        "normalized_box": {"x0": nx0, "y0": ny0, "x1": nx1, "y1": ny1},
+                        "field_type": field_type,
+                    }
+            if learned_boxes:
+                await db_mod.upsert_qwen_layout_boxes(
+                    pool, vendor_id_llm, template_id_llm, extraction_id, learned_boxes,
+                )
+                logger.info(
+                    "Page 1 boxes: saved %d field(s) for vendor=%s template=%s",
+                    len(learned_boxes), vendor_id_llm, template_id_llm,
+                )
+                plog.event(
+                    "page1_boxes_saved",
+                    stage="llm",
+                    **base,
+                    fields_learned=list(learned_boxes.keys()),
+                    count=len(learned_boxes),
+                )
 
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     if output.get("cancelled"):

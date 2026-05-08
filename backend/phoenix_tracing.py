@@ -17,13 +17,9 @@ Hierarchy for a 5-page digital PDF:
     │   │   └── ocr_page_N (per scanned page)
     │   └── unified_geometry_saved
     ├── stage.llm
-    │   ├── bbox_agent.learn_layout
-    │   │   ├── bbox_agent.build_prompt
-    │   │   ├── bbox_agent.llm_call (LLM span)
-    │   │   └── bbox_agent.parse_and_snap
-    │   ├── system_prompt_built
+    │   ├── system_prompt_built (builds two prompts: page1 w/ boxes + page2+ fields-only)
     │   ├── field_agent.extract_document
-    │   │   ├── page_1_extraction
+    │   │   ├── page_1_extraction (uses system_prompt_page1, returns {fields, boxes})
     │   │   │   ├── build_user_message
     │   │   │   └── llm.chat page_1/5 (LLM span)
     │   │   ├── page_2_extraction … page_5_extraction

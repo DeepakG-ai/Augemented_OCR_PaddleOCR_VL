@@ -2254,6 +2254,55 @@ async def get_extraction_page_usage(
     return await db_mod.get_extraction_page_usage(request.app.state.pool, extraction_id)
 
 
+@app.get("/user/documents")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_user_documents(
+    request: Request,
+    limit: int = 200,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    range: str | None = None,
+    user: dict = Depends(get_current_user),
+):
+    """Per-document usage for the currently authenticated user."""
+    pool = request.app.state.pool
+    start_dt, end_dt, _, _ = _usage_date_range(
+        date_from, date_to, default_today=(range != "all"),
+    )
+    return await db_mod.get_client_document_usage(
+        pool,
+        user["id"],
+        limit=limit,
+        date_from=start_dt,
+        date_to=end_dt,
+    )
+
+
+@app.get("/user/extractions/{extraction_id}/pages")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_user_extraction_page_usage(
+    request: Request,
+    extraction_id: int,
+    user: dict = Depends(get_current_user),
+):
+    """Per-page token breakdown for a user's own extraction."""
+    pool = request.app.state.pool
+    # Ownership check: extraction's vendor must belong to this user
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT e.id FROM extractions e
+            JOIN vendors v ON v.id = e.vendor_id AND v.user_id = $2::UUID
+            WHERE e.id = $1
+            """,
+            extraction_id,
+            user["id"],
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="Extraction not found")
+    return await db_mod.get_extraction_page_usage(pool, extraction_id)
+
+
 @app.get("/admin/usage")
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def get_admin_usage(

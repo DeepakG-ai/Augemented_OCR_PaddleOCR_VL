@@ -333,8 +333,8 @@ let _pipelineTimerInterval = null;
 const PIPELINE_STAGES = [
     { id: 'upload', label: 'Uploading', detail: 'Document stream received' },
     { id: 'detect', label: 'Detecting Vendor', detail: 'Reading page 1' },
-    { id: 'normalize', label: 'PDF Rendering', detail: 'Detecting digital PDF or scanned PDF boxes' },
-    { id: 'ocr', label: 'OCR Bounding Box', detail: 'Digital PDF or scanned PDF routing' },
+    { id: 'normalize', label: 'PDF Rendering', detail: 'Classifying pages and extracting geometry' },
+    { id: 'ocr', label: 'OCR Bounding Box', detail: 'Waiting for page classification' },
     { id: 'llm', label: 'Vision Extraction', detail: 'Qwen VL extraction' },
     { id: 'json', label: 'JSON Created', detail: 'Structured output assembled' },
     { id: 'postprocess', label: 'Post Processing', detail: 'Field mapping and review memory' },
@@ -501,13 +501,21 @@ function updatePipelineFromSSE(jobState) {
         setPipelineStage('detect', 'done', `Detected: ${extraction.vendor_name}`);
     }
 
-    // Mark all stages before current as done
+    // Mark all stages before current as done (preserve their live detail text)
     for (let i = 1; i < currentIdx; i++) {
         const s = stageOrder[i];
         const el = document.getElementById(`pipeStage_${s}`);
         if (el && !el.classList.contains('done')) {
+            // Read the current detail text from DOM (may have been set by a prior SSE event)
+            const detEl = document.getElementById(`pipeDetail_${s}`);
+            const liveDetail = detEl ? detEl.textContent : null;
             const stageInfo = PIPELINE_STAGES.find(p => p.id === s);
-            setPipelineStage(s, 'done', stageInfo ? stageInfo.detail + ' — complete' : 'Complete');
+            const fallback = stageInfo ? stageInfo.detail : 'Complete';
+            // Use the live detail if it differs from the default, otherwise append " — complete"
+            const finalDetail = (liveDetail && liveDetail !== fallback)
+                ? liveDetail
+                : fallback + ' — complete';
+            setPipelineStage(s, 'done', finalDetail);
         }
     }
 
@@ -539,11 +547,20 @@ function updatePipelineFromSSE(jobState) {
     if (stage === 'normalize') {
         const digital = progress.digital_pages;
         const scanned = progress.scanned_pages;
-        detail = Number.isFinite(digital) && Number.isFinite(scanned)
-            ? `Bounding boxes: ${digital} digital, ${scanned} scanned`
-            : 'Detecting digital PDF or scanned PDF boxes';
+        const total = progress.total_pages;
+        if (Number.isFinite(digital) && Number.isFinite(scanned)) {
+            if (scanned === 0) {
+                detail = `${total} page(s) — all digital`;
+            } else if (digital === 0) {
+                detail = `${total} page(s) — all scanned`;
+            } else {
+                detail = `${total} page(s) — ${digital} digital, ${scanned} scanned`;
+            }
+        } else {
+            detail = message || 'Classifying pages...';
+        }
     } else if (stage === 'ocr') {
-        detail = message || 'Reading scanned page bounding boxes';
+        detail = message || 'Processing page geometry';
     } else if (stage === 'llm') {
         detail = message || 'Vision extraction in progress';
     } else if (stage === 'postprocess') {

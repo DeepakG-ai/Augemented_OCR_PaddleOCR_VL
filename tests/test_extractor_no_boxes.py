@@ -1,7 +1,9 @@
 """
-Verify that the Fields Agent prompt contains no bbox/boxes references.
+Verify that the Fields Agent prompt (page 2+) contains no bbox/boxes references.
 
-The system prompt and user message must be fields-only after the two-agent split.
+After the v5.0 single-agent refactor:
+  - Page 1 (include_boxes=True) DOES contain box instructions.
+  - Page 2+ (include_boxes=False, the default) must remain fields-only.
 """
 from __future__ import annotations
 
@@ -21,14 +23,18 @@ LINE_ITEM_FIELDS = ["item_code", "description", "quantity", "unit_price", "amoun
 
 
 class ExtractorNoBboxTests(unittest.TestCase):
+    """Page 2+ prompt must be strictly fields-only (no boxes)."""
 
     def setUp(self):
+        # Default (include_boxes=False) = page 2+ behaviour
         self.system_prompt = extractor.build_system_prompt(
             HEADER_FIELDS, LINE_ITEM_FIELDS,
             instructions=None, rules=[], format_type="single_po_multipage",
+            include_boxes=False,
         )
         self.user_message = extractor.build_user_message(
-            HEADER_FIELDS, LINE_ITEM_FIELDS, page_num=1, total_pages=3,
+            HEADER_FIELDS, LINE_ITEM_FIELDS, page_num=2, total_pages=3,
+            include_boxes=False,
         )
 
     def test_system_prompt_no_boxes_keyword(self):
@@ -38,8 +44,6 @@ class ExtractorNoBboxTests(unittest.TestCase):
         self.assertNotIn("bounding", self.system_prompt.lower())
 
     def test_user_message_no_boxes_key(self):
-        import json
-        # The JSON shape must have "fields" at the top level, not "boxes"
         self.assertNotIn('"boxes"', self.user_message)
 
     def test_user_message_has_fields_template(self):
@@ -53,21 +57,20 @@ class ExtractorNoBboxTests(unittest.TestCase):
         for field in LINE_ITEM_FIELDS:
             self.assertIn(field, self.user_message)
 
-    def test_system_prompt_version_v4(self):
-        self.assertEqual(extractor.PROMPT_VERSION, "v4.0")
+    def test_system_prompt_version_v5(self):
+        self.assertEqual(extractor.PROMPT_VERSION, "v5.0")
 
     def test_prompt_with_gold_examples_no_boxes(self):
         gold = [{"correction_diff": {"supplier": "ACME Corp"}}]
         prompt = extractor.build_system_prompt(
             HEADER_FIELDS, LINE_ITEM_FIELDS,
             instructions=None, rules=[], format_type="single_po_multipage",
-            gold_examples=gold,
+            gold_examples=gold, include_boxes=False,
         )
         self.assertNotIn("boxes", prompt.lower())
         self.assertIn("ACME Corp", prompt)
 
     def test_auto_extract_mode_no_bbox(self):
-        # When no fields are passed (auto-extract mode)
         msg = extractor.build_user_message([], [], page_num=1, total_pages=1)
         self.assertNotIn("boxes", msg.lower())
         self.assertNotIn("bounding", msg.lower())
