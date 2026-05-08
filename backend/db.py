@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from uuid import UUID
 
 import asyncpg
 
@@ -443,6 +444,13 @@ def _record(row: asyncpg.Record | None, *json_keys: str) -> dict | None:
     return d
 
 
+def _stringify_uuid_fields(row: dict, *keys: str) -> dict:
+    for key in keys:
+        if row.get(key) is not None:
+            row[key] = str(row[key])
+    return row
+
+
 # -- LLM usage queries -----------------------------------------------------
 
 def _int_or_zero(value: Any) -> int:
@@ -457,6 +465,15 @@ def _int_or_none(value: Any) -> int | None:
         return None
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _uuid_or_none(value: Any) -> UUID | None:
+    if value is None:
+        return None
+    try:
+        return UUID(str(value))
     except (TypeError, ValueError):
         return None
 
@@ -667,6 +684,9 @@ async def get_client_document_usage(
     date_to: Any = None,
 ) -> list[dict]:
     """Return per-document token usage for a specific client user (admin only)."""
+    user_uuid = _uuid_or_none(user_id)
+    if user_uuid is None:
+        return []
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -695,7 +715,7 @@ async def get_client_document_usage(
             ORDER BY e.created_at DESC
             LIMIT $2
             """,
-            user_id,
+            user_uuid,
             max(1, min(limit, 500)),
             date_from,
             date_to,
@@ -800,10 +820,11 @@ async def get_usage_stats(
             date_to,
         )
     stats = {**dict(ext_row), **dict(llm_row)}
-    stats["failed_pages"] = max(
+    stats["unbilled_pages"] = max(
         int(stats.get("all_pages") or 0) - int(stats.get("billable_pages") or 0),
         0,
     )
+    stats["failed_pages"] = 0
     return stats
 
 
@@ -812,9 +833,10 @@ async def get_usage_stats(
 async def get_vendor(pool: asyncpg.Pool, vendor_id: str) -> dict | None:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, name, status, created_at FROM vendors WHERE id = $1", vendor_id
+            "SELECT id, name, status, user_id, created_at FROM vendors WHERE id = $1",
+            vendor_id,
         )
-        return dict(row) if row else None
+        return _stringify_uuid_fields(dict(row), "user_id") if row else None
 
 
 async def list_vendors(pool: asyncpg.Pool, user_id: str | None = None) -> list[dict]:
@@ -840,12 +862,14 @@ async def upsert_vendor(
         row = await conn.fetchrow(
             """
             INSERT INTO vendors (id, name, user_id) VALUES ($1, $2, $3)
-            ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name
+            ON CONFLICT (id) DO UPDATE SET
+                name = EXCLUDED.name,
+                user_id = COALESCE(EXCLUDED.user_id, vendors.user_id)
             RETURNING id, name, status, user_id, created_at
             """,
-            vendor_id, name, user_id,
+            vendor_id, name, _uuid_or_none(user_id),
         )
-        return dict(row)
+        return _stringify_uuid_fields(dict(row), "user_id")
 
 
 async def get_vendor_owner(pool: asyncpg.Pool, vendor_id: str) -> str | None:
@@ -885,7 +909,7 @@ async def create_user(
             """,
             email.lower().strip(), hashed_pw, role,
         )
-        return dict(row)
+        return _stringify_uuid_fields(dict(row), "id")
 
 
 async def get_user_by_email(pool: asyncpg.Pool, email: str) -> dict | None:
@@ -897,19 +921,22 @@ async def get_user_by_email(pool: asyncpg.Pool, email: str) -> dict | None:
             """,
             email.lower().strip(),
         )
-        return dict(row) if row else None
+        return _stringify_uuid_fields(dict(row), "id") if row else None
 
 
 async def get_user_by_id(pool: asyncpg.Pool, user_id: str) -> dict | None:
+    user_uuid = _uuid_or_none(user_id)
+    if user_uuid is None:
+        return None
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             SELECT id, email, role, is_active, created_at
             FROM users WHERE id = $1
             """,
-            user_id,
+            user_uuid,
         )
-        return dict(row) if row else None
+        return _stringify_uuid_fields(dict(row), "id") if row else None
 
 
 async def list_users(pool: asyncpg.Pool) -> list[dict]:
@@ -920,21 +947,27 @@ async def list_users(pool: asyncpg.Pool) -> list[dict]:
             FROM users ORDER BY created_at DESC
             """
         )
-        return [dict(r) for r in rows]
+        return [_stringify_uuid_fields(dict(r), "id") for r in rows]
 
 
 async def deactivate_user(pool: asyncpg.Pool, user_id: str) -> bool:
+    user_uuid = _uuid_or_none(user_id)
+    if user_uuid is None:
+        return False
     async with pool.acquire() as conn:
         result = await conn.execute(
-            "UPDATE users SET is_active = FALSE WHERE id = $1", user_id,
+            "UPDATE users SET is_active = FALSE WHERE id = $1", user_uuid,
         )
         return result.endswith(" 1")
 
 
 async def reset_user_password(pool: asyncpg.Pool, user_id: str, hashed_pw: str) -> bool:
+    user_uuid = _uuid_or_none(user_id)
+    if user_uuid is None:
+        return False
     async with pool.acquire() as conn:
         result = await conn.execute(
-            "UPDATE users SET hashed_pw = $1 WHERE id = $2", hashed_pw, user_id,
+            "UPDATE users SET hashed_pw = $1 WHERE id = $2", hashed_pw, user_uuid,
         )
         return result.endswith(" 1")
 

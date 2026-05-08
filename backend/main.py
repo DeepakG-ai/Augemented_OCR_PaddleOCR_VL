@@ -2229,6 +2229,7 @@ async def get_client_usage_dashboard(
             "total_extractions": int(stats.get("total_extractions") or 0),
             "total_pages": int(stats.get("all_pages") or stats.get("total_pages") or 0),
             "billable_pages": int(stats.get("billable_pages") or 0),
+            "unbilled_pages": int(stats.get("unbilled_pages") or 0),
             "failed_pages": int(stats.get("failed_pages") or 0),
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
