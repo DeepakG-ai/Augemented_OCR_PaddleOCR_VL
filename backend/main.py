@@ -144,6 +144,7 @@ except ImportError:
     )
 
 from .config import LLM_URL, LLM_MODEL, RATE_LIMIT_PER_MINUTE as RATE_LIMIT, MAX_UPLOAD_BYTES
+from .config import DEFAULT_SUBSCRIPTION_LIMIT, SUBSCRIPTION_WARNING_THRESHOLD
 
 # ── Centralized logging (replaces inline basicConfig) ───────────────
 configure_logging()
@@ -448,6 +449,19 @@ async def auth_me(request: Request, user: dict = Depends(get_current_user)):
     )
 
 
+@app.get("/me/usage")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_my_usage(request: Request, user: dict = Depends(get_current_user)):
+    """Return the calling user's page usage against their subscription limit."""
+    pool = request.app.state.pool
+    usage = await db_mod.get_user_billable_pages(pool, user["id"])
+    return {
+        "user_id": user["id"],
+        "email": user.get("email"),
+        **usage,
+    }
+
+
 # -- Admin: User Management -------------------------------------------------
 
 @app.get("/admin/users", response_model=list[UserOut])
@@ -460,6 +474,7 @@ async def admin_list_users(request: Request, user: dict = Depends(require_admin)
             email=r["email"],
             role=r["role"],
             is_active=r.get("is_active", True),
+            subscription_limit=r.get("subscription_limit", 0),
             created_at=r.get("created_at"),
         )
         for r in rows
@@ -485,6 +500,7 @@ async def admin_create_user(
         email=created["email"],
         role=created["role"],
         is_active=created.get("is_active", True),
+        subscription_limit=created.get("subscription_limit", 0),
         created_at=created.get("created_at"),
     )
 
@@ -520,6 +536,49 @@ async def admin_reset_user_password(
     if not ok:
         raise HTTPException(status_code=404, detail="User not found")
     return {"status": "password_reset", "user_id": user_id}
+
+
+@app.get("/admin/users/{user_id}/usage")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_get_user_usage(
+    request: Request,
+    user_id: str,
+    user: dict = Depends(require_admin),
+):
+    """Get a user's current billable page usage and subscription limit."""
+    pool = request.app.state.pool
+    target = await db_mod.get_user_by_id(pool, user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    usage = await db_mod.get_user_billable_pages(pool, user_id)
+    return {
+        "user_id": user_id,
+        "email": target["email"],
+        **usage,
+    }
+
+
+@app.patch("/admin/users/{user_id}/subscription-limit")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_update_subscription_limit(
+    request: Request,
+    user_id: str,
+    body: dict,
+    user: dict = Depends(require_admin),
+):
+    """Update a user's subscription page limit at runtime.
+
+    Body: {"subscription_limit": 2000}
+    """
+    pool = request.app.state.pool
+    new_limit = body.get("subscription_limit")
+    if new_limit is None or not isinstance(new_limit, int) or new_limit < 0:
+        raise HTTPException(status_code=400, detail="subscription_limit must be a non-negative integer")
+    ok = await db_mod.update_user_subscription_limit(pool, user_id, new_limit)
+    if not ok:
+        raise HTTPException(status_code=404, detail="User not found")
+    logger.info("Admin %s updated subscription_limit for user %s to %d", user["id"], user_id, new_limit)
+    return {"status": "updated", "user_id": user_id, "subscription_limit": new_limit}
 
 
 # -- Vendors ----------------------------------------------------------------
@@ -708,17 +767,51 @@ async def get_template(request: Request, vendor_id: str, user: dict = Depends(ge
         raise HTTPException(404, detail="No template configured for this vendor")
         
     tmpl = dict(tmpl_row)
-    try:
-        from . import extractor
-        tmpl["user_prompt"] = extractor.build_user_message(
-            tmpl.get("header_fields") or [],
-            tmpl.get("line_item_fields") or [],
-            page_num=1,
-            total_pages=1
-        )
-    except Exception as e:
-        logger.warning("Failed to build user prompt preview: %s", e)
-        tmpl["user_prompt"] = "Error building preview"
+    tmpl["system_prompt"] = None
+    tmpl["user_prompt"] = None
+    tmpl["system_prompt_page1"] = None
+    tmpl["user_prompt_page1"] = None
+    tmpl["system_prompt_page2"] = None
+    tmpl["user_prompt_page2"] = None
+
+    if user.get("role") == "admin":
+        try:
+            from . import extractor
+            vendor = await db_mod.get_vendor(request.app.state.pool, vendor_id)
+            gold_examples = await db_mod.get_gold_examples(request.app.state.pool, vendor_id)
+            prompt_args = dict(
+                header_fields=tmpl.get("header_fields") or [],
+                line_item_fields=tmpl.get("line_item_fields") or [],
+                instructions=tmpl.get("prompt_instructions"),
+                rules=tmpl.get("extraction_rules") or [],
+                format_type=tmpl.get("format_type") or "single_po_multipage",
+                gold_examples=gold_examples,
+            )
+            tmpl["system_prompt_page1"] = extractor.build_system_prompt(
+                **prompt_args,
+                include_boxes=True,
+                vendor_name=(vendor or {}).get("name"),
+            )
+            tmpl["user_prompt_page1"] = extractor.build_user_message(
+                tmpl.get("header_fields") or [],
+                tmpl.get("line_item_fields") or [],
+                page_num=1,
+                total_pages=2,
+                include_boxes=True,
+            )
+            tmpl["system_prompt_page2"] = extractor.build_system_prompt(**prompt_args, include_boxes=False)
+            tmpl["user_prompt_page2"] = extractor.build_user_message(
+                tmpl.get("header_fields") or [],
+                tmpl.get("line_item_fields") or [],
+                page_num=2,
+                total_pages=2,
+                include_boxes=False,
+            )
+            tmpl["system_prompt"] = tmpl["system_prompt_page1"]
+            tmpl["user_prompt"] = tmpl["user_prompt_page1"]
+        except Exception as e:
+            logger.warning("Failed to build admin prompt preview: %s", e)
+            tmpl["user_prompt"] = "Error building preview"
         
     return TemplateOut(**tmpl)
 
@@ -836,7 +929,7 @@ async def save_template(
         return TemplateSaveResponse(
             template_id=tmpl["id"],
             prompt_hash=prompt_hash,
-            system_prompt_preview=system_prompt[:200],
+            system_prompt_preview=system_prompt[:200] if user.get("role") == "admin" else "",
         )
     except Exception:
         logger.error("Template save FAILED vendor=%s:\n%s", vendor_id, traceback.format_exc())
@@ -1102,6 +1195,72 @@ async def ingest_document(
     detected_vendor = None
     req_header = json.loads(header_fields) if header_fields else []
     req_items = json.loads(line_item_fields) if line_item_fields else []
+
+    # -- Subscription quota check (soft limit) ---------------------------------
+    # Soft-limit model: the request that pushed usage to/past the limit was
+    # allowed through. Every subsequent request is blocked with 402 until an
+    # admin raises the limit. Admins are never subject to quota checks.
+    usage_warning = None
+    if user.get("role") != "admin":
+        try:
+            usage_info = await db_mod.get_user_billable_pages(pool, user["id"])
+            u_used = usage_info["billable_pages"]
+            u_limit = usage_info["subscription_limit"]
+            u_remaining = usage_info["remaining"]
+            u_pct = u_used / max(u_limit, 1)
+            if u_used >= u_limit:
+                _user_record = await db_mod.get_user_by_id(pool, user["id"])
+                page_logger.log_limit_alert(
+                    user_id=user["id"],
+                    email=(_user_record or {}).get("email"),
+                    total_extracted_pages=u_used,
+                    subscription_limit=u_limit,
+                    alert_type="exceeded",
+                    filename=filename,
+                )
+                overage = u_limit - u_used  # negative number, e.g. -3
+                raise HTTPException(
+                    status_code=402,
+                    detail={
+                        "code": "QUOTA_EXCEEDED",
+                        "message": (
+                            f"Page limit exceeded. "
+                            f"Subscription: {u_limit} pages, "
+                            f"Extracted: {u_used} pages, "
+                            f"Overage: {overage} pages. "
+                            "Contact your administrator to increase your limit."
+                        ),
+                        "subscription_limit": u_limit,
+                        "total_extracted_pages": u_used,
+                        "overage": overage,
+                    },
+                )
+            elif u_pct >= SUBSCRIPTION_WARNING_THRESHOLD:
+                usage_warning = {
+                    "level": "warning",
+                    "message": (
+                        f"You have used {u_used} of {u_limit} pages "
+                        f"({round(u_pct * 100, 1)}%). "
+                        f"Only {u_remaining} pages remaining."
+                    ),
+                    "subscription_limit": u_limit,
+                    "total_extracted_pages": u_used,
+                    "remaining": u_remaining,
+                }
+                _user_record = await db_mod.get_user_by_id(pool, user["id"])
+                page_logger.log_limit_alert(
+                    user_id=user["id"],
+                    email=(_user_record or {}).get("email"),
+                    total_extracted_pages=u_used,
+                    subscription_limit=u_limit,
+                    alert_type="warning",
+                    filename=filename,
+                )
+        except HTTPException:
+            raise
+        except Exception as usage_exc:
+            logger.warning("Subscription usage check failed (non-blocking): %s", usage_exc)
+
     plog.event(
         "file_received",
         stage="ingest",
@@ -1280,6 +1439,8 @@ async def ingest_document(
         result = resp.model_dump() if hasattr(resp, "model_dump") else resp.dict()
         if detected_vendor:
             result["detected_vendor"] = detected_vendor
+        if usage_warning:
+            result["usage_warning"] = usage_warning
         pipeline["status"] = "queued"
         pipeline["extraction_id"] = submitted["extraction"]["id"]
         pipeline["document_id"] = submitted["extraction"].get("document_id")
@@ -1474,6 +1635,44 @@ async def queue_resume_extraction(
         raise HTTPException(404, detail="Extraction not found")
     if extraction["status"] not in ("partial", "cancelled", "failed", "cancelling"):
         raise HTTPException(400, detail=f"Cannot resume extraction with status '{extraction['status']}'")
+
+    # -- Quota check (same rule as /ingest/ui) --------------------------------
+    if user.get("role") != "admin":
+        try:
+            usage_info = await db_mod.get_user_billable_pages(pool, user["id"])
+            u_used = usage_info["billable_pages"]
+            u_limit = usage_info["subscription_limit"]
+            if u_used >= u_limit:
+                _user_record = await db_mod.get_user_by_id(pool, user["id"])
+                page_logger.log_limit_alert(
+                    user_id=user["id"],
+                    email=(_user_record or {}).get("email"),
+                    total_extracted_pages=u_used,
+                    subscription_limit=u_limit,
+                    alert_type="exceeded",
+                    filename=extraction.get("filename"),
+                )
+                overage = u_limit - u_used
+                raise HTTPException(
+                    status_code=402,
+                    detail={
+                        "code": "QUOTA_EXCEEDED",
+                        "message": (
+                            f"Page limit exceeded. "
+                            f"Subscription: {u_limit} pages, "
+                            f"Extracted: {u_used} pages, "
+                            f"Overage: {overage} pages. "
+                            "Contact your administrator to increase your limit."
+                        ),
+                        "subscription_limit": u_limit,
+                        "total_extracted_pages": u_used,
+                        "overage": overage,
+                    },
+                )
+        except HTTPException:
+            raise
+        except Exception as usage_exc:
+            logger.warning("Subscription usage check failed on resume (non-blocking): %s", usage_exc)
 
     jobs = await db_mod.list_jobs_for_extraction(pool, extraction_id)
     inflight_jobs = [job for job in jobs if job["status"] in ("queued", "running", "cancelling")]
@@ -1704,7 +1903,8 @@ async def upload_preview(
     else:
         raise HTTPException(400, detail=f"Unsupported file type: {filename}")
 
-    return {"filename": filename, "total_pages": len(pages), "pages": pages}
+    total_pages = pages[0].get("doc_total_pages", len(pages)) if pages else 0
+    return {"filename": filename, "total_pages": total_pages, "pages": pages}
 
 
 # -- Review: OCR Data for Click-to-Select -----------------------------------
@@ -1841,8 +2041,8 @@ async def save_extraction_corrections(
     """Persist user corrections from the Review page.
 
     Saves to corrected_result (original result stays immutable).
-    Auto-creates a gold example for this vendor if fields were changed.
-    Invalidates prompt cache so next extraction uses the gold example.
+    Auto-creates an audit gold example for this vendor if fields were changed.
+    Future prompts use only value-redacted field hints from those examples.
     """
     pool_for_check = request.app.state.pool
     await assert_extraction_access(pool_for_check, extraction_id, user)
@@ -1858,7 +2058,7 @@ async def save_extraction_corrections(
 
     pool = request.app.state.pool
 
-    # Get original extraction to compare and create gold example
+    # Get original extraction to compare and create an audit gold example.
     extraction = await db_mod.get_extraction(pool, extraction_id)
     if not extraction:
         raise HTTPException(404, detail=f"Extraction {extraction_id} not found")
@@ -1931,7 +2131,7 @@ async def save_extraction_corrections(
         diff=correction_diff,
     )
 
-    # Auto-create gold example if any header fields were actually changed.
+    # Auto-create an audit gold example if any header fields were actually changed.
     # Exclude all line-item data: "line_items" (single PO) and "doc_N_line_items" (po_per_page).
     # Old table rows as few-shot examples add noise, not signal (AGENTS.md §7).
     gold_id = None
@@ -2123,7 +2323,14 @@ async def get_user_stats(request: Request, user: dict = Depends(get_current_user
     uid = None if user["role"] == "admin" else user["id"]
     stats = await db_mod.get_usage_stats(pool, user_id=uid)
     days = await db_mod.get_llm_usage_daily_summary(pool, limit=30, user_id=uid)
-    return {"stats": stats, "days": days}
+    response = {"stats": stats, "days": days}
+    # Include subscription limit info for non-admin users
+    if uid is not None:
+        try:
+            response["subscription"] = await db_mod.get_user_billable_pages(pool, uid)
+        except Exception:
+            pass
+    return response
 
 
 @app.get("/admin/stats")
@@ -2214,6 +2421,14 @@ async def get_client_usage_dashboard(
 
     input_tokens = int(stats.get("total_input_tokens") or 0)
     output_tokens = int(stats.get("total_output_tokens") or 0)
+
+    # All-time subscription usage (independent of date range)
+    subscription = {}
+    try:
+        subscription = await db_mod.get_user_billable_pages(pool, client_user_id)
+    except Exception:
+        pass
+
     return {
         "client": {
             "user_id": client["id"],
@@ -2224,6 +2439,7 @@ async def get_client_usage_dashboard(
         "date_from": start_label,
         "date_to": end_label,
         "range": range or ("custom" if date_from or date_to else "today"),
+        "subscription": subscription,
         "stats": {
             "todays_pdfs": int(stats.get("total_pdfs") or 0),
             "total_extractions": int(stats.get("total_extractions") or 0),

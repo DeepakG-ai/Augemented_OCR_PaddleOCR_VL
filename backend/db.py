@@ -11,7 +11,10 @@ from uuid import UUID
 
 import asyncpg
 
-from .config import DATABASE_URL
+if __package__:
+    from .config import DATABASE_URL
+else:
+    from config import DATABASE_URL  # type: ignore[no-redef]
 
 
 # -- Pool creation ---------------------------------------------------------
@@ -422,6 +425,17 @@ async def init(pool: asyncpg.Pool) -> None:
                     WHERE table_name = 'documents' AND column_name = 'object_key'
                 ) THEN
                     NULL;
+                END IF;
+            END $$;
+        """)
+        # Migration: add subscription_limit to users for SaaS page quotas
+        await conn.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'users' AND column_name = 'subscription_limit'
+                ) THEN
+                    ALTER TABLE users ADD COLUMN subscription_limit INT NOT NULL DEFAULT 0;
                 END IF;
             END $$;
         """)
@@ -943,7 +957,7 @@ async def list_users(pool: asyncpg.Pool) -> list[dict]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, email, role, is_active, created_at
+            SELECT id, email, role, is_active, created_at, subscription_limit
             FROM users ORDER BY created_at DESC
             """
         )
@@ -1889,7 +1903,10 @@ async def save_gold_example(
     corrected_result: dict,
     correction_diff: dict | None = None,
 ) -> int:
-    """Store a human-verified correction as a gold example for future prompts."""
+    """Store a human-verified correction as audit history.
+
+    Prompt builders must redact field values before using this data.
+    """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -1910,12 +1927,12 @@ async def get_gold_examples(
     vendor_id: str,
     limit: int | None = None,
 ) -> list[dict]:
-    """Retrieve latest correction per field for prompt injection.
+    """Retrieve latest correction per field for value-redacted prompt hints.
 
     gold_examples remains append-only for audit history, but the prompt should
-    not receive stale conflicting examples for the same field. This returns a
+    not receive stale conflicting hints for the same field. This returns a
     single consolidated correction_diff object where each field uses its latest
-    saved correction.
+    saved correction. Callers must not expose the raw values to the model.
     """
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -2432,3 +2449,66 @@ async def list_deliveries(pool: asyncpg.Pool, extraction_id: int) -> list[dict]:
             _parse_jsonb(d, "payload")
             results.append(d)
         return results
+
+
+# -- Subscription / page-limit queries ------------------------------------
+
+async def get_user_billable_pages(
+    pool: asyncpg.Pool,
+    user_id: str,
+) -> dict:
+    """Return current billable page count and subscription limit for a user.
+
+    Billable pages = COUNT(DISTINCT (extraction_id, page_num))
+                     WHERE call_type = 'extraction'
+                     scoped to the user's vendors.
+    """
+    uid = _uuid_or_none(user_id)
+    if uid is None:
+        return {"billable_pages": 0, "subscription_limit": 0, "remaining": 0}
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                COALESCE(u.subscription_limit, 0) AS subscription_limit,
+                (
+                    SELECT COUNT(DISTINCT (lu.extraction_id, lu.page_num))
+                    FROM llm_usage lu
+                    JOIN vendors v ON v.id = lu.vendor_id
+                    WHERE v.user_id = $1
+                      AND lu.call_type = 'extraction'
+                      AND lu.extraction_id IS NOT NULL
+                      AND lu.page_num IS NOT NULL
+                )::INT AS billable_pages
+            FROM users u
+            WHERE u.id = $1
+            """,
+            uid,
+        )
+    if not row:
+        return {"billable_pages": 0, "subscription_limit": 0, "remaining": 0}
+    limit_val = int(row["subscription_limit"])
+    used = int(row["billable_pages"])
+    return {
+        "billable_pages": used,
+        "subscription_limit": limit_val,
+        "remaining": limit_val - used,
+    }
+
+
+async def update_user_subscription_limit(
+    pool: asyncpg.Pool,
+    user_id: str,
+    new_limit: int,
+) -> bool:
+    """Update the subscription_limit for a user. Admin-only at runtime."""
+    uid = _uuid_or_none(user_id)
+    if uid is None:
+        return False
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE users SET subscription_limit = $1 WHERE id = $2",
+            new_limit,
+            uid,
+        )
+        return result.endswith(" 1")

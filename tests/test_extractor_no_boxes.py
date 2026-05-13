@@ -1,7 +1,7 @@
 """
 Verify that the Fields Agent prompt (page 2+) contains no bbox/boxes references.
 
-After the v5.0 single-agent refactor:
+After the v5.2 single-agent refactor:
   - Page 1 (include_boxes=True) DOES contain box instructions.
   - Page 2+ (include_boxes=False, the default) must remain fields-only.
 """
@@ -58,17 +58,20 @@ class ExtractorNoBboxTests(unittest.TestCase):
             self.assertIn(field, self.user_message)
 
     def test_system_prompt_version_v5(self):
-        self.assertEqual(extractor.PROMPT_VERSION, "v5.0")
+        self.assertEqual(extractor.PROMPT_VERSION, "v5.2")
 
-    def test_prompt_with_gold_examples_no_boxes(self):
-        gold = [{"correction_diff": {"supplier": "ACME Corp"}}]
+    def test_prompt_with_gold_examples_no_boxes_or_value_leak(self):
+        gold = [{"correction_diff": {"supplier": {"original": "Wrong Co", "corrected": "ACME Corp"}}}]
         prompt = extractor.build_system_prompt(
             HEADER_FIELDS, LINE_ITEM_FIELDS,
             instructions=None, rules=[], format_type="single_po_multipage",
             gold_examples=gold, include_boxes=False,
         )
         self.assertNotIn("boxes", prompt.lower())
-        self.assertIn("ACME Corp", prompt)
+        self.assertIn("supplier", prompt)
+        self.assertIn("Values are intentionally redacted", prompt)
+        self.assertNotIn("ACME Corp", prompt)
+        self.assertNotIn("Wrong Co", prompt)
 
     def test_auto_extract_mode_no_bbox(self):
         msg = extractor.build_user_message([], [], page_num=1, total_pages=1)

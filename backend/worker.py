@@ -571,6 +571,10 @@ async def _process_llm(pool, job: dict) -> None:
         attributes=base,
     ) as prompt_trace:
         gold_examples = await db_mod.get_gold_examples(pool, extraction_row["vendor_id"])
+
+
+
+
         _prompt_args = dict(
             header_fields=req_header,
             line_item_fields=req_items,
@@ -581,8 +585,12 @@ async def _process_llm(pool, job: dict) -> None:
         )
         # Page 2+ system prompt: fields only (current behaviour)
         system_prompt = extractor.build_system_prompt(**_prompt_args, include_boxes=False)
-        # Page 1 system prompt: fields + bounding boxes
-        system_prompt_page1 = extractor.build_system_prompt(**_prompt_args, include_boxes=True)
+        # Page 1 system prompt: fields + bounding boxes + vendor verification
+        system_prompt_page1 = extractor.build_system_prompt(
+            **_prompt_args,
+            include_boxes=True,
+            vendor_name=extraction_row.get("vendor_name"),
+        )
         prompt_trace["output"] = {
             "prompt_version": getattr(extractor, "PROMPT_VERSION", "unknown"),
             "gold_examples_count": len(gold_examples),
@@ -591,7 +599,10 @@ async def _process_llm(pool, job: dict) -> None:
             "system_prompt": system_prompt,
         }
     if gold_examples:
-        logger.info("LLM prompt includes %d gold example(s) for vendor=%s", len(gold_examples), extraction_row["vendor_id"])
+        logger.info(
+            "LLM prompt includes %d value-redacted correction hint set(s) for vendor=%s",
+            len(gold_examples), extraction_row["vendor_id"],
+        )
 
     pages = await _load_pages(pool, extraction_id)
 
@@ -607,6 +618,10 @@ async def _process_llm(pool, job: dict) -> None:
     )
 
     async def on_page_done(page_num: int, total_pages: int, page_result: dict | None) -> None:
+        if page_num == 1 and page_result and page_result.get("vendor_confirmed") is False:
+            logger.warning("Vendor verification failed on page 1 for extraction %s", extraction_id)
+            page_result["_error"] = "vendor_unverified"
+            cancel_event.set()
         progress = {
             "stage": "llm",
             "message": f"Extracting page {page_num}/{total_pages}",
@@ -728,8 +743,14 @@ async def _process_llm(pool, job: dict) -> None:
                 )
 
     elapsed_ms = int((time.perf_counter() - start) * 1000)
-    if output.get("cancelled"):
-        status = "partial" if output.get("page_results") else "cancelled"
+    _pr = output.get("page_results") or []
+    _unverified = any(pr.get("_error") == "vendor_unverified" for pr in _pr)
+
+    if _unverified:
+        status = "unverified"
+        logger.error("Extraction %s failed: Vendor unverified", extraction_id)
+    elif output.get("cancelled"):
+        status = "partial" if _pr else "cancelled"
     else:
         # Don't set "done" here — postprocess worker sets the final status
         # after computing field-to-bounding-box mappings. Keeping "processing"

@@ -104,8 +104,8 @@ function _renderPieChart(inputTokens, outputTokens) {
     </div>`;
 }
 
-// ── LINE CHART (daily input vs output tokens, last 30 days) ───────────
-function _renderLineChart(days) {
+// ── BAR CHART (daily input vs output tokens, last 30 days) ────────────
+function _renderBarChart(days) {
     if (!days || days.length === 0) {
         return `<div style="color:var(--text-dim);text-align:center;padding:48px 0;font-size:10px">No data yet</div>`;
     }
@@ -122,7 +122,6 @@ function _renderLineChart(days) {
         1
     );
 
-    function xP(i) { return PAD.left + (i / Math.max(n - 1, 1)) * cW; }
     function yP(v) { return PAD.top + cH - (Number(v || 0) / maxVal) * cH; }
 
     const gridLines = [0.25, 0.5, 0.75, 1.0].map(f => {
@@ -134,41 +133,48 @@ function _renderLineChart(days) {
                       >${fmtTokens(maxVal * f)}</text>`;
     }).join('');
 
+    const baseY = PAD.top + cH;
+    const slotW = cW / Math.max(n, 1);
+    const groupGap = Math.min(12, slotW * 0.28);
+    const groupW = Math.min(42, Math.max(2, slotW - groupGap));
+    const barGap = groupW >= 5 ? Math.min(4, groupW * 0.16) : 0.5;
+    const barW = Math.max(1, (groupW - barGap) / 2);
+
+    function groupX(i) { return PAD.left + i * slotW + (slotW - groupW) / 2; }
+    function groupCenter(i) { return groupX(i) + groupW / 2; }
+
     const step = Math.max(1, Math.floor(n / 8));
     const xLabels = sorted
-        .filter((_, i) => i % step === 0 || i === n - 1)
-        .map(d => {
-            const i = sorted.indexOf(d);
+        .map((d, i) => ({ d, i }))
+        .filter(({ i }) => i % step === 0 || i === n - 1)
+        .map(({ d, i }) => {
             const label = String(d.day || '').slice(5);
-            return `<text x="${xP(i)}" y="${H - 5}" text-anchor="middle"
+            return `<text x="${groupCenter(i)}" y="${H - 5}" text-anchor="middle"
                           fill="var(--text-dim)" font-size="9" font-family="JetBrains Mono,monospace"
                           >${label}</text>`;
         }).join('');
 
-    const inputPts  = sorted.map((d, i) => `${xP(i)},${yP(d.input_tokens)}`).join(' ');
-    const outputPts = sorted.map((d, i) => `${xP(i)},${yP(d.output_tokens)}`).join(' ');
+    function barRect(d, i, key, color, label, offset) {
+        const value = Number(d[key] || 0);
+        const height = value > 0 ? Math.max(1, baseY - yP(value)) : 0;
+        const x = groupX(i) + offset;
+        const y = baseY - height;
+        return `<rect x="${x}" y="${y}" width="${barW}" height="${height}" rx="1.5" fill="${color}" opacity="0.9">
+                    <title>${escapeHtml(String(d.day || '').slice(5))}: ${fmtTokens(value)} ${label}</title>
+                </rect>`;
+    }
 
-    const baseY = PAD.top + cH;
-    const inputAreaPts  = `${xP(0)},${baseY} ${inputPts}  ${xP(n-1)},${baseY}`;
-    const outputAreaPts = `${xP(0)},${baseY} ${outputPts} ${xP(n-1)},${baseY}`;
-
-    const inputDots  = sorted.map((d, i) =>
-        `<circle cx="${xP(i)}" cy="${yP(d.input_tokens)}"  r="3" fill="#3b82f6"
-                 style="cursor:default" title="${String(d.day).slice(5)}: ${fmtTokens(d.input_tokens)} input"/>`
-    ).join('');
-    const outputDots = sorted.map((d, i) =>
-        `<circle cx="${xP(i)}" cy="${yP(d.output_tokens)}" r="3" fill="#22c55e"
-                 style="cursor:default" title="${String(d.day).slice(5)}: ${fmtTokens(d.output_tokens)} output"/>`
+    const bars = sorted.map((d, i) =>
+        barRect(d, i, 'input_tokens', '#3b82f6', 'input', 0) +
+        barRect(d, i, 'output_tokens', '#22c55e', 'output', barW + barGap)
     ).join('');
 
     return `
     <svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" style="max-width:${W}px;display:block">
         ${gridLines}
-        <polygon points="${inputAreaPts}"  fill="#3b82f6" opacity="0.08"/>
-        <polygon points="${outputAreaPts}" fill="#22c55e" opacity="0.08"/>
-        <polyline points="${inputPts}"  fill="none" stroke="#3b82f6" stroke-width="2" stroke-linejoin="round"/>
-        <polyline points="${outputPts}" fill="none" stroke="#22c55e" stroke-width="2" stroke-linejoin="round"/>
-        ${inputDots}${outputDots}
+        <line x1="${PAD.left}" y1="${baseY}" x2="${W - PAD.right}" y2="${baseY}"
+              stroke="var(--border)" stroke-width="1"/>
+        ${bars}
         ${xLabels}
     </svg>`;
 }
@@ -521,13 +527,13 @@ async function renderDashboardPage(app) {
                 </div>
                 <div style="display:flex;gap:20px;margin-bottom:12px">
                     <span style="display:flex;align-items:center;gap:6px;font-size:9px;color:var(--text-dim)">
-                        <span style="display:inline-block;width:22px;height:2px;background:#3b82f6;border-radius:1px"></span>Input
+                        <span style="display:inline-block;width:10px;height:10px;background:#3b82f6;border-radius:2px"></span>Input
                     </span>
                     <span style="display:flex;align-items:center;gap:6px;font-size:9px;color:var(--text-dim)">
-                        <span style="display:inline-block;width:22px;height:2px;background:#22c55e;border-radius:1px"></span>Output
+                        <span style="display:inline-block;width:10px;height:10px;background:#22c55e;border-radius:2px"></span>Output
                     </span>
                 </div>
-                ${_renderLineChart(days)}
+                ${_renderBarChart(days)}
             </div>
             <div style="background:var(--bg1);border:1px solid var(--border);border-radius:4px;padding:18px 20px;text-align:center">
                 <div style="font-size:9px;letter-spacing:0.14em;color:var(--text-dim);margin-bottom:12px">
@@ -724,7 +730,7 @@ async function renderClientDashboardPage(app, userId) {
 
         <div style="background:var(--bg1);border:1px solid var(--border);border-radius:4px;padding:18px 20px;margin-bottom:20px">
             <div style="font-size:9px;letter-spacing:0.14em;color:var(--text-dim);margin-bottom:12px">CLIENT TOKEN TREND</div>
-            ${_renderLineChart(data.days || [])}
+            ${_renderBarChart(data.days || [])}
         </div>
 
         <div style="background:var(--bg1);border:1px solid var(--border);border-radius:4px;overflow:hidden">

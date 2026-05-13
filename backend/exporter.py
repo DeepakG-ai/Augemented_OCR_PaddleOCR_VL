@@ -32,7 +32,16 @@ def _stringify(value: Any) -> str:
         return "true" if value else "false"
     if isinstance(value, (list, dict)):
         return str(value)
-    return str(value)
+    s = str(value)
+    if s:
+        first = s[0]
+        if first in ("=", "+", "@", "\t", "\r", "\n"):
+            s = "'" + s
+        elif first == "-":
+            rest = s[1:]
+            if rest and (not rest.replace(".", "").isdigit()):
+                s = "'" + s
+    return s
 
 
 def _header_pairs(contract: dict[str, Any]) -> list[tuple[str, str]]:

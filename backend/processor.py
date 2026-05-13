@@ -149,6 +149,7 @@ def _render_pdf_sync(file_bytes: bytes, dpi: int = DPI_DEFAULT, max_pages: int |
                     "height":      img.height,
                     "orig_width":  orig_w,
                     "orig_height": orig_h,
+                    "doc_total_pages": total_pages,
                 })
 
             except Exception as page_err:
@@ -189,6 +190,7 @@ def _resize_image_sync(file_bytes: bytes) -> list[dict]:
         "height":      img.height,
         "orig_width":  w,
         "orig_height": h,
+        "doc_total_pages": 1,
     }]
 
 

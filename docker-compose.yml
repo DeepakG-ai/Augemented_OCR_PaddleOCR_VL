@@ -4,15 +4,15 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: augocr
-      POSTGRES_USER: augocr
-      POSTGRES_PASSWORD: augocr
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
       - "5432:5432"
     healthcheck:
-      test: [ "CMD", "pg_isready", "-U", "augocr", "-d", "augocr" ]
+      test: [ "CMD", "pg_isready", "-U", "${POSTGRES_USER}", "-d", "${POSTGRES_DB}" ]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -22,8 +22,8 @@ services:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
     volumes:
       - miniodata:/data
     ports:
@@ -41,10 +41,10 @@ services:
       dockerfile: Dockerfile
     command: [ "python", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000" ]
     environment:
-      DATABASE_URL: postgresql://augocr:augocr@postgres:5432/augocr
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
       MINIO_SECURE: "false"
       PHOENIX_COLLECTOR_ENDPOINT: http://phoenix:4317
       SECRET_KEY: ${SECRET_KEY}
@@ -69,10 +69,10 @@ services:
     command: [ "python", "-m", "backend.worker", "--stage", "normalize", "--name", "normalize-worker" ]
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql://augocr:augocr@postgres:5432/augocr
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
       MINIO_SECURE: "false"
       PHOENIX_COLLECTOR_ENDPOINT: http://phoenix:4317
     depends_on:
@@ -90,10 +90,10 @@ services:
     command: [ "python", "-m", "backend.worker", "--stage", "ocr", "--name", "ocr-worker" ]
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql://augocr:augocr@postgres:5432/augocr
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
       MINIO_SECURE: "false"
       PHOENIX_COLLECTOR_ENDPOINT: http://phoenix:4317
     depends_on:
@@ -111,10 +111,10 @@ services:
     command: [ "python", "-m", "backend.worker", "--stage", "llm", "--name", "llm-worker" ]
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql://augocr:augocr@postgres:5432/augocr
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
       MINIO_SECURE: "false"
       PHOENIX_COLLECTOR_ENDPOINT: http://phoenix:4317
       LLM_URL: http://host.docker.internal:8001/v1/chat/completions
@@ -135,10 +135,10 @@ services:
     command: [ "python", "-m", "backend.worker", "--stage", "postprocess", "--name", "postprocess-worker" ]
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql://augocr:augocr@postgres:5432/augocr
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
       MINIO_SECURE: "false"
       PHOENIX_COLLECTOR_ENDPOINT: http://phoenix:4317
       LLM_URL: http://host.docker.internal:8001/v1/chat/completions
@@ -159,10 +159,10 @@ services:
     command: [ "python", "-m", "backend.worker", "--stage", "outbound", "--name", "outbound-worker" ]
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql://augocr:augocr@postgres:5432/augocr
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
       MINIO_SECURE: "false"
       PHOENIX_COLLECTOR_ENDPOINT: http://phoenix:4317
     depends_on:
@@ -188,8 +188,8 @@ services:
   pgadmin:
     image: dpage/pgadmin4:latest
     environment:
-      PGADMIN_DEFAULT_EMAIL: admin@augocr.com
-      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
       PGADMIN_CONFIG_SERVER_MODE: "False"
       PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
     ports:

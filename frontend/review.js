@@ -93,6 +93,13 @@ function _rvUpdateStats() {
 function _rvSetCurrentPage(nextPage) {
     const clampedPage = Math.max(1, Math.min(_rvTotalPages, nextPage));
     if (_rvCurrentPage === clampedPage) return;
+    if (_rvPendingSelection) {
+        _rvPendingSelection = null;
+        const previewBar = document.getElementById('rvSelPreview');
+        if (previewBar) previewBar.remove();
+        const selBox = document.querySelector('.rv-selection-box');
+        if (selBox) selBox.style.display = 'none';
+    }
     _rvPersistCurrentRecord();
     _rvCurrentPage = clampedPage;
     _rvLoadCurrentRecord();
@@ -832,6 +839,21 @@ function rvSetupSelectionMode() {
 
 // ── Intersection Engine: Find OCR words inside drawn rectangle ────────
 
+function rvDisplayRectToOcrBox(displayLeft, displayTop, displayWidth, displayHeight) {
+    const img = document.getElementById('rvDocImg');
+    if (!img || !img.naturalWidth || !img.naturalHeight || !img.clientWidth || !img.clientHeight) return null;
+
+    const scaleX = img.naturalWidth / img.clientWidth;
+    const scaleY = img.naturalHeight / img.clientHeight;
+    const ocrLeft = Math.max(0, Math.min(img.naturalWidth, displayLeft * scaleX));
+    const ocrTop = Math.max(0, Math.min(img.naturalHeight, displayTop * scaleY));
+    const ocrRight = Math.max(0, Math.min(img.naturalWidth, (displayLeft + displayWidth) * scaleX));
+    const ocrBottom = Math.max(0, Math.min(img.naturalHeight, (displayTop + displayHeight) * scaleY));
+
+    if (ocrRight <= ocrLeft || ocrBottom <= ocrTop) return null;
+    return [Math.round(ocrLeft), Math.round(ocrTop), Math.round(ocrRight), Math.round(ocrBottom)];
+}
+
 function rvFindWordsInRect(displayLeft, displayTop, displayWidth, displayHeight) {
     const img = document.getElementById('rvDocImg');
     if (!img || !img.naturalWidth) return [];
@@ -882,8 +904,9 @@ function rvHighlightOcrWordsInRect(left, top, width, height) {
 
 function rvApplySelection(displayLeft, displayTop, displayWidth, displayHeight) {
     const matchedWords = rvFindWordsInRect(displayLeft, displayTop, displayWidth, displayHeight);
+    const drawnBox = rvDisplayRectToOcrBox(displayLeft, displayTop, displayWidth, displayHeight);
 
-    if (matchedWords.length === 0) {
+    if (matchedWords.length === 0 || !drawnBox) {
         showToast('No OCR text found in selection');
         const selBox = document.querySelector('.rv-selection-box');
         if (selBox) selBox.style.display = 'none';
@@ -898,18 +921,14 @@ function rvApplySelection(displayLeft, displayTop, displayWidth, displayHeight) 
     });
     const combinedText = matchedWords.map(w => w.text.trim()).join(' ');
 
-    // Build precise bounding box from the matched OCR words
-    const x0 = Math.min(...matchedWords.map(w => w.box[0]));
-    const y0 = Math.min(...matchedWords.map(w => w.box[1]));
-    const x1 = Math.max(...matchedWords.map(w => w.box[2]));
-    const y1 = Math.max(...matchedWords.map(w => w.box[3]));
     const avgScore = matchedWords.reduce((s, w) => s + (w.score || 0), 0) / matchedWords.length;
 
     // Store pending selection — don't apply yet, show preview bar
     _rvPendingSelection = {
         fieldKey: _rvSelectionField,
+        page: _rvCurrentPage,
         combinedText,
-        box: [x0, y0, x1, y1],
+        box: drawnBox,
         avgScore,
     };
 
@@ -959,6 +978,11 @@ function _rvShowSelectionPreview() {
 function rvAcceptSelection() {
     const sel = _rvPendingSelection;
     if (!sel) return;
+    if (sel.page !== _rvCurrentPage) {
+        showToast('Selection was made on another page. Draw the box again on the current page.');
+        rvRejectSelection();
+        return;
+    }
 
     const fieldKey = sel.fieldKey;
     const existingCorrection = !fieldKey.startsWith('line_item_')
@@ -998,7 +1022,7 @@ function rvAcceptSelection() {
 
     // Update field_locations
     _rvFieldLocs[fieldKey] = {
-        page: _rvCurrentPage,
+        page: sel.page,
         box: sel.box,
         matched_text: sel.combinedText,
         score: Math.round(sel.avgScore * 10000) / 10000,

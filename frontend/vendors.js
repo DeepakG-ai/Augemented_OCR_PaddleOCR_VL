@@ -108,19 +108,46 @@ async function renderTemplatePage(app, vendorId) {
     const fmt = tmpl ? tmpl.format_type : 'single_po_multipage';
     const instructions = tmpl ? (tmpl.prompt_instructions || '') : '';
     const hash = tmpl ? (tmpl.prompt_hash || '') : '';
+    const isAdmin = (getAuthUser() || {}).role === 'admin';
 
-    window.tplSysPrompt = tmpl && tmpl.system_prompt ? tmpl.system_prompt : 'No system prompt generated yet. Run an extraction.';
-    window.tplUsrPrompt = tmpl && tmpl.user_prompt ? tmpl.user_prompt : 'No user message available.';
+    window.tplPrompts = {
+        page1System: tmpl && tmpl.system_prompt_page1 ? tmpl.system_prompt_page1 : (tmpl && tmpl.system_prompt ? tmpl.system_prompt : 'No system prompt generated yet. Save the template.'),
+        page1User: tmpl && tmpl.user_prompt_page1 ? tmpl.user_prompt_page1 : (tmpl && tmpl.user_prompt ? tmpl.user_prompt : 'No user message available.'),
+        page2System: tmpl && tmpl.system_prompt_page2 ? tmpl.system_prompt_page2 : 'No page 2 system prompt available.',
+        page2User: tmpl && tmpl.user_prompt_page2 ? tmpl.user_prompt_page2 : 'No page 2 user message available.',
+    };
     window.tplShowPrompt = function (type) {
         const el = document.getElementById('tplPromptPreview');
         if (!el) return;
-        el.value = type === 'system' ? window.tplSysPrompt : window.tplUsrPrompt;
-        document.getElementById('btnSysPrompt').style = type === 'system' ? 'background:var(--blue-bg);color:var(--blue);border-color:var(--blue)' : '';
-        document.getElementById('btnUsrPrompt').style = type === 'user' ? 'background:var(--blue-bg);color:var(--blue);border-color:var(--blue)' : '';
-        document.getElementById('tplPromptDesc').textContent = type === 'system' ?
-            'This is the exact system prompt sent to Qwen3-VL.' :
-            'This is the dynamic user message sent for page 1.';
+        const prompts = window.tplPrompts || {};
+        const promptMeta = {
+            page1System: ['btnPage1SystemPrompt', 'Page 1 system prompt: fields, vendor confirmation, and label/header boxes.'],
+            page1User: ['btnPage1UserPrompt', 'Page 1 user message: fields plus the boxes response shape.'],
+            page2System: ['btnPage2SystemPrompt', 'Page 2+ system prompt: fields only, using the same saved template instructions and rules.'],
+            page2User: ['btnPage2UserPrompt', 'Page 2+ user message: fields-only response shape.'],
+        };
+        el.value = prompts[type] || 'Prompt preview unavailable.';
+        Object.values(promptMeta).forEach(([id]) => {
+            const btn = document.getElementById(id);
+            if (btn) btn.style = '';
+        });
+        const activeBtn = document.getElementById((promptMeta[type] || [])[0]);
+        if (activeBtn) activeBtn.style = 'background:var(--blue-bg);color:var(--blue);border-color:var(--blue)';
+        document.getElementById('tplPromptDesc').textContent = (promptMeta[type] || [null, 'Prompt preview unavailable.'])[1];
     };
+    const promptPreviewPanel = isAdmin ? `
+        <div class="tpl-panel" style="margin-top:16px; grid-column: 1 / -1;">
+            <div style="display:flex; gap:8px; margin-bottom:8px; align-items:center;">
+                <div class="tpl-panel-title" style="margin-bottom:0">Prompt Previews</div>
+                <div style="flex:1"></div>
+                <button id="btnPage1SystemPrompt" class="small-btn" onclick="tplShowPrompt('page1System')">Page 1 System</button>
+                <button id="btnPage1UserPrompt" class="small-btn" onclick="tplShowPrompt('page1User')">Page 1 User</button>
+                <button id="btnPage2SystemPrompt" class="small-btn" onclick="tplShowPrompt('page2System')">Page 2+ System</button>
+                <button id="btnPage2UserPrompt" class="small-btn" onclick="tplShowPrompt('page2User')">Page 2+ User</button>
+            </div>
+            <textarea id="tplPromptPreview" class="prompt-area" style="min-height:400px;font-family:monospace;font-size:11px;background:var(--bg);color:var(--text);border:1px solid var(--border);" readonly></textarea>
+            <div id="tplPromptDesc" style="font-size:10px;color:var(--text-dim);margin-top:8px">This is the admin-only prompt preview.</div>
+        </div>` : '';
 
     app.innerHTML = headerHTML() + `
     <div class="page-content">
@@ -147,7 +174,7 @@ async function renderTemplatePage(app, vendorId) {
             </div>
             <div class="tpl-panel">
                 <div class="tpl-panel-title">Prompt Instructions</div>
-                <textarea class="prompt-area" id="tplPrompt" style="min-height:120px" placeholder="e.g. Supplier address is always in the top-left block. PO number starts with PO and is 5 digits...">${instructions}</textarea>
+                <textarea class="prompt-area" id="tplPrompt" style="min-height:120px" placeholder="e.g. Supplier address is always in the top-left block. PO number starts with PO and is 5 digits...">${escapeHtml(instructions)}</textarea>
                 <div style="margin-top:12px" class="tpl-panel-title">Extraction Rules</div>
                 <div id="tplRulesList" class="rules-list"></div>
                 <div class="add-rule-row"><input class="add-rule-input" id="tplRuleInput" placeholder="Add extraction rule..." onkeydown="if(event.key==='Enter')tplAddRule()"><button class="small-btn" onclick="tplAddRule()">+ Add</button></div>
@@ -157,16 +184,7 @@ async function renderTemplatePage(app, vendorId) {
                     <span class="rule-example" onclick="tplAddRuleText('Dates in DD/MM/YYYY format')">Dates DD/MM/YYYY</span>
                     <span class="rule-example" onclick="tplAddRuleText('Skip rows with empty description')">Skip empty rows</span>
         </div>
-        <div class="tpl-panel" style="margin-top:16px; grid-column: 1 / -1;">
-            <div style="display:flex; gap:8px; margin-bottom:8px; align-items:center;">
-                <div class="tpl-panel-title" style="margin-bottom:0">Prompt Previews</div>
-                <div style="flex:1"></div>
-                <button id="btnSysPrompt" class="small-btn" onclick="tplShowPrompt('system')">System Prompt</button>
-                <button id="btnUsrPrompt" class="small-btn" onclick="tplShowPrompt('user')">User Message (Page 1)</button>
-            </div>
-            <textarea id="tplPromptPreview" class="prompt-area" style="min-height:400px;font-family:monospace;font-size:11px;background:var(--bg);color:var(--text);border:1px solid var(--border);" readonly></textarea>
-            <div id="tplPromptDesc" style="font-size:10px;color:var(--text-dim);margin-top:8px">This is the exact system prompt sent to Qwen3-VL.</div>
-        </div>
+        ${promptPreviewPanel}
         <button class="tpl-save-btn" style="margin-top:16px" onclick="saveTplConfig()">💾 Save Template</button>
     </div>
     <div class="bottom-bar">
@@ -174,7 +192,7 @@ async function renderTemplatePage(app, vendorId) {
     </div>`;
 
     tplRenderHeaders(); tplRenderLines(); tplRenderRules(); updateTplFormatHint(); updateNavActive();
-    tplShowPrompt('system');
+    if (isAdmin) tplShowPrompt('page1System');
     fetchVendorAliases(vendorId);
 }
 

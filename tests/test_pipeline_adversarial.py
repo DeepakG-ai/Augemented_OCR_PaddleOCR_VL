@@ -173,7 +173,13 @@ class ResumeApiAdversarialTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             response.json(),
-            {"job_id": 900, "extraction_id": 123, "status": "queued", "detected_vendor": None},
+            {
+                "job_id": 900,
+                "extraction_id": 123,
+                "status": "queued",
+                "detected_vendor": None,
+                "usage_warning": None,
+            },
         )
         self.assertEqual(mock_enqueue.await_args.kwargs["payload"]["start_from_page"], 2)
         self.assertEqual(mock_enqueue.await_args.kwargs["payload"]["existing_page_results"], extraction["page_results"])

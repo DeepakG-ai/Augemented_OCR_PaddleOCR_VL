@@ -16,6 +16,7 @@ import re
 import time
 from typing import Any, Awaitable, Callable
 
+
 import httpx
 
 if __package__:
@@ -67,26 +68,57 @@ def _strip_newlines(obj: Any) -> Any:
     return obj
 
 
-# ── Format Descriptions ─────────────────────────────────────────────
-
-_FORMAT_DESCRIPTIONS: dict[str, str] = {
-    "single_po_multipage": (
-        "This document is a single purchase order that spans multiple pages. "
-        "Header fields appear on page 1; line items may continue across subsequent pages."
-    ),
-    "po_per_page": (
-        "Each page of this document contains an independent purchase order. "
-        "Extract each page as a separate, complete record."
-    ),
-    "single_page": (
-        "This document is a single-page invoice or purchase order. "
-        "All fields appear on this one page."
-    ),
-}
+# v5.2 = vendor verification on page 1, value-redacted gold hints,
+# removed format descriptions / duplicate bbox / contradictory type rules.
+PROMPT_VERSION = "v5.2"
 
 
-# v5.0 = single agent: page 1 returns {fields, boxes}, page 2+ returns {fields} only
-PROMPT_VERSION = "v5.0"
+def _has_value(value: Any) -> bool:
+    """Return True when a correction side contains user-visible content."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, dict)):
+        return bool(value)
+    return True
+
+
+def _correction_hint(correction: Any) -> str:
+    """Summarize a correction without leaking the old or corrected value."""
+    if not isinstance(correction, dict):
+        return "reviewer changed this field"
+    original_has_value = _has_value(correction.get("original"))
+    corrected_has_value = _has_value(correction.get("corrected"))
+    if not original_has_value and corrected_has_value:
+        return "reviewer filled a missing value"
+    if original_has_value and not corrected_has_value:
+        return "reviewer cleared a value that was not visible"
+    return "reviewer replaced the extracted value"
+
+
+def _safe_gold_correction_hints(gold_examples: list[dict] | None) -> dict[str, dict[str, str]]:
+    """Return field-level correction hints with all document values redacted.
+
+    Gold examples are useful for identifying fields where the model commonly
+    makes mistakes, but passing prior corrected values into the prompt causes
+    value leakage on future documents. Keep only the field names and correction
+    categories.
+    """
+    hints: dict[str, dict[str, str]] = {}
+    for ex in gold_examples or []:
+        correction_diff = ex.get("correction_diff")
+        if not isinstance(correction_diff, dict):
+            continue
+        for field_key, correction in correction_diff.items():
+            key = str(field_key).strip()
+            if not key:
+                continue
+            hints[key] = {
+                "history": _correction_hint(correction),
+                "instruction": "extract only the current visible document value; never reuse a prior correction",
+            }
+    return hints
 
 # ── System Prompt (built once, stored in DB + Redis) ─────────────────
 
@@ -98,19 +130,15 @@ def build_system_prompt(
     format_type: str,
     gold_examples: list[dict] | None = None,
     include_boxes: bool = False,
+    vendor_name: str | None = None,
 ) -> str:
-    """Build the reusable system prompt. Stored in DB and cached in Redis.
+    """Build the reusable system prompt.
 
     Args:
-        gold_examples: Optional list of human-verified correct extractions
-            for this vendor. Injected as few-shot examples so the LLM learns
-            from past corrections.
-        include_boxes: If True (page 1), instruct the LLM to also return
-            bounding boxes for field labels alongside extracted values.
+        gold_examples: Value-redacted correction hints from past human review.
+        include_boxes: If True (page 1), also request bounding boxes.
+        vendor_name: Detected vendor name for LLM-side verification (page 1).
     """
-
-    fmt_desc = _FORMAT_DESCRIPTIONS.get(format_type, _FORMAT_DESCRIPTIONS["single_page"])
-
     context_section = ""
     if instructions and instructions.strip():
         context_section = f"""
@@ -126,26 +154,24 @@ def build_system_prompt(
 {numbered}
 </extraction_rules>"""
 
-    # Few-shot gold examples from human corrections
+    # Value-safe correction hints — no old values leaked into prompt
     gold_section = ""
-    if gold_examples:
-        examples_json = "\n---\n".join(
-            json.dumps(ex["correction_diff"], indent=2, ensure_ascii=False)
-            for ex in gold_examples[:2] if "correction_diff" in ex
-        )
-        if examples_json.strip():
+    correction_hints = _safe_gold_correction_hints(gold_examples)
+    if correction_hints:
+        hints_json = json.dumps(correction_hints, indent=2, ensure_ascii=False)
+        if hints_json.strip():
             gold_section = f"""
-<verified_examples>
-The following are examples of human corrections tracking how raw outputs were fixed.
-These represent "Diffs" in the form {{"field_name": "correct_value"}}.
-Use these as hints for formatting issues or re-occurring mistakes:
+<correction_hints>
+Human review has corrected these fields before. Values are intentionally redacted.
+Use this only as a warning that the field needs careful current-document reading:
 
-{examples_json}
-</verified_examples>"""
+{hints_json}
+</correction_hints>"""
 
-    # ── Page 1: return both fields AND boxes ──
+    # ── Page 1: fields + boxes + vendor verification ──
     if include_boxes:
-        return_keys = """Return two top-level keys:
+        return_keys = """Return three top-level keys:
+- `vendor_confirmed`: true if the document belongs to the detected vendor, false otherwise
 - `fields`: extracted values
 - `boxes`: bounding box of the LABEL text for each field"""
 
@@ -155,13 +181,21 @@ Use these as hints for formatting issues or re-occurring mistakes:
 - For each line item column, return the bounding box of the COLUMN HEADER text in the table header row.
 - Coordinates use bbox_2d format: [x1, y1, x2, y2] in a 0-1000 normalized grid relative to the full page image.
 - If a label or column header is not visible on this page, set its box to null.
-- "po_number" refers to the Purchase Order Number field, NOT a postal PO Box address.
-- "bill_to" refers to the billing address label, not the address text itself.
 </bbox_rules>"""
+
+        vendor_section = ""
+        if vendor_name:
+            vendor_section = f"""
+<vendor_verification>
+The system detected this document belongs to: "{vendor_name}"
+Check the document header, letterhead, or company name in the image.
+Return vendor_confirmed: true if correct, false if the document belongs to a different company.
+</vendor_verification>"""
     else:
         return_keys = """Return one top-level key:
 - `fields`: extracted values"""
         bbox_rules = ""
+        vendor_section = ""
 
     return f"""You are a highly accurate document data extraction assistant.
 This request is processed one page at a time.
@@ -170,11 +204,8 @@ This request is processed one page at a time.
 {context_section}
 {rules_section}
 {gold_section}
+{vendor_section}
 {bbox_rules}
-<document_format>
-{fmt_desc}
-</document_format>
-
 <critical>
 Count the number of rows in the line items table FIRST, then extract that exact number of items.
 </critical>
@@ -182,11 +213,9 @@ Count the number of rows in the line items table FIRST, then extract that exact 
 <output_rules>
 - Extract ONLY what is explicitly visible in the document image.
 - Never guess or fabricate data.
-- Return ONLY valid JSON. No markdown fences, no explanation, no extra text.
+- STRICTLY return ONLY valid JSON. No markdown fences, no explanation, no extra text.
 - Use null for missing fields, never omit them.
 - For line_items, return an array even if only one item exists.
-- Numbers should be numeric (not strings) when possible.
-- Identifiers (po_number, order_number, invoice_number, vendor_id, etc.) must ALWAYS be strings, even if they look numeric.
 - Dates should be in the format they appear in the document.
 </output_rules>"""
 
@@ -218,11 +247,15 @@ def build_user_message(
         if line_item_fields:
             fields_template["line_items"] = [{col: None for col in line_item_fields}]
 
-        # ── Build JSON shape: page 1 includes boxes, page 2+ fields only ──
+        # ── Build JSON shape: page 1 includes vendor_confirmed + boxes ──
         if include_boxes:
             all_keys = list(header_fields) + list(line_item_fields)
             boxes_template = {k: None for k in all_keys}
-            full_template: dict[str, Any] = {"fields": fields_template, "boxes": boxes_template}
+            full_template: dict[str, Any] = {
+                "vendor_confirmed": True,
+                "fields": fields_template,
+                "boxes": boxes_template,
+            }
         else:
             full_template = {"fields": fields_template}
 
@@ -242,36 +275,21 @@ def build_user_message(
 {line_list}
 </line_item_columns>"""
 
-        # ── Extra instruction for page 1 boxes ──
-        bbox_instruction = ""
-        if include_boxes:
-            bbox_instruction = """
-<bbox_instructions>
-Also return a "boxes" object with the bounding box of each LABEL or COLUMN HEADER text.
-- For header fields: locate the LABEL text (e.g. "PO Number:", "Ship To:"), NOT the value.
-- For line item columns: locate the COLUMN HEADER text in the table header row (e.g. "Qty", "Unit Price").
-- Coordinates: [x1, y1, x2, y2] in a 0-1000 normalized grid.
-- Set to null if the label is not visible.
-</bbox_instructions>"""
-
         return f"""Extract the header fields AND all visible line item rows from this purchase order page (page {page_num} of {total_pages}).
 
 If any field is empty or not visible, return null.
 {header_section}
 {line_section}
-{bbox_instruction}
 
 Return JSON in exactly this shape:
 {json.dumps(full_template, indent=2)}
 
 <rules>
 - Empty or missing cells → null.
-- Numbers (qty, unit_cost, amount, unit_price) must be numbers, not strings.
-- Identifiers (po_number, order_number, invoice_number, vendor_id, etc.) must ALWAYS be strings, even if they look numeric.
 - Extract every visible line item row.
 </rules>
 
-Return ONLY valid JSON matching EXACTLY the structure above."""
+STRICTLY return ONLY valid JSON matching EXACTLY the structure above."""
 
     else:
         # ── Auto Extract mode (no bbox support) ──
@@ -292,7 +310,7 @@ Return JSON with:
 - Never guess or fabricate values.
 </accuracy>
 
-Return ONLY valid JSON. No markdown fences, no explanation, no extra text."""
+STRICTLY return ONLY valid JSON. No markdown fences, no explanation, no extra text."""
 
 
 # ── Prompt Hash & Cache ─────────────────────────────────────────────
@@ -312,13 +330,7 @@ def compute_prompt_hash(
         "rules": sorted(rules),
         "format_type": format_type,
         "prompt_version": PROMPT_VERSION,
-        "gold_examples": [
-            {
-                "corrected_result": ex.get("corrected_result"),
-                "correction_diff": ex.get("correction_diff"),
-            }
-            for ex in (gold_examples or [])
-        ],
+        "gold_examples": _safe_gold_correction_hints(gold_examples),
     }, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()
 
@@ -330,7 +342,7 @@ async def get_or_build_system_prompt(
 ) -> tuple[str, str]:
     """Returns (system_prompt, prompt_hash). Cache: DB → build.
 
-    Includes gold examples from past human corrections in the prompt.
+    Includes value-redacted correction hints from past human review.
     """
 
     # Fetch one consolidated latest correction per field for this vendor.
@@ -347,7 +359,7 @@ async def get_or_build_system_prompt(
         logger.info("Prompt cache HIT (DB) vendor=%s hash=%s gold=%d", vendor_id, prompt_hash[:12], len(gold_examples))
         return tmpl["system_prompt"], prompt_hash
 
-    # 2. Build fresh (includes gold examples)
+    # 2. Build fresh (includes value-redacted correction hints)
     logger.info("Prompt cache MISS — building vendor=%s hash=%s gold=%d", vendor_id, prompt_hash[:12], len(gold_examples))
     system_prompt = build_system_prompt(
         header_fields, line_item_fields, instructions, rules, format_type,

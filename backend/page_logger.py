@@ -58,3 +58,57 @@ def append_log(record: dict) -> None:
                 f.write(line)
     except Exception as exc:
         logger.warning("page_logger: failed to write usage log: %s", exc)
+
+
+# -- Subscription alerts log -----------------------------------------------
+
+_ALERTS_LOG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "logs", "page_usage", "alerts.log",
+)
+_alerts_lock = threading.Lock()
+
+
+def log_limit_alert(
+    *,
+    user_id: str,
+    email: str | None = None,
+    total_extracted_pages: int,
+    subscription_limit: int,
+    alert_type: str = "warning",
+    extraction_id: int | None = None,
+    filename: str | None = None,
+) -> None:
+    """Append one JSON line to the alerts log when a user hits or nears their limit.
+
+    alert_type:
+        - 'warning'  — user is above the warning threshold (e.g. 90%) but not yet blocked
+        - 'exceeded' — user is already over their limit and this upload was blocked
+
+    overage = subscription_limit - total_extracted_pages
+        negative → over limit (e.g. -3 means 3 pages over)
+        positive → pages still available
+
+    Never raises — billing alerts must not crash the pipeline.
+    """
+    try:
+        overage = subscription_limit - total_extracted_pages
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "alert_type": alert_type,
+            "user_id": user_id,
+            "email": email,
+            "filename": filename,
+            "subscription_limit": subscription_limit,
+            "total_extracted_pages": total_extracted_pages,
+            "overage": overage,
+        }
+        if extraction_id is not None:
+            record["extraction_id"] = extraction_id
+        line = json.dumps(record, default=str) + "\n"
+        os.makedirs(os.path.dirname(_ALERTS_LOG_PATH), exist_ok=True)
+        with _alerts_lock:
+            with open(_ALERTS_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception as exc:
+        logger.warning("page_logger: failed to write limit alert: %s", exc)

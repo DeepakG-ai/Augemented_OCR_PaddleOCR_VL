@@ -1,0 +1,16 @@
+.venv
+.env
+.env.*
+.pip_tmp
+.pytest_cache
+__pycache__
+.git
+.idea
+.jbeval
+.claude
+.paddlex_cache
+.paddlex_runtime
+.local_object_store
+bbox
+logs
+*.pyc

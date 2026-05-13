@@ -82,6 +82,12 @@ PIPELINE_LOG_VALUES       = os.getenv("PIPELINE_LOG_VALUES", "1").lower() not in
 PIPELINE_LOG_VALUE_LIMIT  = int(os.getenv("PIPELINE_LOG_VALUE_LIMIT", "160"))
 
 # ---------------------------------------------------------------------------
+# Subscription / page limits
+# ---------------------------------------------------------------------------
+DEFAULT_SUBSCRIPTION_LIMIT    = int(os.getenv("DEFAULT_SUBSCRIPTION_LIMIT", "0"))
+SUBSCRIPTION_WARNING_THRESHOLD = float(os.getenv("SUBSCRIPTION_WARNING_THRESHOLD", "0.9"))  # 90%
+
+# ---------------------------------------------------------------------------
 # Debug toggles
 # ---------------------------------------------------------------------------
 DEBUG_DUMP_BBOX = bool(os.getenv("DEBUG_DUMP_BBOX"))

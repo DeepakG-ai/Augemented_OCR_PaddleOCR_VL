@@ -20,7 +20,8 @@ async function renderAdminUsersPage(app) {
         <span style="font-size:10px;color:var(--text-dim);letter-spacing:0.1em">${users.length} USER${users.length !== 1 ? 'S' : ''}</span>
     </div>
     ${_createUserModalHTML()}
-    ${_resetPasswordModalHTML()}`;
+    ${_resetPasswordModalHTML()}
+    ${_pageLimitModalHTML()}`;
 
     updateNavActive();
 }
@@ -37,6 +38,7 @@ function _renderUserTable(users) {
                 <th style="text-align:left;padding:8px 12px;font-weight:500">EMAIL</th>
                 <th style="text-align:left;padding:8px 12px;font-weight:500">ROLE</th>
                 <th style="text-align:left;padding:8px 12px;font-weight:500">STATUS</th>
+                <th style="text-align:right;padding:8px 12px;font-weight:500">PAGE LIMIT</th>
                 <th style="text-align:left;padding:8px 12px;font-weight:500">CREATED</th>
                 <th style="text-align:left;padding:8px 12px;font-weight:500">ACTIONS</th>
             </tr>
@@ -61,11 +63,21 @@ function _renderUserRow(u, currentUser) {
     const resetBtn = !isSelf
         ? `<button class="small-btn" style="margin-left:6px" onclick="openResetPasswordModal('${escapeInlineJsString(u.id)}','${escapeInlineJsString(u.email)}')">Reset PW</button>`
         : '';
+
+    const limit = u.subscription_limit != null ? u.subscription_limit : 0;
+    const limitDisplay = limit === 0
+        ? `<span style="color:var(--red,#e06c75);font-weight:500">NOT SET</span>`
+        : `<span style="font-weight:500;font-family:var(--mono)">${Number(limit).toLocaleString()}</span>`;
+    const editLimitBtn = u.role === 'client'
+        ? `<button class="small-btn" style="margin-left:8px;padding:2px 8px;font-size:9px" onclick="openPageLimitModal('${escapeInlineJsString(u.id)}','${escapeInlineJsString(u.email)}',${limit})">Edit</button>`
+        : '';
+
     return `
         <tr style="border-bottom:1px solid var(--border);transition:background 0.15s" onmouseover="this.style.background='var(--bg2)'" onmouseout="this.style.background=''">
             <td style="padding:10px 12px;font-weight:500">${escapeHtml(u.email)}</td>
             <td style="padding:10px 12px">${roleBadge}</td>
             <td style="padding:10px 12px">${statusBadge}</td>
+            <td style="padding:10px 12px;text-align:right">${limitDisplay}${editLimitBtn}</td>
             <td style="padding:10px 12px;color:var(--text-dim)">${u.created_at ? new Date(u.created_at).toLocaleDateString() : '—'}</td>
             <td style="padding:10px 12px;white-space:nowrap">${deactivateBtn}${resetBtn}</td>
         </tr>`;
@@ -214,6 +226,73 @@ async function submitResetPassword() {
         showToast('Password reset successfully');
     } catch (e) {
         errEl.textContent = 'Error: ' + e.message;
+    }
+}
+
+// ── Page Limit Modal ──────────────────────────────────────────────────
+
+function _pageLimitModalHTML() {
+    return `
+    <div class="modal-overlay" id="pageLimitModal">
+        <div class="modal">
+            <div class="modal-title">Set Page Limit</div>
+            <div id="pageLimitTarget" style="font-size:11px;color:var(--text-dim);margin-bottom:14px"></div>
+            <div class="modal-field">
+                <label class="modal-label">Subscription Page Limit</label>
+                <input class="modal-input" id="pageLimitInput" type="number" min="0" step="1" placeholder="e.g. 1000" autocomplete="off"
+                    style="font-family:var(--mono);font-size:14px;letter-spacing:0.04em">
+            </div>
+            <div style="font-size:10px;color:var(--text-dim);margin-top:2px;line-height:1.5">
+                Set to <strong>0</strong> to block all uploads. The client can go slightly over this limit
+                on their last allowed PDF (soft overage), but the next upload will be blocked.
+            </div>
+            <div id="pageLimitError" style="color:var(--red,#e06c75);font-size:11px;min-height:16px;margin-top:8px"></div>
+            <div class="modal-actions">
+                <button class="modal-btn secondary" onclick="closeModal('pageLimitModal')">Cancel</button>
+                <button class="modal-btn primary" id="pageLimitSaveBtn" onclick="submitPageLimit()">Save Limit</button>
+            </div>
+        </div>
+    </div>`;
+}
+
+let _pageLimitUserId = null;
+
+function openPageLimitModal(userId, email, currentLimit) {
+    _pageLimitUserId = userId;
+    document.getElementById('pageLimitTarget').textContent = `User: ${email}`;
+    document.getElementById('pageLimitInput').value = currentLimit || '';
+    document.getElementById('pageLimitError').textContent = '';
+    document.getElementById('pageLimitModal').classList.add('open');
+    setTimeout(() => document.getElementById('pageLimitInput').focus(), 50);
+}
+
+async function submitPageLimit() {
+    const input = document.getElementById('pageLimitInput');
+    const errEl = document.getElementById('pageLimitError');
+    const saveBtn = document.getElementById('pageLimitSaveBtn');
+    const raw = input.value.trim();
+
+    if (raw === '')          { errEl.textContent = 'Page limit is required.'; return; }
+    const limit = parseInt(raw, 10);
+    if (isNaN(limit) || limit < 0) { errEl.textContent = 'Must be a non-negative integer.'; return; }
+    errEl.textContent = '';
+
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Saving...';
+    try {
+        await apiJSON(`/admin/users/${_pageLimitUserId}/subscription-limit`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ subscription_limit: limit }),
+        });
+        closeModal('pageLimitModal');
+        showToast(`Page limit set to ${limit.toLocaleString()}`);
+        await _refreshUserTable();
+    } catch (e) {
+        errEl.textContent = 'Error: ' + e.message;
+    } finally {
+        saveBtn.disabled = false;
+        saveBtn.textContent = 'Save Limit';
     }
 }
 

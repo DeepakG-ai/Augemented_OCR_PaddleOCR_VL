@@ -60,6 +60,7 @@ async function renderExtractPage(app) {
             <div class="entity-name" id="rpEntityName">—</div>
             <span class="rp-badge optimal" id="rpBadge">OPTIMAL</span>
         </div>
+        ${buildPipelineHTML()}
         <div class="rp-section" id="conflictSection" style="display:none">
             <div class="rp-title" style="color:var(--red)">⚠ Needs Review</div>
             <div id="conflictMsg"></div><div id="conflictCandidates"></div>
@@ -79,6 +80,7 @@ async function renderExtractPage(app) {
     </aside>
     <div class="bottom-bar">
         <button class="extract-btn" id="extractBtn" onclick="runExtract()" disabled>EXTRACT</button>
+        <button class="cancel-btn" id="cancelBtn" style="display:none" onclick="cancelExtract()">&#9632; CANCEL</button>
     </div>` + vendorModalHTML();
 
     await extLoadVendorConfig();
@@ -115,10 +117,18 @@ async function extLoadVendorConfig() {
             extractionRules = [...(tmpl.extraction_rules || [])];
             headerFields = [...(tmpl.header_fields || [])];
             lineItemFields = [...(tmpl.line_item_fields || [])];
+            activePromptInstructions = tmpl.prompt_instructions || null;
+            activeFormatType = tmpl.format_type || 'single_po_multipage';
         } catch (e) {
             extractionRules = []; headerFields = []; lineItemFields = [];
+            activePromptInstructions = null;
+            activeFormatType = 'single_po_multipage';
         }
-    } else { extractionRules = []; headerFields = []; lineItemFields = []; }
+    } else {
+        extractionRules = []; headerFields = []; lineItemFields = [];
+        activePromptInstructions = null;
+        activeFormatType = 'single_po_multipage';
+    }
 
     extUpdateFormatHint(); renderRules(); renderHeaderFields(); renderLineItemFields(); renderBottomBar();
 }
@@ -152,6 +162,7 @@ function renderLineItemFields() {
 function renderBottomBar() {
     const btn = document.getElementById('extractBtn');
     if (!btn) return;
+    btn.style.display = '';
     btn.textContent = 'EXTRACT';
     btn.disabled = !loadedFile;
     btn.className = 'extract-btn';
@@ -227,7 +238,8 @@ async function handleFile(file) {
         formData.append('max_pages', '5'); // Quick preview; full pages load after extraction
         const resp = await apiJSON('/upload-preview', { method: 'POST', body: formData });
         extractionPages = resp.pages;
-        totalPages = resp.total_pages;
+        totalPages = extractionPages.length; // Limit pagination to what we actually have in memory
+        window.docTotalPages = resp.total_pages; // Store true document length
         currentPage = 1;
         updatePageNav();
         renderCurrentPage();
@@ -256,13 +268,29 @@ async function handleFile(file) {
         };
         reader.readAsDataURL(file);
     }
+    // Reset pipeline to idle and mark upload complete
+    PIPELINE_STAGES.forEach(s => {
+        const el = document.getElementById(`pipeStage_${s.id}`);
+        if (el) el.className = 'pipeline-stage';
+        const badge = document.getElementById(`pipeBadge_${s.id}`);
+        if (badge) { badge.className = 'pipeline-badge'; badge.textContent = ''; }
+        const detail = document.getElementById(`pipeDetail_${s.id}`);
+        if (detail) detail.textContent = s.detail;
+    });
+    setPipelineStage('upload', 'done', 'Document stream received');
     renderBottomBar();
     setStatus('optimal');
 }
 
 function updatePageNav() {
     const ind = document.getElementById('pageIndicator');
-    if (ind) ind.textContent = `PAGE ${currentPage} / ${totalPages}`;
+    if (ind) {
+        if (window.docTotalPages && window.docTotalPages > totalPages) {
+            ind.innerHTML = `PAGE ${currentPage} / ${totalPages} <span style="color:var(--text-dim);font-size:9px;margin-left:4px">(of ${window.docTotalPages} total)</span>`;
+        } else {
+            ind.textContent = `PAGE ${currentPage} / ${totalPages}`;
+        }
+    }
     const prev = document.getElementById('prevBtn');
     const next = document.getElementById('nextBtn');
     if (prev) prev.disabled = currentPage <= 1;
@@ -354,7 +382,7 @@ function buildPipelineHTML() {
     `).join('');
 
     return `
-        <div class="pipeline-panel" id="pipelinePanel">
+        <div class="pipeline-panel active" id="pipelinePanel">
             <div class="pipeline-header">
                 <div class="pipeline-title">Pipeline Sequence</div>
                 <div class="pipeline-subtitle">Real-time extraction progress</div>
@@ -369,24 +397,6 @@ function buildPipelineHTML() {
 
 function showPipelinePanel(options = {}) {
     const selectedVendorName = options.selectedVendorName || null;
-    const panel = document.getElementById('pipelinePanel');
-    if (!panel) {
-        // Inject pipeline HTML into the right panel
-        const rp = document.querySelector('.right-panel');
-        if (rp) rp.insertAdjacentHTML('beforeend', buildPipelineHTML());
-    }
-
-    // Hide config sections (format type, instructions, rules, result)
-    document.querySelectorAll('.right-panel > .rp-section').forEach(sec => {
-        // Keep the Active Entity section (first one) visible
-        const title = sec.querySelector('.rp-title');
-        if (title && title.textContent.trim() === 'Active Entity') return;
-        sec.style.display = 'none';
-    });
-
-    // Show pipeline
-    const pp = document.getElementById('pipelinePanel');
-    if (pp) pp.classList.add('active');
 
     // Reset all stages to pending
     PIPELINE_STAGES.forEach(s => {
@@ -421,17 +431,7 @@ function showPipelinePanel(options = {}) {
 }
 
 function hidePipelinePanel() {
-    // Stop timer
     if (_pipelineTimerInterval) { clearInterval(_pipelineTimerInterval); _pipelineTimerInterval = null; }
-
-    // Hide pipeline
-    const pp = document.getElementById('pipelinePanel');
-    if (pp) pp.classList.remove('active');
-
-    // Restore config sections
-    document.querySelectorAll('.right-panel > .rp-section').forEach(sec => {
-        sec.style.display = '';
-    });
 }
 
 function setPipelineStage(stageId, state, detail) {
@@ -484,6 +484,22 @@ function updatePipelineFromSSE(jobState) {
     const stage = progress.stage;
     const message = progress.message || '';
     const event = jobState.event;
+    const stageOrder = ['upload', 'detect', 'normalize', 'ocr', 'llm', 'json', 'postprocess'];
+
+    // Terminal events may omit extraction.progress.stage, especially in tests
+    // and older stream payloads. Handle them before the stage guard.
+    if (event === 'done') {
+        stageOrder.forEach(s => {
+            setPipelineStage(s, 'done', null);
+        });
+        if (_pipelineTimerInterval) { clearInterval(_pipelineTimerInterval); _pipelineTimerInterval = null; }
+        const el = document.getElementById('pipelineTimer');
+        if (el && _pipelineStartTime) {
+            const elapsed = ((Date.now() - _pipelineStartTime) / 1000).toFixed(1);
+            el.textContent = `${elapsed}s — COMPLETE`;
+        }
+        return;
+    }
 
     if (!stage) return;
 
@@ -493,7 +509,6 @@ function updatePipelineFromSSE(jobState) {
     // Define stage order for sequential markings
     const stageMap = { normalize: 'normalize', ocr: 'ocr', llm: 'llm', postprocess: 'postprocess' };
     const uiStage = stageMap[stage] || stage;
-    const stageOrder = ['upload', 'detect', 'normalize', 'ocr', 'llm', 'json', 'postprocess'];
     const currentIdx = stageOrder.indexOf(uiStage);
 
     if (extraction.vendor_name) {
@@ -580,11 +595,9 @@ function updatePipelineFromSSE(jobState) {
 function showStopButton(buttonId = 'extractBtn') {
     activeExtractButtonId = buttonId;
     const btn = document.getElementById(buttonId);
-    if (!btn) return;
-    btn.className = 'extract-btn processing';
-    btn.textContent = '⏹ STOP';
-    btn.disabled = false;
-    btn.onclick = cancelExtract;
+    if (btn) btn.style.display = 'none';
+    const cancelBtn = document.getElementById('cancelBtn');
+    if (cancelBtn) cancelBtn.style.display = '';
 }
 
 function resetExtractButtons() {
@@ -592,6 +605,8 @@ function resetExtractButtons() {
     activeExtractButtonId = 'extractBtn';
     _pipelineSeenStages = new Set();
     hidePipelinePanel();
+    const cancelBtn = document.getElementById('cancelBtn');
+    if (cancelBtn) cancelBtn.style.display = 'none';
     renderBottomBar();
 }
 
@@ -626,12 +641,7 @@ function applyJobStatus(jobState) {
     updatePipelineFromSSE(jobState);
 
     if (progress.total_pages && progress.page) {
-        const activeBtn = document.getElementById(activeExtractButtonId);
-        if (activeBtn) activeBtn.textContent = `Page ${progress.page}/${progress.total_pages}`;
         totalPages = progress.total_pages;
-    } else if (progress.message) {
-        const activeBtn = document.getElementById(activeExtractButtonId);
-        if (activeBtn) activeBtn.textContent = progress.message;
     }
 
     if (!extraction) return;
@@ -778,6 +788,7 @@ async function runExtract() {
             setDetectedVendorDisplay(payload.detected_vendor.vendor_name, 'Client Detected from page 1');
             setPipelineStage('detect', 'done', `Client Detected: ${payload.detected_vendor.vendor_name}`);
             db.activeVendorId = payload.detected_vendor.vendor_id;
+            await extLoadVendorConfig();
         } else if (v) {
             setDetectedVendorDisplay(v.name, 'Manual vendor selected. Auto-detection skipped.');
             setPipelineStage('detect', 'done', `Manual vendor selected: ${v.name}. Auto-detection skipped.`);
@@ -787,6 +798,17 @@ async function runExtract() {
     } catch (err) {
         let errorMsg = 'Extraction failed: ' + err.message;
         try {
+            const match402 = err.message.match(/HTTP 402:\s*(.+)/s);
+            if (match402) {
+                const parsed = JSON.parse(match402[1]);
+                const detail = parsed.detail || parsed;
+                if (detail.code === 'QUOTA_EXCEEDED') {
+                    const limit = detail.subscription_limit;
+                    const used = detail.total_extracted_pages;
+                    const over = Math.abs(detail.overage);
+                    errorMsg = `Page limit exceeded — ${used} pages extracted, limit is ${limit} (${over} pages over). Contact your administrator to increase your limit.`;
+                }
+            }
             const match = err.message.match(/HTTP 409:\s*(.+)/s);
             if (match) {
                 const parsed = JSON.parse(match[1]);

@@ -36,6 +36,7 @@ class UserOut(BaseModel):
     email: str
     role: str
     is_active: bool = True
+    subscription_limit: int | None = None
     created_at: datetime | None = None
 
 
@@ -116,6 +117,10 @@ class TemplateOut(BaseModel):
     extraction_rules: list[str]
     system_prompt: str | None
     user_prompt: str | None = None
+    system_prompt_page1: str | None = None
+    user_prompt_page1: str | None = None
+    system_prompt_page2: str | None = None
+    user_prompt_page2: str | None = None
     prompt_hash: str | None
     created_at: datetime
     updated_at: datetime
@@ -217,3 +222,4 @@ class ExtractionJobStartOut(BaseModel):
     extraction_id: int
     status: str
     detected_vendor: Any | None = None
+    usage_warning: Any | None = None
