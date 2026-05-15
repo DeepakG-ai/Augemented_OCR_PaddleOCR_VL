@@ -17,11 +17,11 @@ async function renderExtractPage(app) {
         } catch (e) { actAsClientList = []; }
         // Restore previous selection from session storage
         const saved = sessionStorage.getItem('actAsClientId');
-        if (saved && actAsClientList.find(c => c.id === saved)) {
+        if (saved && (saved === 'ADMIN' || actAsClientList.find(c => c.id === saved))) {
             actAsClientId = saved;
-        } else if (!actAsClientId && actAsClientList.length) {
-            // Auto-select first client if nothing was selected
-            actAsClientId = actAsClientList[0].id;
+        } else {
+            // Forces admin to explicitly select a context before continuing
+            actAsClientId = null;
         }
     }
 
@@ -41,7 +41,7 @@ async function renderExtractPage(app) {
     const clientDropdownHTML = isAdmin ? `
         <div class="sidebar-section" style="padding-bottom:0">
             <div class="section-title" style="display:flex;align-items:center;gap:6px">
-                <span>⚙ Acting As Client</span>
+                <span>&#9881; Acting As Client</span>
                 <span style="font-size:9px;color:var(--blue);letter-spacing:0.08em;font-weight:600">ADMIN</span>
             </div>
         </div>
@@ -52,15 +52,18 @@ async function renderExtractPage(app) {
                 style="width:100%;font-size:11px;padding:5px 8px;cursor:pointer;border-color:var(--blue-dim)"
                 onchange="extSetActAsClient(this.value)"
             >
-                <option value="">— Admin\'s own vendors —</option>
+                <option value="" ${!actAsClientId ? 'selected' : ''} disabled>&#8212; Select Client Context &#8212;</option>
+                <option value="ADMIN" ${actAsClientId === 'ADMIN' ? 'selected' : ''}>Admin (myself)</option>
                 ${actAsClientList.map(c =>
                     `<option value="${escapeHtml(c.id)}" ${actAsClientId === c.id ? 'selected' : ''}>${escapeHtml(c.email)}</option>`
                 ).join('')}
             </select>
             <div id="actAsClientInfo" style="font-size:9px;color:var(--text-dim);margin-top:4px;line-height:1.5">
-                ${actAsClientId
-                    ? `Detection &amp; vendor list scoped to: <strong style="color:var(--blue)">${escapeHtml((actAsClientList.find(c => c.id === actAsClientId) || {}).email || '')}</strong>`
-                    : 'Using admin\'s own vendors for detection.'}
+                ${!actAsClientId
+                    ? '<strong style="color:var(--red)">Please select a client context to enable extraction.</strong>'
+                    : actAsClientId === 'ADMIN'
+                        ? 'Using admin&#39;s own vendors for detection.'
+                        : `Detection &amp; vendor list scoped to: <strong style="color:var(--blue)">${escapeHtml((actAsClientList.find(c => c.id === actAsClientId) || {}).email || '')}</strong>`}
             </div>
         </div>
         <div class="divider"></div>` : '';
@@ -149,8 +152,14 @@ async function extReloadVendors() {
         let url = '/vendors';
         // For admin: filter by selected client via query param so the server
         // returns only that client's vendors (prevents leaking other tenants).
-        if (isAdmin && actAsClientId) {
-            url = `/vendors?user_id=${encodeURIComponent(actAsClientId)}`;
+        if (isAdmin) {
+            if (!actAsClientId) {
+                db.vendors = [];
+                return;
+            }
+            if (actAsClientId !== 'ADMIN') {
+                url = `/vendors?user_id=${encodeURIComponent(actAsClientId)}`;
+            }
         }
         const vendors = await apiJSON(url);
         db.vendors = vendors;
@@ -177,10 +186,16 @@ async function extSetActAsClient(clientId) {
     // Update the info label
     const infoEl = document.getElementById('actAsClientInfo');
     if (infoEl) {
-        const client = actAsClientList.find(c => c.id === actAsClientId);
-        infoEl.innerHTML = client
-            ? `Detection &amp; vendor list scoped to: <strong style="color:var(--blue)">${escapeHtml(client.email)}</strong>`
-            : 'Using admin\'s own vendors for detection.';
+        if (!actAsClientId) {
+            infoEl.innerHTML = '<strong style="color:var(--red)">Please select a client context to enable extraction.</strong>';
+        } else if (actAsClientId === 'ADMIN') {
+            infoEl.innerHTML = 'Using admin&#39;s own vendors for detection.';
+        } else {
+            const client = actAsClientList.find(c => c.id === actAsClientId);
+            infoEl.innerHTML = client
+                ? `Detection &amp; vendor list scoped to: <strong style="color:var(--blue)">${escapeHtml(client.email)}</strong>`
+                : '';
+        }
     }
     await extLoadVendorConfig();
     setDetectedVendorDisplay(null, 'Client changed — upload a document to detect vendor.');
@@ -862,6 +877,12 @@ async function streamJob(jobId) {
 
 async function runExtract() {
     if (!loadedFile) return;
+    const user = getAuthUser();
+    if (user && user.role === 'admin' && !actAsClientId) {
+        showToast('Please select a client context to enable extraction.');
+        return;
+    }
+
     const v = db.vendors.find(v => v.id === db.activeVendorId);
 
     setStatus('processing');
@@ -889,8 +910,7 @@ async function runExtract() {
     if (v) formData.append('vendor_id', v.id);
     // Pass the selected client scope so the backend restricts vendor detection
     // to that client's aliases/templates only (prevents cross-tenant collisions).
-    const user = getAuthUser();
-    if (user && user.role === 'admin' && actAsClientId) {
+    if (user && user.role === 'admin' && actAsClientId && actAsClientId !== 'ADMIN') {
         formData.append('act_as_client_id', actAsClientId);
     }
 

@@ -616,12 +616,17 @@ async def record_llm_usage(
     duration_ms: float | None = None,
     llm_url: str = "",
     request_id: str | None = None,
+    billing_user_id: str | None = None,  # override: admin uploads bill to admin, not vendor owner
 ) -> dict:
     """Persist one LLM call's usage counters.
 
     llama.cpp returns usage in the OpenAI-compatible response body. This
     helper stores those reported counters as-is, with a computed total only
     when the server omits total_tokens.
+
+    billing_user_id: when set, overrides the vendor-resolved user_id for this
+    usage record. Used so admin uploads are billed to the admin account rather
+    than the client who owns the matched vendor.
     """
     prompt_tokens = _int_or_zero(prompt_tokens)
     completion_tokens = _int_or_zero(completion_tokens)
@@ -635,8 +640,12 @@ async def record_llm_usage(
 
     async with pool.acquire() as conn:
         # Resolve user_id from vendor now so billing survives future vendor deletion.
+        # If billing_user_id is explicitly provided (e.g. admin acting as client),
+        # use it directly — this ensures admin uploads are billed to admin's account.
         resolved_user_id: UUID | None = None
-        if vendor_id:
+        if billing_user_id:
+            resolved_user_id = _uuid_or_none(billing_user_id)
+        elif vendor_id:
             row_uid = await conn.fetchval(
                 "SELECT user_id FROM vendors WHERE id = $1", vendor_id
             )

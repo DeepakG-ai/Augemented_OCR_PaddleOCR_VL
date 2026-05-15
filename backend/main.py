@@ -1416,6 +1416,11 @@ async def ingest_document(
             else:
                 vendor_trace["output"] = {"mode": "preselected", "vendor_id": vendor_id}
 
+        # Admin uploads: bill pages to admin's own account, not the vendor's client.
+        # This ensures admin usage shows on admin's dashboard and doesn't inflate
+        # any client's subscription quota counter.
+        billing_user_id = user["id"] if user.get("role") == "admin" else None
+
         submitted = await _submit_ingestion_job(
             pool,
             request.app.state.store,
@@ -1428,6 +1433,7 @@ async def ingest_document(
             source_type=source_type,
             source_ref=source_ref,
             trace_context=trace_context,
+            metadata={"billing_user_id": billing_user_id} if billing_user_id else None,
         )
         resp = ExtractionJobStartOut(
             job_id=submitted["job"]["id"],

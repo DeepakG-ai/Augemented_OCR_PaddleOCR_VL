@@ -37,7 +37,8 @@ let actAsClientList = [];      // [{id, email}, ...] loaded from /admin/users
 function getEffectiveClientId() {
     const user = getAuthUser();
     if (!user || user.role !== 'admin') return null; // clients use their own id (server-side)
-    return actAsClientId || null;  // null = admin's own vendors
+    if (actAsClientId === 'ADMIN') return null; // server uses admin's own
+    return actAsClientId || null;
 }
 
 // ── REVIEW STATE (cross-file: written by extract.js, read by review.js)

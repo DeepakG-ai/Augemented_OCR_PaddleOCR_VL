@@ -56,6 +56,7 @@ def _pipeline_base(
         "vendor_id": extraction.get("vendor_id") or document.get("vendor_id"),
         "vendor_name": extraction.get("vendor_name"),
         "filename": document.get("filename") or extraction.get("filename"),
+        "billing_user_id": (document.get("metadata") or {}).get("billing_user_id"),
     }
 
 
@@ -479,7 +480,8 @@ async def _process_llm(pool, job: dict) -> None:
     extraction_row = await db_mod.get_extraction(pool, extraction_id)
     if not extraction_row:
         raise ValueError("Extraction not found for LLM job")
-    base = _pipeline_base(extraction=extraction_row, job=job)
+    document_row = await db_mod.get_document(pool, job["document_id"]) if job.get("document_id") else None
+    base = _pipeline_base(extraction=extraction_row, document=document_row, job=job)
     logger.info("── LLM started ── ext=%s vendor=%s", extraction_id, extraction_row.get("vendor_id"))
 
     with plog.timed("template") as t:
