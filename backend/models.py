@@ -15,7 +15,9 @@ from pydantic import BaseModel, ConfigDict, Field
 # -- Vendor ---------------------------------------------------------------
 
 class VendorCreate(BaseModel):
-    id: str = Field(..., min_length=1, max_length=64, description="Unique vendor slug")
+    # id is issued server-side from a global sequence; clients never supply it.
+    # Accepted-but-ignored if a legacy caller still sends it.
+    id: str | None = Field(None, max_length=64, description="(ignored) server-issued")
     name: str = Field(..., min_length=1, max_length=256, description="Display name")
     user_id: str | None = Field(
         None,
@@ -63,6 +65,7 @@ class VendorOut(BaseModel):
     status: str
     created_at: datetime
     user_id: str | None = None
+    client_seq: int | None = None
 
 
 class VendorAliasCreate(BaseModel):

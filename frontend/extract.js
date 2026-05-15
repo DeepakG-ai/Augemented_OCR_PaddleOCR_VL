@@ -4,19 +4,70 @@
 // PAGE 4: EXTRACTION (preserving old UI exactly)
 // ══════════════════════════════════════════════════════════════════════
 async function renderExtractPage(app) {
-    let vendors = [];
-    try { vendors = await apiJSON('/vendors'); db.vendors = vendors; } catch (e) { }
+    const user = getAuthUser();
+    const isAdmin = user && user.role === 'admin';
+
+    // ── Admin: load client list for the "Act As Client" selector ──────────
+    if (isAdmin) {
+        try {
+            const allUsers = await apiJSON('/admin/users');
+            actAsClientList = allUsers
+                .filter(u => u.role === 'client' && u.is_active)
+                .map(u => ({ id: u.id, email: u.email }));
+        } catch (e) { actAsClientList = []; }
+        // Restore previous selection from session storage
+        const saved = sessionStorage.getItem('actAsClientId');
+        if (saved && actAsClientList.find(c => c.id === saved)) {
+            actAsClientId = saved;
+        } else if (!actAsClientId && actAsClientList.length) {
+            // Auto-select first client if nothing was selected
+            actAsClientId = actAsClientList[0].id;
+        }
+    }
+
+    // ── Load vendors scoped to selected client (or admin's own) ──────────
+    await extReloadVendors();
 
     const savedVid = localStorage.getItem('extractVendor');
-    if (savedVid && vendors.find(v => v.id === savedVid)) {
+    if (savedVid && db.vendors.find(v => v.id === savedVid)) {
         db.activeVendorId = savedVid;
         localStorage.removeItem('extractVendor');
+    } else if (!savedVid) {
+        db.activeVendorId = null;
     }
-    if (!savedVid) db.activeVendorId = null;
     detectedVendorName = null;
+
+    // ── Build admin "Act As Client" dropdown HTML ─────────────────────────
+    const clientDropdownHTML = isAdmin ? `
+        <div class="sidebar-section" style="padding-bottom:0">
+            <div class="section-title" style="display:flex;align-items:center;gap:6px">
+                <span>⚙ Acting As Client</span>
+                <span style="font-size:9px;color:var(--blue);letter-spacing:0.08em;font-weight:600">ADMIN</span>
+            </div>
+        </div>
+        <div style="padding:0 0 10px 0">
+            <select
+                id="actAsClientSelect"
+                class="modal-input"
+                style="width:100%;font-size:11px;padding:5px 8px;cursor:pointer;border-color:var(--blue-dim)"
+                onchange="extSetActAsClient(this.value)"
+            >
+                <option value="">— Admin\'s own vendors —</option>
+                ${actAsClientList.map(c =>
+                    `<option value="${escapeHtml(c.id)}" ${actAsClientId === c.id ? 'selected' : ''}>${escapeHtml(c.email)}</option>`
+                ).join('')}
+            </select>
+            <div id="actAsClientInfo" style="font-size:9px;color:var(--text-dim);margin-top:4px;line-height:1.5">
+                ${actAsClientId
+                    ? `Detection &amp; vendor list scoped to: <strong style="color:var(--blue)">${escapeHtml((actAsClientList.find(c => c.id === actAsClientId) || {}).email || '')}</strong>`
+                    : 'Using admin\'s own vendors for detection.'}
+            </div>
+        </div>
+        <div class="divider"></div>` : '';
 
     app.innerHTML = headerHTML() + `
     <aside class="sidebar">
+        ${clientDropdownHTML}
         <div class="sidebar-section"><div class="section-title">Vendor Detection</div></div>
         <div class="detected-vendor-card" id="detectedVendorCard">
             <div class="detected-vendor-label">Vendor Status</div>
@@ -86,6 +137,56 @@ async function renderExtractPage(app) {
 }
 
 // ── Extract page helpers ──────────────────────────────────────────────
+
+/**
+ * Reload vendors scoped to the currently selected client (for admin) or
+ * the logged-in client's own vendors. Writes to db.vendors.
+ */
+async function extReloadVendors() {
+    try {
+        const user = getAuthUser();
+        const isAdmin = user && user.role === 'admin';
+        let url = '/vendors';
+        // For admin: filter by selected client via query param so the server
+        // returns only that client's vendors (prevents leaking other tenants).
+        if (isAdmin && actAsClientId) {
+            url = `/vendors?user_id=${encodeURIComponent(actAsClientId)}`;
+        }
+        const vendors = await apiJSON(url);
+        db.vendors = vendors;
+    } catch (e) { db.vendors = []; }
+}
+
+/**
+ * Called when admin changes the "Act As Client" dropdown.
+ * Re-scopes the vendor list and clears any prior manual vendor selection.
+ */
+async function extSetActAsClient(clientId) {
+    actAsClientId = clientId || null;
+    // Persist for the current browser session
+    if (actAsClientId) {
+        sessionStorage.setItem('actAsClientId', actAsClientId);
+    } else {
+        sessionStorage.removeItem('actAsClientId');
+    }
+    // Clear manual vendor pick — it belonged to the old client
+    db.activeVendorId = null;
+    detectedVendorName = null;
+    // Reload vendors for the new scope
+    await extReloadVendors();
+    // Update the info label
+    const infoEl = document.getElementById('actAsClientInfo');
+    if (infoEl) {
+        const client = actAsClientList.find(c => c.id === actAsClientId);
+        infoEl.innerHTML = client
+            ? `Detection &amp; vendor list scoped to: <strong style="color:var(--blue)">${escapeHtml(client.email)}</strong>`
+            : 'Using admin\'s own vendors for detection.';
+    }
+    await extLoadVendorConfig();
+    setDetectedVendorDisplay(null, 'Client changed — upload a document to detect vendor.');
+    renderBottomBar();
+}
+
 async function extSetVendor(id) {
     db.activeVendorId = id;
     await extLoadVendorConfig();
@@ -786,12 +887,18 @@ async function runExtract() {
     const formData = new FormData();
     formData.append('file', loadedFile);
     if (v) formData.append('vendor_id', v.id);
+    // Pass the selected client scope so the backend restricts vendor detection
+    // to that client's aliases/templates only (prevents cross-tenant collisions).
+    const user = getAuthUser();
+    if (user && user.role === 'admin' && actAsClientId) {
+        formData.append('act_as_client_id', actAsClientId);
+    }
 
     try {
         const payload = await apiJSON('/ingest/ui', { method: 'POST', body: formData });
         if (payload.detected_vendor) {
-            setDetectedVendorDisplay(payload.detected_vendor.vendor_name, 'Client Detected from page 1');
-            setPipelineStage('detect', 'done', `Client Detected: ${payload.detected_vendor.vendor_name}`);
+            setDetectedVendorDisplay(payload.detected_vendor.vendor_name, 'Detected from page 1');
+            setPipelineStage('detect', 'done', `Detected: ${payload.detected_vendor.vendor_name}`);
             db.activeVendorId = payload.detected_vendor.vendor_id;
             await extLoadVendorConfig();
         } else if (v) {
@@ -802,6 +909,9 @@ async function runExtract() {
         await streamJob(payload.job_id);
     } catch (err) {
         let errorMsg = 'Extraction failed: ' + err.message;
+        let failedStage = 'detect'; // default: failed during vendor detection
+        let actionButtons = '<button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">Retry Extraction</button>';
+
         try {
             const match402 = err.message.match(/HTTP 402:\s*(.+)/s);
             if (match402) {
@@ -811,21 +921,39 @@ async function runExtract() {
                     const limit = detail.subscription_limit;
                     const used = detail.total_extracted_pages;
                     const over = Math.abs(detail.overage);
-                    errorMsg = `Page limit exceeded — ${used} pages extracted, limit is ${limit} (${over} pages over). Contact your administrator to increase your limit.`;
+                    errorMsg = `Page limit exceeded — ${used} pages used, limit is ${limit} (${over} over). Contact your administrator to increase your limit.`;
+                    failedStage = 'upload';
                 }
             }
-            const match = err.message.match(/HTTP 409:\s*(.+)/s);
-            if (match) {
-                const parsed = JSON.parse(match[1]);
+            const match409 = err.message.match(/HTTP 409:\s*(.+)/s);
+            if (match409) {
+                const parsed = JSON.parse(match409[1]);
                 const detail = parsed.detail || parsed;
                 if (detail.reason === 'unknown_vendor') {
-                    errorMsg = 'Unknown Vendor - No vendor matched. Create a vendor with the correct name and aliases first, then retry.';
+                    errorMsg = 'Unknown vendor — no alias matched the document. Add the vendor name as an alias, then retry.';
+                    failedStage = 'detect';
+                    actionButtons = '<button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">Retry Extraction</button> <button class="small-btn" onclick="navigate(\'#/vendors\')" style="margin-top:8px">Manage Vendors</button>';
                 }
             }
         } catch (_) { }
+
+        // Stop the spinning timer, mark the failed stage, and reset all later stages to blank
+        if (_pipelineTimerInterval) { clearInterval(_pipelineTimerInterval); _pipelineTimerInterval = null; }
+        setPipelineStage(failedStage, 'failed', errorMsg);
+        const _stageOrder = PIPELINE_STAGES.map(s => s.id);
+        const _failedIdx  = _stageOrder.indexOf(failedStage);
+        _stageOrder.slice(_failedIdx + 1).forEach(sid => {
+            const info = PIPELINE_STAGES.find(p => p.id === sid);
+            setPipelineStage(sid, '', info ? info.detail : '');
+        });
+
         const cs2 = document.getElementById('conflictSection'); if (cs2) cs2.style.display = 'block';
-        const cm = document.getElementById('conflictMsg'); if (cm) cm.textContent = errorMsg;
-        const cc = document.getElementById('conflictCandidates'); if (cc) cc.innerHTML = '<button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">Retry Extraction</button> <button class="small-btn" onclick="navigate(\'#/vendors\')" style="margin-top:8px">Manage Vendors</button>';
+        const cm = document.getElementById('conflictMsg');
+        if (cm) {
+            cm.style.cssText = 'font-size:11px;line-height:1.6;color:var(--text);margin-bottom:8px;font-family:var(--mono)';
+            cm.textContent = errorMsg;
+        }
+        const cc = document.getElementById('conflictCandidates'); if (cc) cc.innerHTML = actionButtons;
         setStatus('optimal');
         document.getElementById('rpBadge').className = 'rp-badge review';
         document.getElementById('rpBadge').textContent = 'NEEDS REVIEW';

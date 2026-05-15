@@ -93,6 +93,7 @@ from .mlflow_tracing import (
 
 from .config import LLM_URL, LLM_MODEL, RATE_LIMIT_PER_MINUTE as RATE_LIMIT, MAX_UPLOAD_BYTES
 from .config import DEFAULT_SUBSCRIPTION_LIMIT, SUBSCRIPTION_WARNING_THRESHOLD
+from .config import PIPELINE_LOG_DIR
 
 from pydantic import BaseModel
 
@@ -653,6 +654,21 @@ async def admin_reactivate_user(
     return {"status": "reactivated", "user_id": user_id}
 
 
+@app.delete("/admin/users/{user_id}/hard")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_hard_delete_user(
+    request: Request,
+    user_id: str,
+    user: dict = Depends(require_admin),
+):
+    if user_id == user["id"]:
+        raise HTTPException(status_code=400, detail="Cannot delete yourself")
+    ok = await db_mod.hard_delete_user(request.app.state.pool, user_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"status": "deleted", "user_id": user_id}
+
+
 @app.patch("/admin/users/{user_id}/password")
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def admin_reset_user_password(
@@ -718,8 +734,24 @@ async def admin_update_subscription_limit(
 
 @app.get("/vendors", response_model=list[VendorOut])
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def list_vendors(request: Request, user: dict = Depends(get_current_user)):
-    filter_user = None if user["role"] == "admin" else user["id"]
+async def list_vendors(
+    request: Request,
+    user: dict = Depends(get_current_user),
+    user_id: str | None = None,  # admin-only: scope to a specific client
+):
+    """
+    Return vendors visible to the caller.
+    - Clients always see only their own vendors.
+    - Admin sees all vendors by default, or a specific client's vendors
+      when ?user_id=<client_uuid> is passed (used by the Extract page
+      "Act As Client" dropdown to scope the vendor shortcut list).
+    """
+    if user["role"] == "admin":
+        # Admin can optionally scope to a specific client; None = all vendors
+        filter_user = user_id if user_id else None
+    else:
+        # Clients always see only their own vendors — ignore any user_id param
+        filter_user = user["id"]
     rows = await db_mod.list_vendors(request.app.state.pool, user_id=filter_user)
     return [VendorOut(**r) for r in rows]
 
@@ -729,14 +761,9 @@ async def list_vendors(request: Request, user: dict = Depends(get_current_user))
 async def create_vendor(request: Request, body: VendorCreate, user: dict = Depends(get_current_user)):
     pool = request.app.state.pool
 
-    # If vendor already exists, the caller must own it (admin bypasses).
-    existing = await db_mod.get_vendor(pool, body.id)
-    if existing:
-        await assert_vendor_access(pool, body.id, user)
-
     if user["role"] == "admin":
         owner_id = body.user_id
-        if not owner_id and not existing:
+        if not owner_id:
             raise HTTPException(
                 status_code=400,
                 detail="Admin must specify user_id when creating a new vendor",
@@ -745,12 +772,14 @@ async def create_vendor(request: Request, body: VendorCreate, user: dict = Depen
         # Clients always own vendors they create; ignore any user_id in body.
         owner_id = user["id"]
 
-    row = await db_mod.upsert_vendor(pool, body.id, body.name, user_id=owner_id)
-    # Auto-insert vendor name as a detection alias
+    # id is issued server-side; name is unique per owner, so a re-submitted
+    # name returns the existing vendor rather than creating a duplicate.
+    row = await db_mod.create_vendor_by_name(pool, body.name, user_id=owner_id)
+    # Auto-insert vendor name as a detection alias (idempotent on the alias side)
     try:
-        await db_mod.insert_vendor_alias(pool, body.id, body.name.lower(), weight=1, source="auto_from_name")
+        await db_mod.insert_vendor_alias(pool, row["id"], body.name.lower(), weight=1, source="auto_from_name")
     except Exception as exc:
-        logger.warning("Failed to auto-insert vendor alias for %s: %s", body.id, exc)
+        logger.warning("Failed to auto-insert vendor alias for %s: %s", row["id"], exc)
     return VendorOut(**row)
 
 
@@ -1144,6 +1173,14 @@ async def ingest_document(
     header_fields: str = Form(None),
     line_item_fields: str = Form(None),
     source_ref: str = Form(None),
+    act_as_client_id: str | None = Form(
+        None,
+        description=(
+            "Admin-only: the client UUID whose vendors/aliases to use for "
+            "vendor detection. Scopes detection to prevent cross-tenant "
+            "template/alias collisions. Billing stays on admin's account."
+        ),
+    ),
     user: dict = Depends(get_current_user),
 ):
     if source_type not in {"ui", "rest", "email", "s3", "sftp", "partner"}:
@@ -1303,7 +1340,27 @@ async def ingest_document(
                     logger.info("PaddleOCR fallback: %d words (%.0fms)", len(page_words), t["ms"])
                     page_source = "paddleocr"
 
-                _detect_uid = None if user.get("role") == "admin" else user["id"]
+                # Vendor detection is ALWAYS scoped to a specific client.
+                # • For regular clients: always their own user_id.
+                # • For admin: use act_as_client_id if supplied (chosen via UI
+                #   dropdown); fall back to admin's own user_id.
+                # We never pass None (global) to avoid cross-tenant collisions
+                # where two clients both have a vendor named e.g. "Aegis".
+                if user.get("role") == "admin":
+                    _detect_uid = act_as_client_id if act_as_client_id else user["id"]
+                    if not act_as_client_id:
+                        logger.info(
+                            "[VendorDetect] Admin upload with no act_as_client_id — "
+                            "scoping to admin's own vendors (user_id=%s)",
+                            user["id"],
+                        )
+                    else:
+                        logger.info(
+                            "[VendorDetect] Admin acting as client user_id=%s for vendor detection",
+                            _detect_uid,
+                        )
+                else:
+                    _detect_uid = user["id"]
                 with plog.timed("vendor_match") as t:
                     match = await _vd.detect_vendor(pool, page_words, user_id=_detect_uid)
                 if match:
@@ -2147,6 +2204,26 @@ async def get_extraction_trace(
         "summary": plog.build_extraction_trace_summary(extraction_id, events, extraction=extraction),
         "events": events,
     }
+
+
+@app.get("/admin/logs/pipeline")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_pipeline_log(
+    request: Request,
+    lines: int = 200,
+    _user: dict = Depends(require_admin),
+):
+    """Return the last N lines of the combined pipeline.log (admin only)."""
+    log_path = PIPELINE_LOG_DIR / "pipeline.log"
+    if not log_path.exists():
+        return {"lines": [], "path": str(log_path), "exists": False}
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+        tail = [ln.rstrip("\n") for ln in all_lines[-lines:]]
+        return {"lines": tail, "path": str(log_path), "exists": True, "total_lines": len(all_lines)}
+    except Exception as exc:
+        raise HTTPException(500, detail=f"Failed to read pipeline log: {exc}")
 
 
 USAGE_INPUT_USD_PER_1K = float(os.getenv("USAGE_INPUT_USD_PER_1K", "0.006"))

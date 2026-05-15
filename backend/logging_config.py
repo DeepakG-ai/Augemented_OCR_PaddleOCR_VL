@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextvars
 import logging
 import logging.config
+import logging.handlers
 import re
 import time
 from contextlib import contextmanager
@@ -76,6 +77,9 @@ class ExtractionLogHandler(logging.Handler):
 
 def configure_logging() -> None:
     level = LOG_LEVEL
+    pipeline_log = _PIPELINE_LOG_DIR / "pipeline.log"
+    _PIPELINE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
     logging.config.dictConfig({
         "version": 1,
         "disable_existing_loggers": False,
@@ -88,8 +92,17 @@ def configure_logging() -> None:
                 "formatter": "standard",
                 "level": level,
             },
+            "pipeline_file": {
+                "class": "logging.handlers.RotatingFileHandler",
+                "formatter": "standard",
+                "level": level,
+                "filename": str(pipeline_log),
+                "maxBytes": 10 * 1024 * 1024,  # 10 MB then rotate
+                "backupCount": 5,
+                "encoding": "utf-8",
+            },
         },
-        "root": {"handlers": ["console"], "level": level},
+        "root": {"handlers": ["console", "pipeline_file"], "level": level},
     })
     # Install per-extraction tee on root logger (idempotent)
     root = logging.getLogger()

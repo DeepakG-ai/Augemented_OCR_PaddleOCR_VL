@@ -390,12 +390,11 @@ class AuthHttpTests(unittest.TestCase):
     def test_admin_post_vendor_with_user_id_succeeds(self) -> None:
         row = {"id": "NEWCO", "name": "Newco Ltd", "status": "idle",
                "user_id": "client-A", "created_at": "2026-01-01T00:00:00Z"}
-        with patch.object(main.db_mod, "get_vendor", new=AsyncMock(return_value=None)), \
-             patch.object(main.db_mod, "upsert_vendor", new=AsyncMock(return_value=row)), \
+        with patch.object(main.db_mod, "create_vendor_by_name", new=AsyncMock(return_value=row)), \
              patch.object(main.db_mod, "insert_vendor_alias", new=AsyncMock(return_value=None)):
             r = self.client.post(
                 "/vendors",
-                json={"id": "NEWCO", "name": "Newco Ltd", "user_id": "client-A"},
+                json={"name": "Newco Ltd", "user_id": "client-A"},
             )
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["id"], "NEWCO")
@@ -403,19 +402,18 @@ class AuthHttpTests(unittest.TestCase):
     def test_client_post_vendor_ignores_user_id_in_body(self) -> None:
         captured: dict = {}
 
-        async def fake_upsert(pool, vendor_id, name, user_id=None):
+        async def fake_create(pool, name, user_id=None):
             captured["user_id"] = user_id
-            return {"id": vendor_id, "name": name, "status": "idle",
+            return {"id": "1", "name": name, "status": "idle",
                     "user_id": user_id, "created_at": "2026-01-01T00:00:00Z"}
 
         with _ScopedOverrides(main.app, {get_current_user: lambda: _client("A")}), \
-             patch.object(main.db_mod, "get_vendor", new=AsyncMock(return_value=None)), \
-             patch.object(main.db_mod, "upsert_vendor", new=fake_upsert), \
+             patch.object(main.db_mod, "create_vendor_by_name", new=fake_create), \
              patch.object(main.db_mod, "insert_vendor_alias", new=AsyncMock(return_value=None)):
             # Client tries to plant ownership on someone else
             r = self.client.post(
                 "/vendors",
-                json={"id": "NEWCO", "name": "Newco", "user_id": "B"},
+                json={"name": "Newco", "user_id": "B"},
             )
         self.assertEqual(r.status_code, 200)
         self.assertEqual(captured["user_id"], "A")  # forced to caller, not B

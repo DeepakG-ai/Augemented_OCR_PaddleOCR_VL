@@ -161,7 +161,7 @@ Use this only as a warning that the field needs careful current-document reading
 <bbox_rules>
 - For each header field, return the bounding box of the LABEL text (e.g., word "PO Number:"), NOT the value next to it.
 - For each line item column, return the bounding box of the COLUMN HEADER text in the table header row.
-- Coordinates use bbox_2d format: [x1, y1, x2, y2] in a 0-1000 normalized grid relative to the full page image.
+- Each box value MUST be a plain JSON array: [x1, y1, x2, y2] — four integers in a 0-1000 normalized grid relative to the full page image. Do NOT nest it in a dict or use any key like "bbox_2d".
 - If a label or column header is not visible on this page, set its box to null.
 </bbox_rules>"""
 
@@ -234,7 +234,7 @@ def build_user_message(
             all_keys = list(header_fields) + list(line_item_fields)
             boxes_template = {k: None for k in all_keys}
             full_template: dict[str, Any] = {
-                "vendor_confirmed": True,
+                "vendor_confirmed": None,
                 "fields": fields_template,
                 "boxes": boxes_template,
             }

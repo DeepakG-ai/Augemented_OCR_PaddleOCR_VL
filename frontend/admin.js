@@ -146,6 +146,16 @@ function _renderUserCard(u, currentUser) {
            </button>`
         : '';
 
+    const hardDeleteBtn = !isSelf
+        ? `<button onclick="hardDeleteUser('${escapeInlineJsString(u.id)}','${escapeInlineJsString(u.email)}')"
+               title="Permanently delete this user"
+               style="background:none;border:1px solid var(--border);border-radius:3px;cursor:pointer;padding:6px 8px;color:var(--text-dim);display:inline-flex;align-items:center;transition:all 0.15s"
+               onmouseover="this.style.borderColor='var(--red,#e06c75)';this.style.color='var(--red,#e06c75)'"
+               onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-dim)'">
+               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+           </button>`
+        : '';
+
     const opacity = isActive ? '1' : '0.55';
 
     return `
@@ -192,6 +202,7 @@ function _renderUserCard(u, currentUser) {
         <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;min-width:160px;justify-content:flex-end">
             ${deactivateBtn}
             ${resetPwBtn}
+            ${hardDeleteBtn}
         </div>
     </div>`;
 }
@@ -436,6 +447,17 @@ async function reactivateUser(userId, email) {
     try {
         await apiJSON(`/admin/users/${userId}/reactivate`, { method: 'PATCH' });
         showToast(`${email} reactivated`);
+        await _refreshUserTable();
+    } catch (e) {
+        showToast('Failed: ' + e.message);
+    }
+}
+
+async function hardDeleteUser(userId, email) {
+    if (!confirm(`Permanently delete "${email}"?\n\nThis cannot be undone. All their data will remain but the account will be gone.`)) return;
+    try {
+        await apiJSON(`/admin/users/${userId}/hard`, { method: 'DELETE' });
+        showToast(`${email} permanently deleted`);
         await _refreshUserTable();
     } catch (e) {
         showToast('Failed: ' + e.message);

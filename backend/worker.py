@@ -627,35 +627,26 @@ async def _process_llm(pool, job: dict) -> None:
         if isinstance(_p1_boxes, dict) and _p1_boxes:
             vendor_id_llm = extraction_row["vendor_id"]
             template_id_llm = tmpl["id"]
-            # Page 1 dimensions for FACTOR=32 alignment correction
-            _p1_page = next((pg for pg in pages if pg["page_number"] == 1), None)
-            _p1w = (_p1_page or {}).get("width") or 0
-            _p1h = (_p1_page or {}).get("height") or 0
+            # Qwen3-VL uses relative 0-1000 coordinates (not Qwen2.5-VL absolute pixels).
+            # Direct normalization: nx = coord / 1000.0 — no alignment factor needed.
+            # processor.py already pre-aligns images to multiples of 32 so the model
+            # never internally re-pads, keeping the 0-1000 grid exact.
+            req_items_set = set(req_items)
             learned_boxes: dict = {}
-            if _p1w > 0 and _p1h > 0:
-                FACTOR = 32
-                w_bar = max(FACTOR, int(round(_p1w / FACTOR) * FACTOR))
-                h_bar = max(FACTOR, int(round(_p1h / FACTOR) * FACTOR))
-                req_items_set = set(req_items)
-                for field_key, raw_box in _p1_boxes.items():
-                    if not isinstance(raw_box, list) or len(raw_box) != 4:
-                        continue
-                    # 0-1000 grid -> aligned pixel space -> 0-1 normalized
-                    x0_px = (raw_box[0] / 1000.0) * w_bar
-                    y0_px = (raw_box[1] / 1000.0) * h_bar
-                    x1_px = (raw_box[2] / 1000.0) * w_bar
-                    y1_px = (raw_box[3] / 1000.0) * h_bar
-                    nx0 = max(0.0, x0_px / _p1w)
-                    ny0 = max(0.0, y0_px / _p1h)
-                    nx1 = min(1.0, x1_px / _p1w)
-                    ny1 = min(1.0, y1_px / _p1h)
-                    if nx1 <= nx0 or ny1 <= ny0:
-                        continue
-                    field_type = "line_item_column" if field_key in req_items_set else "header"
-                    learned_boxes[field_key] = {
-                        "normalized_box": {"x0": nx0, "y0": ny0, "x1": nx1, "y1": ny1},
-                        "field_type": field_type,
-                    }
+            for field_key, raw_box in _p1_boxes.items():
+                if not isinstance(raw_box, list) or len(raw_box) != 4:
+                    continue
+                nx0 = max(0.0, raw_box[0] / 1000.0)
+                ny0 = max(0.0, raw_box[1] / 1000.0)
+                nx1 = min(1.0, raw_box[2] / 1000.0)
+                ny1 = min(1.0, raw_box[3] / 1000.0)
+                if nx1 <= nx0 or ny1 <= ny0:
+                    continue
+                field_type = "line_item_column" if field_key in req_items_set else "header"
+                learned_boxes[field_key] = {
+                    "normalized_box": {"x0": nx0, "y0": ny0, "x1": nx1, "y1": ny1},
+                    "field_type": field_type,
+                }
             if learned_boxes:
                 await db_mod.upsert_qwen_layout_boxes(
                     pool, vendor_id_llm, template_id_llm, extraction_id, learned_boxes,

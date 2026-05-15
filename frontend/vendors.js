@@ -80,7 +80,7 @@ function renderVendorCardsByClient(vendors, clients) {
             <div class="vendor-card" style="margin-left:16px;border-left:2px solid var(--border)">
                 <div class="vendor-card-info" onclick="navigate('#/template/${escapeInlineJsString(v.id)}')">
                     <div class="vendor-card-name" style="font-size:11px">${i + 1}. ${escapeHtml(v.name)}</div>
-                    <div class="vendor-card-id">ID: ${escapeHtml(v.id)} · Created: ${new Date(v.created_at).toLocaleDateString()}</div>
+                    <div class="vendor-card-id">Vendor #${v.client_seq != null ? v.client_seq : '—'} · Created: ${new Date(v.created_at).toLocaleDateString()}</div>
                 </div>
                 <div class="vendor-card-actions">
                     <a class="link-btn" href="#/template/${escapeHtml(v.id)}">⚙ Template</a>
@@ -134,7 +134,7 @@ function renderVendorCards(vendors) {
         <div class="vendor-card">
             <div class="vendor-card-info" onclick="navigate('#/template/${escapeInlineJsString(v.id)}')">
                 <div class="vendor-card-name">${escapeHtml(v.name)}</div>
-                <div class="vendor-card-id">ID: ${escapeHtml(v.id)} · Created: ${new Date(v.created_at).toLocaleDateString()}</div>
+                <div class="vendor-card-id">Vendor #${v.client_seq != null ? v.client_seq : '—'} · Created: ${new Date(v.created_at).toLocaleDateString()}</div>
             </div>
             <div class="vendor-card-actions">
                 <a class="link-btn" href="#/template/${escapeHtml(v.id)}">⚙ Template</a>
@@ -175,10 +175,6 @@ function vendorModalHTML() {
                 <label class="modal-label">Vendor Name</label>
                 <input class="modal-input" id="newVendorName" placeholder="e.g. Robert Scott">
             </div>
-            <div class="modal-field">
-                <label class="modal-label">Vendor ID</label>
-                <input class="modal-input" id="newVendorId" placeholder="e.g. RS001" style="text-transform:uppercase">
-            </div>
             ${clientField}
             <div class="modal-actions">
                 <button class="modal-btn secondary" onclick="closeModal('vendorModal')">Cancel</button>
@@ -210,11 +206,11 @@ function closeModal(id) { document.getElementById(id).classList.remove('open'); 
 
 async function saveNewVendor() {
     const name = document.getElementById('newVendorName').value.trim().toUpperCase();
-    const id = document.getElementById('newVendorId').value.trim().toUpperCase() || Math.random().toString(36).slice(2, 10).toUpperCase();
     if (!name) return;
     const isAdmin = (getAuthUser() || {}).role === 'admin';
     const clientEl = document.getElementById('newVendorClient');
-    const payload = { id, name };
+    // id is issued server-side from a global sequence — never sent by the client.
+    const payload = { name };
     if (isAdmin && clientEl && clientEl.value) payload.user_id = clientEl.value;
     try {
         await apiJSON('/vendors', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });

@@ -26,6 +26,20 @@ let detectedVendorName = null;
 let activeFormatType = 'single_po_multipage';
 let activePromptInstructions = null;
 
+// ── ADMIN "ACT AS CLIENT" STATE ────────────────────────────────────────
+// When admin uploads on the Extraction page, detection is scoped to this
+// client's vendors only. Prevents cross-tenant alias/template collisions.
+// actAsClientId: UUID string of the selected client, or null = admin's own.
+let actAsClientId = null;      // currently selected client for vendor scoping
+let actAsClientList = [];      // [{id, email}, ...] loaded from /admin/users
+
+// Returns the effective user_id to scope vendor detection/list to.
+function getEffectiveClientId() {
+    const user = getAuthUser();
+    if (!user || user.role !== 'admin') return null; // clients use their own id (server-side)
+    return actAsClientId || null;  // null = admin's own vendors
+}
+
 // ── REVIEW STATE (cross-file: written by extract.js, read by review.js)
 let reviewFieldLocations = {};   // {fieldName: {page, box, matched_text, score, strategy}}
 let reviewExtractionId = null;

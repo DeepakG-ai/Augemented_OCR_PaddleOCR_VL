@@ -269,6 +269,56 @@ async def init(pool: asyncpg.Pool) -> None:
                 END IF;
             END $$;
         """)
+        # Vendor id auto-generation. The primary key stays an opaque, globally
+        # unique TEXT (server-issued from a sequence) so it remains safe as a
+        # foreign key and as the global spatial_memory/layout key. `client_seq`
+        # is a per-owner display number (Vendor #1, #2 ...) — display only,
+        # never referenced by any FK. Name is unique per owner (case-insensitive).
+        await conn.execute("""
+            CREATE SEQUENCE IF NOT EXISTS vendors_global_id_seq;
+
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='vendors' AND column_name='client_seq'
+                ) THEN
+                    ALTER TABLE vendors ADD COLUMN client_seq INT;
+                END IF;
+            END $$;
+
+            -- Keep the sequence ahead of any existing all-numeric ids so a
+            -- freshly issued id can never collide with a legacy one. Idempotent:
+            -- server-issued ids are themselves numeric and feed this MAX on the
+            -- next startup. is_called=false => next nextval returns max+1 exactly.
+            DO $$
+            DECLARE maxid bigint;
+            BEGIN
+                SELECT COALESCE(MAX(id::bigint), 0) INTO maxid
+                  FROM vendors WHERE id ~ '^[0-9]+$';
+                PERFORM setval('vendors_global_id_seq', maxid + 1, false);
+            END $$;
+
+            -- Backfill client_seq for pre-existing vendors, numbered per owner
+            -- by creation order.
+            WITH ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY user_id ORDER BY created_at, id
+                       ) AS rn
+                  FROM vendors
+                 WHERE client_seq IS NULL
+            )
+            UPDATE vendors v
+               SET client_seq = r.rn
+              FROM ranked r
+             WHERE v.id = r.id AND v.client_seq IS NULL;
+
+            -- Name unique per owner (case-insensitive). Partial: legacy
+            -- unowned (NULL user_id) rows are not forced globally unique.
+            CREATE UNIQUE INDEX IF NOT EXISTS vendors_owner_name_uniq
+                ON vendors (user_id, lower(name))
+                WHERE user_id IS NOT NULL;
+        """)
         # Migration: add extraction_id to llm_usage if the table predates this column.
         await conn.execute("""
             DO $$ BEGIN
@@ -929,10 +979,13 @@ async def get_usage_stats(
 
 # -- Vendor queries --------------------------------------------------------
 
+_VENDOR_COLS = "id, name, status, user_id, client_seq, created_at"
+
+
 async def get_vendor(pool: asyncpg.Pool, vendor_id: str) -> dict | None:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, name, status, user_id, created_at FROM vendors WHERE id = $1",
+            f"SELECT {_VENDOR_COLS} FROM vendors WHERE id = $1",
             vendor_id,
         )
         return _stringify_uuid_fields(dict(row), "user_id") if row else None
@@ -941,8 +994,8 @@ async def get_vendor(pool: asyncpg.Pool, vendor_id: str) -> dict | None:
 async def list_vendors(pool: asyncpg.Pool, user_id: str | None = None) -> list[dict]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """
-            SELECT id, name, status, user_id, created_at FROM vendors
+            f"""
+            SELECT {_VENDOR_COLS} FROM vendors
             WHERE ($1::UUID IS NULL OR user_id = $1)
             ORDER BY created_at DESC
             """,
@@ -954,14 +1007,69 @@ async def list_vendors(pool: asyncpg.Pool, user_id: str | None = None) -> list[d
 async def assign_vendor_owner(pool: asyncpg.Pool, vendor_id: str, user_id: str) -> dict | None:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            """
+            f"""
             UPDATE vendors SET user_id = $1::UUID
             WHERE id = $2
-            RETURNING id, name, status, user_id, created_at
+            RETURNING {_VENDOR_COLS}
             """,
             user_id, vendor_id,
         )
         return _stringify_uuid_fields(dict(row), "user_id") if row else None
+
+
+async def _next_client_seq(conn: asyncpg.Connection, user_id) -> int:
+    """Next per-owner display number. user_id may be a UUID or None."""
+    return await conn.fetchval(
+        """
+        SELECT COALESCE(MAX(client_seq), 0) + 1 FROM vendors
+        WHERE user_id IS NOT DISTINCT FROM $1
+        """,
+        user_id,
+    )
+
+
+async def create_vendor_by_name(
+    pool: asyncpg.Pool,
+    name: str,
+    user_id: str | None = None,
+) -> dict:
+    """Create a vendor from a name alone — the id is issued server-side from a
+    global sequence. Name is unique per owner (case-insensitive): re-submitting
+    an existing name returns that vendor instead of creating a duplicate.
+    """
+    uid = _uuid_or_none(user_id)
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            f"""
+            SELECT {_VENDOR_COLS} FROM vendors
+            WHERE user_id IS NOT DISTINCT FROM $1 AND lower(name) = lower($2)
+            """,
+            uid, name,
+        )
+        if existing:
+            return _stringify_uuid_fields(dict(existing), "user_id")
+        try:
+            new_id = str(await conn.fetchval("SELECT nextval('vendors_global_id_seq')"))
+            seq = await _next_client_seq(conn, uid)
+            row = await conn.fetchrow(
+                f"""
+                INSERT INTO vendors (id, name, user_id, client_seq)
+                VALUES ($1, $2, $3, $4)
+                RETURNING {_VENDOR_COLS}
+                """,
+                new_id, name, uid, seq,
+            )
+            return _stringify_uuid_fields(dict(row), "user_id")
+        except asyncpg.exceptions.UniqueViolationError:
+            # Concurrent create of the same name lost the race — return the winner.
+            row = await conn.fetchrow(
+                f"""
+                SELECT {_VENDOR_COLS} FROM vendors
+                WHERE user_id IS NOT DISTINCT FROM $1 AND lower(name) = lower($2)
+                """,
+                uid, name,
+            )
+            return _stringify_uuid_fields(dict(row), "user_id")
 
 
 async def upsert_vendor(
@@ -970,16 +1078,24 @@ async def upsert_vendor(
     name: str,
     user_id: str | None = None,
 ) -> dict:
+    """Upsert by explicit id. Used by the template side-door where the vendor
+    id already exists (issued earlier by create_vendor_by_name). Backfills
+    client_seq if the row is created here.
+    """
     async with pool.acquire() as conn:
+        uid = _uuid_or_none(user_id)
+        seq = await _next_client_seq(conn, uid)
         row = await conn.fetchrow(
-            """
-            INSERT INTO vendors (id, name, user_id) VALUES ($1, $2, $3)
+            f"""
+            INSERT INTO vendors (id, name, user_id, client_seq)
+            VALUES ($1, $2, $3, $4)
             ON CONFLICT (id) DO UPDATE SET
                 name = EXCLUDED.name,
-                user_id = COALESCE(EXCLUDED.user_id, vendors.user_id)
-            RETURNING id, name, status, user_id, created_at
+                user_id = COALESCE(EXCLUDED.user_id, vendors.user_id),
+                client_seq = COALESCE(vendors.client_seq, EXCLUDED.client_seq)
+            RETURNING {_VENDOR_COLS}
             """,
-            vendor_id, name, _uuid_or_none(user_id),
+            vendor_id, name, uid, seq,
         )
         return _stringify_uuid_fields(dict(row), "user_id")
 
@@ -1080,6 +1196,17 @@ async def reactivate_user(pool: asyncpg.Pool, user_id: str) -> bool:
     async with pool.acquire() as conn:
         result = await conn.execute(
             "UPDATE users SET is_active = TRUE WHERE id = $1", user_uuid,
+        )
+        return result.endswith(" 1")
+
+
+async def hard_delete_user(pool: asyncpg.Pool, user_id: str) -> bool:
+    user_uuid = _uuid_or_none(user_id)
+    if user_uuid is None:
+        return False
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM users WHERE id = $1", user_uuid,
         )
         return result.endswith(" 1")
 

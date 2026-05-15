@@ -1122,3 +1122,736 @@ prompt eval time =    4642.96 ms /  1530 tokens (    3.03 ms per token,   329.53
 slot      release: id  0 | task 3964 | stop processing: n_tokens = 2512, truncated = 0
 srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200
 srv  update_slots: all slots are idle
+
+
+
+
+
+
+
+new log after claude changes : 
+
+c:\llama-cpp>llama-server ^
+More?   --model "Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf" ^
+More?   --mmproj "mmproj-F16.gguf" ^
+More?   --host 0.0.0.0 ^
+More?   --port 8001 ^
+More?   --n-gpu-layers 99 ^
+More?   --ctx-size 4096 ^
+More?   --parallel 1 ^
+More?   --flash-attn on ^
+More?   --cache-ram 512 ^
+More?   --image-max-tokens 768 ^
+More?   --image-min-tokens 192
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 8187 MiB):
+  Device 0: NVIDIA GeForce RTX 4060, compute capability 8.9, VMM: yes, VRAM: 8187 MiB
+load_backend: loaded CUDA backend from c:\llama-cpp\ggml-cuda.dll
+load_backend: loaded RPC backend from c:\llama-cpp\ggml-rpc.dll
+load_backend: loaded CPU backend from c:\llama-cpp\ggml-cpu-alderlake.dll
+build: 8508 (9f102a140) with Clang 19.1.5 for Windows x86_64
+system info: n_threads = 24, n_threads_batch = 24, total_threads = 32
+
+system_info: n_threads = 24 (n_threads_batch = 24) / 32 | CUDA : ARCHS = 500,610,700,750,800,860,890 | USE_GRAPHS = 1 | PEER_MAX_BATCH_SIZE = 128 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX_VNNI = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 |
+
+Running without SSL
+init: using 31 threads for HTTP server
+start: binding port with default address family
+main: loading model
+srv    load_model: loading model 'Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf'
+common_init_result: fitting params to device memory, for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on
+llama_params_fit_impl: projected to use 5451 MiB of device memory vs. 7097 MiB of free device memory
+llama_params_fit_impl: will leave 1645 >= 1024 MiB of free device memory, no changes needed
+llama_params_fit: successfully fit params to free device memory
+llama_params_fit: fitting params to free memory took 0.20 seconds
+llama_model_load_from_file_impl: using device CUDA0 (NVIDIA GeForce RTX 4060) (0000:01:00.0) - 7097 MiB free
+llama_model_loader: loaded meta data with 42 key-value pairs and 399 tensors from Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf (version GGUF V3 (latest))
+llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+llama_model_loader: - kv   0:                       general.architecture str              = qwen3vl
+llama_model_loader: - kv   1:                               general.type str              = model
+llama_model_loader: - kv   2:                               general.name str              = Qwen3-Vl-8B-Instruct
+llama_model_loader: - kv   3:                           general.finetune str              = Instruct
+llama_model_loader: - kv   4:                           general.basename str              = Qwen3-Vl-8B-Instruct
+llama_model_loader: - kv   5:                       general.quantized_by str              = Unsloth
+llama_model_loader: - kv   6:                         general.size_label str              = 8B
+llama_model_loader: - kv   7:                            general.license str              = apache-2.0
+llama_model_loader: - kv   8:                           general.repo_url str              = https://huggingface.co/unsloth
+llama_model_loader: - kv   9:                   general.base_model.count u32              = 1
+llama_model_loader: - kv  10:                  general.base_model.0.name str              = Qwen3 VL 8B Instruct
+llama_model_loader: - kv  11:          general.base_model.0.organization str              = Qwen
+llama_model_loader: - kv  12:              general.base_model.0.repo_url str              = https://huggingface.co/Qwen/Qwen3-VL-...
+llama_model_loader: - kv  13:                               general.tags arr[str,2]       = ["unsloth", "image-text-to-text"]
+llama_model_loader: - kv  14:                        qwen3vl.block_count u32              = 36
+llama_model_loader: - kv  15:                     qwen3vl.context_length u32              = 262144
+llama_model_loader: - kv  16:                   qwen3vl.embedding_length u32              = 4096
+llama_model_loader: - kv  17:                qwen3vl.feed_forward_length u32              = 12288
+llama_model_loader: - kv  18:               qwen3vl.attention.head_count u32              = 32
+llama_model_loader: - kv  19:            qwen3vl.attention.head_count_kv u32              = 8
+llama_model_loader: - kv  20:                     qwen3vl.rope.freq_base f32              = 5000000.000000
+llama_model_loader: - kv  21:   qwen3vl.attention.layer_norm_rms_epsilon f32              = 0.000001
+llama_model_loader: - kv  22:               qwen3vl.attention.key_length u32              = 128
+llama_model_loader: - kv  23:             qwen3vl.attention.value_length u32              = 128
+llama_model_loader: - kv  24:            qwen3vl.rope.dimension_sections arr[i32,4]       = [24, 20, 20, 0]
+llama_model_loader: - kv  25:                 qwen3vl.n_deepstack_layers u32              = 3
+llama_model_loader: - kv  26:                       tokenizer.ggml.model str              = gpt2
+llama_model_loader: - kv  27:                         tokenizer.ggml.pre str              = qwen2
+llama_model_loader: - kv  28:                      tokenizer.ggml.tokens arr[str,151936]  = ["!", "\"", "#", "$", "%", "&", "'", ...
+llama_model_loader: - kv  29:                  tokenizer.ggml.token_type arr[i32,151936]  = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, ...
+llama_model_loader: - kv  30:                      tokenizer.ggml.merges arr[str,151387]  = ["─á ─á", "─á─á ─á─á", "i n", "─á t",...
+llama_model_loader: - kv  31:                tokenizer.ggml.eos_token_id u32              = 151645
+llama_model_loader: - kv  32:            tokenizer.ggml.padding_token_id u32              = 151654
+llama_model_loader: - kv  33:                tokenizer.ggml.bos_token_id u32              = 151643
+llama_model_loader: - kv  34:               tokenizer.ggml.add_bos_token bool             = false
+llama_model_loader: - kv  35:                    tokenizer.chat_template str              = {%- if tools %}\n    {{- '<|im_start|>...
+llama_model_loader: - kv  36:               general.quantization_version u32              = 2
+llama_model_loader: - kv  37:                          general.file_type u32              = 15
+llama_model_loader: - kv  38:                      quantize.imatrix.file str              = Qwen3-VL-8B-Instruct-GGUF/imatrix_uns...
+llama_model_loader: - kv  39:                   quantize.imatrix.dataset str              = unsloth_calibration_Qwen3-VL-8B-Instr...
+llama_model_loader: - kv  40:             quantize.imatrix.entries_count u32              = 252
+llama_model_loader: - kv  41:              quantize.imatrix.chunks_count u32              = 694
+llama_model_loader: - type  f32:  145 tensors
+llama_model_loader: - type q4_K:  153 tensors
+llama_model_loader: - type q5_K:   25 tensors
+llama_model_loader: - type q6_K:   56 tensors
+llama_model_loader: - type iq4_xs:   20 tensors
+print_info: file format = GGUF V3 (latest)
+print_info: file type   = Q4_K - Medium
+print_info: file size   = 4.79 GiB (5.02 BPW)
+load: 0 unused tokens
+load: control-looking token: 128247 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+load: printing all EOG tokens:
+load:   - 128247 ('</s>')
+load:   - 151643 ('<|endoftext|>')
+load:   - 151645 ('<|im_end|>')
+load:   - 151662 ('<|fim_pad|>')
+load:   - 151663 ('<|repo_name|>')
+load:   - 151664 ('<|file_sep|>')
+load: special tokens cache size = 27
+load: token to piece cache size = 0.9311 MB
+print_info: arch                  = qwen3vl
+print_info: vocab_only            = 0
+print_info: no_alloc              = 0
+print_info: n_ctx_train           = 262144
+print_info: n_embd                = 4096
+print_info: n_embd_inp            = 16384
+print_info: n_layer               = 36
+print_info: n_head                = 32
+print_info: n_head_kv             = 8
+print_info: n_rot                 = 128
+print_info: n_swa                 = 0
+print_info: is_swa_any            = 0
+print_info: n_embd_head_k         = 128
+print_info: n_embd_head_v         = 128
+print_info: n_gqa                 = 4
+print_info: n_embd_k_gqa          = 1024
+print_info: n_embd_v_gqa          = 1024
+print_info: f_norm_eps            = 0.0e+00
+print_info: f_norm_rms_eps        = 1.0e-06
+print_info: f_clamp_kqv           = 0.0e+00
+print_info: f_max_alibi_bias      = 0.0e+00
+print_info: f_logit_scale         = 0.0e+00
+print_info: f_attn_scale          = 0.0e+00
+print_info: n_ff                  = 12288
+print_info: n_expert              = 0
+print_info: n_expert_used         = 0
+print_info: n_expert_groups       = 0
+print_info: n_group_used          = 0
+print_info: causal attn           = 1
+print_info: pooling type          = 0
+print_info: rope type             = 40
+print_info: rope scaling          = linear
+print_info: freq_base_train       = 5000000.0
+print_info: freq_scale_train      = 1
+print_info: n_ctx_orig_yarn       = 262144
+print_info: rope_yarn_log_mul     = 0.0000
+print_info: rope_finetuned        = unknown
+print_info: mrope sections        = [24, 20, 20, 0]
+print_info: model type            = 8B
+print_info: model params          = 8.19 B
+print_info: general.name          = Qwen3-Vl-8B-Instruct
+print_info: vocab type            = BPE
+print_info: n_vocab               = 151936
+print_info: n_merges              = 151387
+print_info: BOS token             = 151643 '<|endoftext|>'
+print_info: EOS token             = 151645 '<|im_end|>'
+print_info: EOT token             = 151645 '<|im_end|>'
+print_info: PAD token             = 151654 '<|vision_pad|>'
+print_info: LF token              = 198 '─è'
+print_info: FIM PRE token         = 151659 '<|fim_prefix|>'
+print_info: FIM SUF token         = 151661 '<|fim_suffix|>'
+print_info: FIM MID token         = 151660 '<|fim_middle|>'
+print_info: FIM PAD token         = 151662 '<|fim_pad|>'
+print_info: FIM REP token         = 151663 '<|repo_name|>'
+print_info: FIM SEP token         = 151664 '<|file_sep|>'
+print_info: EOG token             = 128247 '</s>'
+print_info: EOG token             = 151643 '<|endoftext|>'
+print_info: EOG token             = 151645 '<|im_end|>'
+print_info: EOG token             = 151662 '<|fim_pad|>'
+print_info: EOG token             = 151663 '<|repo_name|>'
+print_info: EOG token             = 151664 '<|file_sep|>'
+print_info: max token length      = 256
+load_tensors: loading model tensors, this can take a while... (mmap = true, direct_io = false)
+load_tensors: offloading output layer to GPU
+load_tensors: offloading 35 repeating layers to GPU
+load_tensors: offloaded 37/37 layers to GPU
+load_tensors:   CPU_Mapped model buffer size =   333.84 MiB
+load_tensors:        CUDA0 model buffer size =  4570.66 MiB
+......................................................................................
+common_init_result: added </s> logit bias = -inf
+common_init_result: added <|endoftext|> logit bias = -inf
+common_init_result: added <|im_end|> logit bias = -inf
+common_init_result: added <|fim_pad|> logit bias = -inf
+common_init_result: added <|repo_name|> logit bias = -inf
+common_init_result: added <|file_sep|> logit bias = -inf
+llama_context: constructing llama_context
+llama_context: n_seq_max     = 1
+llama_context: n_ctx         = 4096
+llama_context: n_ctx_seq     = 4096
+llama_context: n_batch       = 2048
+llama_context: n_ubatch      = 512
+llama_context: causal_attn   = 1
+llama_context: flash_attn    = enabled
+llama_context: kv_unified    = false
+llama_context: freq_base     = 5000000.0
+llama_context: freq_scale    = 1
+llama_context: n_ctx_seq (4096) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+llama_context:  CUDA_Host  output buffer size =     0.58 MiB
+llama_kv_cache:      CUDA0 KV buffer size =   576.00 MiB
+llama_kv_cache: size =  576.00 MiB (  4096 cells,  36 layers,  1/1 seqs), K (f16):  288.00 MiB, V (f16):  288.00 MiB
+sched_reserve: reserving ...
+sched_reserve: resolving fused Gated Delta Net support:
+sched_reserve: fused Gated Delta Net (autoregressive) enabled
+sched_reserve: fused Gated Delta Net (chunked) enabled
+sched_reserve:      CUDA0 compute buffer size =   304.75 MiB
+sched_reserve:  CUDA_Host compute buffer size =    48.02 MiB
+sched_reserve: graph nodes  = 1275
+sched_reserve: graph splits = 2
+sched_reserve: reserve took 8.01 ms, sched copies = 1
+common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+clip_model_loader: model name:   Qwen3-Vl-8B-Instruct
+clip_model_loader: description:
+clip_model_loader: GGUF version: 3
+clip_model_loader: alignment:    32
+clip_model_loader: n_tensors:    352
+clip_model_loader: n_kv:         31
+
+clip_model_loader: has vision encoder
+clip_ctx: CLIP using CUDA0 backend
+load_hparams: Qwen-VL models require at minimum 1024 image tokens to function correctly on grounding tasks
+load_hparams: if you encounter problems with accuracy, try adding --image-min-tokens 1024
+load_hparams: more info: https://github.com/ggml-org/llama.cpp/issues/16842
+
+load_hparams: projector:          qwen3vl_merger
+load_hparams: n_embd:             1152
+load_hparams: n_head:             16
+load_hparams: n_ff:               4304
+load_hparams: n_layer:            27
+load_hparams: ffn_op:             gelu
+load_hparams: projection_dim:     4096
+
+--- vision hparams ---
+load_hparams: image_size:         768
+load_hparams: patch_size:         16
+load_hparams: has_llava_proj:     0
+load_hparams: minicpmv_version:   0
+load_hparams: n_merge:            2
+load_hparams: n_wa_pattern: 0
+load_hparams: image_min_pixels:   196608 (custom value)
+load_hparams: image_max_pixels:   786432 (custom value)
+
+load_hparams: model size:         1105.32 MiB
+load_hparams: metadata size:      0.12 MiB
+warmup: warmup with image size = 1472 x 1472
+alloc_compute_meta:      CUDA0 compute buffer size =   372.08 MiB
+alloc_compute_meta:        CPU compute buffer size =    24.93 MiB
+alloc_compute_meta: graph splits = 1, nodes = 853
+warmup: flash attention is enabled
+srv    load_model: loaded multimodal model, 'mmproj-F16.gguf'
+srv    load_model: initializing slots, n_slots = 1
+no implementations specified for speculative decoding
+slot   load_model: id  0 | task -1 | speculative decoding context not initialized
+slot   load_model: id  0 | task -1 | new slot, n_ctx = 4096
+srv    load_model: prompt cache is enabled, size limit: 512 MiB
+srv    load_model: use `--cache-ram 0` to disable the prompt cache
+srv    load_model: for more info see https://github.com/ggml-org/llama.cpp/pull/16391
+init: chat template, example_format: '<|im_start|>system
+You are a helpful assistant<|im_end|>
+<|im_start|>user
+Hello<|im_end|>
+<|im_start|>assistant
+Hi there<|im_end|>
+<|im_start|>user
+How are you?<|im_end|>
+<|im_start|>assistant
+'
+srv          init: init: chat template, thinking = 0
+main: model loaded
+main: server is listening on http://0.0.0.0:8001
+main: starting the main loop...
+srv  update_slots: all slots are idle
+srv  params_from_: Chat format: peg-native
+slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = -1
+slot launch_slot_: id  0 | task -1 | sampler chain: logits -> penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> dist
+slot launch_slot_: id  0 | task 0 | processing task, is_child = 0
+slot update_slots: id  0 | task 0 | new prompt, n_ctx_slot = 4096, n_keep = 0, task.n_tokens = 1315
+slot update_slots: id  0 | task 0 | n_tokens = 0, memory_seq_rm [0, end)
+slot update_slots: id  0 | task 0 | prompt processing progress, n_tokens = 361, batch.n_tokens = 361, progress = 0.274525
+slot update_slots: id  0 | task 0 | n_tokens = 361, memory_seq_rm [361, end)
+srv  process_chun: processing image...
+encoding image slice...
+image slice encoded in 3044 ms
+decoding image batch 1/1, n_tokens_batch = 690
+image decoded (batch 1/1) in 864 ms
+srv  process_chun: image processed in 3908 ms
+slot init_sampler: id  0 | task 0 | init sampler, took 0.08 ms, tokens: text = 625, total = 1315
+slot update_slots: id  0 | task 0 | prompt processing done, n_tokens = 1315, batch.n_tokens = 264
+slot print_timing: id  0 | task 0 |
+prompt eval time =    4684.74 ms /  1315 tokens (    3.56 ms per token,   280.70 tokens per second)
+       eval time =   15539.40 ms /   577 tokens (   26.93 ms per token,    37.13 tokens per second)
+      total time =   20224.14 ms /  1892 tokens
+slot      release: id  0 | task 0 | stop processing: n_tokens = 1891, truncated = 0
+srv  update_slots: all slots are idle
+srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200
+srv  params_from_: Chat format: peg-native
+slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 201175821
+srv  get_availabl: updating prompt cache
+srv   prompt_save:  - saving prompt with length 1891, total state size = 265.959 MiB
+srv          load:  - looking for better prompt, base f_keep = 0.013, sim = 0.023
+srv        update:  - cache state: 1 prompts, 265.959 MiB (limits: 512.000 MiB, 4096 tokens, 4096 est)
+srv        update:    - prompt 0000022835E05B10:    1891 tokens, checkpoints:  0,   265.959 MiB
+srv  get_availabl: prompt cache update took 93.46 ms
+slot launch_slot_: id  0 | task -1 | sampler chain: logits -> penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> dist
+slot launch_slot_: id  0 | task 579 | processing task, is_child = 0
+slot update_slots: id  0 | task 579 | new prompt, n_ctx_slot = 4096, n_keep = 0, task.n_tokens = 1046
+slot update_slots: id  0 | task 579 | n_tokens = 24, memory_seq_rm [24, end)
+slot update_slots: id  0 | task 579 | prompt processing progress, n_tokens = 154, batch.n_tokens = 130, progress = 0.147228
+slot update_slots: id  0 | task 579 | n_tokens = 154, memory_seq_rm [154, end)
+srv  process_chun: processing image...
+encoding image slice...
+image slice encoded in 2722 ms
+decoding image batch 1/1, n_tokens_batch = 690
+image decoded (batch 1/1) in 740 ms
+srv  process_chun: image processed in 3462 ms
+slot init_sampler: id  0 | task 579 | init sampler, took 0.07 ms, tokens: text = 356, total = 1046
+slot update_slots: id  0 | task 579 | prompt processing done, n_tokens = 1046, batch.n_tokens = 202
+slot print_timing: id  0 | task 579 |
+prompt eval time =    3734.93 ms /  1022 tokens (    3.65 ms per token,   273.63 tokens per second)
+       eval time =    9887.47 ms /   410 tokens (   24.12 ms per token,    41.47 tokens per second)
+      total time =   13622.41 ms /  1432 tokens
+slot      release: id  0 | task 579 | stop processing: n_tokens = 1455, truncated = 0
+srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200
+srv  update_slots: all slots are idle
+srv  params_from_: Chat format: peg-native
+slot get_availabl: id  0 | task -1 | selected slot by LCP similarity, sim_best = 0.147 (> 0.100 thold), f_keep = 0.106
+srv  get_availabl: updating prompt cache
+srv   prompt_save:  - saving prompt with length 1455, total state size = 204.638 MiB
+srv          load:  - looking for better prompt, base f_keep = 0.106, sim = 0.147
+srv        update:  - cache state: 2 prompts, 470.597 MiB (limits: 512.000 MiB, 4096 tokens, 4096 est)
+srv        update:    - prompt 0000022835E05B10:    1891 tokens, checkpoints:  0,   265.959 MiB
+srv        update:    - prompt 0000022B1FD81770:    1455 tokens, checkpoints:  0,   204.638 MiB
+srv  get_availabl: prompt cache update took 59.06 ms
+slot launch_slot_: id  0 | task -1 | sampler chain: logits -> penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> dist
+slot launch_slot_: id  0 | task 991 | processing task, is_child = 0
+slot update_slots: id  0 | task 991 | new prompt, n_ctx_slot = 4096, n_keep = 0, task.n_tokens = 1046
+slot update_slots: id  0 | task 991 | n_tokens = 154, memory_seq_rm [154, end)
+srv  process_chun: processing image...
+encoding image slice...
+image slice encoded in 2700 ms
+decoding image batch 1/1, n_tokens_batch = 690
+image decoded (batch 1/1) in 814 ms
+srv  process_chun: image processed in 3514 ms
+slot init_sampler: id  0 | task 991 | init sampler, took 0.04 ms, tokens: text = 356, total = 1046
+slot update_slots: id  0 | task 991 | prompt processing done, n_tokens = 1046, batch.n_tokens = 202
+slot print_timing: id  0 | task 991 |
+prompt eval time =    3732.12 ms /   892 tokens (    4.18 ms per token,   239.01 tokens per second)
+       eval time =   11091.27 ms /   409 tokens (   27.12 ms per token,    36.88 tokens per second)
+      total time =   14823.39 ms /  1301 tokens
+slot      release: id  0 | task 991 | stop processing: n_tokens = 1454, truncated = 0
+srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200
+srv  update_slots: all slots are idle
+srv  params_from_: Chat format: peg-native
+slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 229904453
+srv  get_availabl: updating prompt cache
+srv   prompt_save:  - saving prompt with length 1454, total state size = 204.497 MiB
+srv          load:  - looking for better prompt, base f_keep = 0.017, sim = 0.018
+srv        update:  - cache size limit reached, removing oldest entry (size = 265.959 MiB)
+srv        update:  - cache state: 2 prompts, 409.135 MiB (limits: 512.000 MiB, 4096 tokens, 4096 est)
+srv        update:    - prompt 0000022B1FD81770:    1455 tokens, checkpoints:  0,   204.638 MiB
+srv        update:    - prompt 0000022B1FD80900:    1454 tokens, checkpoints:  0,   204.497 MiB
+srv  get_availabl: prompt cache update took 76.31 ms
+slot launch_slot_: id  0 | task -1 | sampler chain: logits -> penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> dist
+slot launch_slot_: id  0 | task 1401 | processing task, is_child = 0
+slot update_slots: id  0 | task 1401 | new prompt, n_ctx_slot = 4096, n_keep = 0, task.n_tokens = 1315
+slot update_slots: id  0 | task 1401 | n_tokens = 24, memory_seq_rm [24, end)
+slot update_slots: id  0 | task 1401 | prompt processing progress, n_tokens = 361, batch.n_tokens = 337, progress = 0.274525
+slot update_slots: id  0 | task 1401 | n_tokens = 361, memory_seq_rm [361, end)
+srv  process_chun: processing image...
+encoding image slice...
+image slice encoded in 2805 ms
+decoding image batch 1/1, n_tokens_batch = 690
+image decoded (batch 1/1) in 882 ms
+srv  process_chun: image processed in 3687 ms
+slot init_sampler: id  0 | task 1401 | init sampler, took 0.11 ms, tokens: text = 625, total = 1315
+slot update_slots: id  0 | task 1401 | prompt processing done, n_tokens = 1315, batch.n_tokens = 264
+slot print_timing: id  0 | task 1401 |
+prompt eval time =    4396.09 ms /  1291 tokens (    3.41 ms per token,   293.67 tokens per second)
+       eval time =   14565.52 ms /   577 tokens (   25.24 ms per token,    39.61 tokens per second)
+      total time =   18961.61 ms /  1868 tokens
+slot      release: id  0 | task 1401 | stop processing: n_tokens = 1891, truncated = 0
+srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200
+srv  update_slots: all slots are idle
+srv  params_from_: Chat format: peg-native
+slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 2250676776
+srv  get_availabl: updating prompt cache
+srv   prompt_save:  - saving prompt with length 1891, total state size = 265.959 MiB
+srv          load:  - looking for better prompt, base f_keep = 0.013, sim = 0.023
+srv        update:  - cache size limit reached, removing oldest entry (size = 204.638 MiB)
+srv        update:  - cache state: 2 prompts, 470.456 MiB (limits: 512.000 MiB, 4096 tokens, 4096 est)
+srv        update:    - prompt 0000022B1FD80900:    1454 tokens, checkpoints:  0,   204.497 MiB
+srv        update:    - prompt 0000022B1FD80970:    1891 tokens, checkpoints:  0,   265.959 MiB
+srv  get_availabl: prompt cache update took 94.22 ms
+slot launch_slot_: id  0 | task -1 | sampler chain: logits -> penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> dist
+slot launch_slot_: id  0 | task 1980 | processing task, is_child = 0
+slot update_slots: id  0 | task 1980 | new prompt, n_ctx_slot = 4096, n_keep = 0, task.n_tokens = 1046
+slot update_slots: id  0 | task 1980 | n_tokens = 24, memory_seq_rm [24, end)
+slot update_slots: id  0 | task 1980 | prompt processing progress, n_tokens = 154, batch.n_tokens = 130, progress = 0.147228
+slot update_slots: id  0 | task 1980 | n_tokens = 154, memory_seq_rm [154, end)
+srv  process_chun: processing image...
+encoding image slice...
+image slice encoded in 2687 ms
+decoding image batch 1/1, n_tokens_batch = 690
+image decoded (batch 1/1) in 725 ms
+srv  process_chun: image processed in 3412 ms
+slot init_sampler: id  0 | task 1980 | init sampler, took 0.04 ms, tokens: text = 356, total = 1046
+slot update_slots: id  0 | task 1980 | prompt processing done, n_tokens = 1046, batch.n_tokens = 202
+slot print_timing: id  0 | task 1980 |
+prompt eval time =    3690.86 ms /  1022 tokens (    3.61 ms per token,   276.90 tokens per second)
+       eval time =    8531.52 ms /   377 tokens (   22.63 ms per token,    44.19 tokens per second)
+      total time =   12222.39 ms /  1399 tokens
+slot      release: id  0 | task 1980 | stop processing: n_tokens = 1422, truncated = 0
+srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200
+srv  update_slots: all slots are idle
+srv  params_from_: Chat format: peg-native
+slot get_availabl: id  0 | task -1 | selected slot by LCP similarity, sim_best = 0.147 (> 0.100 thold), f_keep = 0.108
+srv  get_availabl: updating prompt cache
+srv   prompt_save:  - saving prompt with length 1422, total state size = 199.997 MiB
+srv          load:  - looking for better prompt, base f_keep = 0.108, sim = 0.147
+srv        update:  - cache size limit reached, removing oldest entry (size = 204.497 MiB)
+srv        update:  - cache state: 2 prompts, 465.955 MiB (limits: 512.000 MiB, 4096 tokens, 4096 est)
+srv        update:    - prompt 0000022B1FD80970:    1891 tokens, checkpoints:  0,   265.959 MiB
+srv        update:    - prompt 0000022B1FD80D60:    1422 tokens, checkpoints:  0,   199.997 MiB
+srv  get_availabl: prompt cache update took 63.38 ms
+slot launch_slot_: id  0 | task -1 | sampler chain: logits -> penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> dist
+slot launch_slot_: id  0 | task 2359 | processing task, is_child = 0
+slot update_slots: id  0 | task 2359 | new prompt, n_ctx_slot = 4096, n_keep = 0, task.n_tokens = 1046
+slot update_slots: id  0 | task 2359 | n_tokens = 154, memory_seq_rm [154, end)
+srv  process_chun: processing image...
+encoding image slice...
+image slice encoded in 2560 ms
+decoding image batch 1/1, n_tokens_batch = 690
+image decoded (batch 1/1) in 741 ms
+srv  process_chun: image processed in 3301 ms
+slot init_sampler: id  0 | task 2359 | init sampler, took 0.04 ms, tokens: text = 356, total = 1046
+slot update_slots: id  0 | task 2359 | prompt processing done, n_tokens = 1046, batch.n_tokens = 202
+slot print_timing: id  0 | task 2359 |
+prompt eval time =    3560.23 ms /   892 tokens (    3.99 ms per token,   250.55 tokens per second)
+       eval time =    9421.68 ms /   414 tokens (   22.76 ms per token,    43.94 tokens per second)
+      total time =   12981.92 ms /  1306 tokens
+slot      release: id  0 | task 2359 | stop processing: n_tokens = 1459, truncated = 0
+srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200
+srv  update_slots: all slots are idle
+srv  params_from_: Chat format: peg-native
+slot get_availabl: id  0 | task -1 | selected slot by LCP similarity, sim_best = 0.147 (> 0.100 thold), f_keep = 0.106
+srv  get_availabl: updating prompt cache
+srv   prompt_save:  - saving prompt with length 1459, total state size = 205.201 MiB
+srv          load:  - looking for better prompt, base f_keep = 0.106, sim = 0.147
+srv        update:  - cache size limit reached, removing oldest entry (size = 265.959 MiB)
+srv        update:  - cache state: 2 prompts, 405.197 MiB (limits: 512.000 MiB, 4096 tokens, 4096 est)
+srv        update:    - prompt 0000022B1FD80D60:    1422 tokens, checkpoints:  0,   199.997 MiB
+srv        update:    - prompt 0000022B1FD82030:    1459 tokens, checkpoints:  0,   205.201 MiB
+srv  get_availabl: prompt cache update took 65.51 ms
+slot launch_slot_: id  0 | task -1 | sampler chain: logits -> penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> dist
+slot launch_slot_: id  0 | task 2774 | processing task, is_child = 0
+slot update_slots: id  0 | task 2774 | new prompt, n_ctx_slot = 4096, n_keep = 0, task.n_tokens = 1046
+slot update_slots: id  0 | task 2774 | n_tokens = 154, memory_seq_rm [154, end)
+srv  process_chun: processing image...
+encoding image slice...
+image slice encoded in 2653 ms
+decoding image batch 1/1, n_tokens_batch = 690
+image decoded (batch 1/1) in 741 ms
+srv  process_chun: image processed in 3394 ms
+slot init_sampler: id  0 | task 2774 | init sampler, took 0.05 ms, tokens: text = 356, total = 1046
+slot update_slots: id  0 | task 2774 | prompt processing done, n_tokens = 1046, batch.n_tokens = 202
+slot print_timing: id  0 | task 2774 |
+prompt eval time =    3661.19 ms /   892 tokens (    4.10 ms per token,   243.64 tokens per second)
+       eval time =    8398.10 ms /   366 tokens (   22.95 ms per token,    43.58 tokens per second)
+      total time =   12059.29 ms /  1258 tokens
+slot      release: id  0 | task 2774 | stop processing: n_tokens = 1411, truncated = 0
+srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200
+srv  update_slots: all slots are idle
+srv  params_from_: Chat format: peg-native
+slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 2288334215
+srv  get_availabl: updating prompt cache
+srv   prompt_save:  - saving prompt with length 1411, total state size = 198.450 MiB
+srv          load:  - looking for better prompt, base f_keep = 0.017, sim = 0.016
+srv        update:  - cache size limit reached, removing oldest entry (size = 199.997 MiB)
+srv        update:  - cache state: 2 prompts, 403.650 MiB (limits: 512.000 MiB, 4096 tokens, 4096 est)
+srv        update:    - prompt 0000022B1FD82030:    1459 tokens, checkpoints:  0,   205.201 MiB
+srv        update:    - prompt 0000022B1FD81FC0:    1411 tokens, checkpoints:  0,   198.450 MiB
+srv  get_availabl: prompt cache update took 70.78 ms
+slot launch_slot_: id  0 | task -1 | sampler chain: logits -> penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> dist
+slot launch_slot_: id  0 | task 3141 | processing task, is_child = 0
+slot update_slots: id  0 | task 3141 | new prompt, n_ctx_slot = 4096, n_keep = 0, task.n_tokens = 1489
+slot update_slots: id  0 | task 3141 | n_tokens = 24, memory_seq_rm [24, end)
+slot update_slots: id  0 | task 3141 | prompt processing progress, n_tokens = 560, batch.n_tokens = 536, progress = 0.376091
+slot update_slots: id  0 | task 3141 | n_tokens = 560, memory_seq_rm [560, end)
+srv  process_chun: processing image...
+encoding image slice...
+image slice encoded in 2410 ms
+decoding image batch 1/1, n_tokens_batch = 630
+image decoded (batch 1/1) in 761 ms
+srv  process_chun: image processed in 3171 ms
+slot init_sampler: id  0 | task 3141 | init sampler, took 0.20 ms, tokens: text = 859, total = 1489
+slot update_slots: id  0 | task 3141 | prompt processing done, n_tokens = 1489, batch.n_tokens = 299
+slot print_timing: id  0 | task 3141 |
+prompt eval time =    4325.18 ms /  1465 tokens (    2.95 ms per token,   338.71 tokens per second)
+       eval time =   18954.87 ms /   823 tokens (   23.03 ms per token,    43.42 tokens per second)
+      total time =   23280.05 ms /  2288 tokens
+slot      release: id  0 | task 3141 | stop processing: n_tokens = 2311, truncated = 0
+srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200
+srv  update_slots: all slots are idle
+srv  params_from_: Chat format: peg-native
+slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 3133259011
+srv  get_availabl: updating prompt cache
+srv   prompt_save:  - saving prompt with length 2311, total state size = 325.029 MiB
+srv          load:  - looking for better prompt, base f_keep = 0.010, sim = 0.020
+srv        update:  - cache size limit reached, removing oldest entry (size = 205.201 MiB)
+srv        update:  - cache size limit reached, removing oldest entry (size = 198.450 MiB)
+srv        update:  - cache state: 1 prompts, 325.029 MiB (limits: 512.000 MiB, 4096 tokens, 4096 est)
+srv        update:    - prompt 0000022B1FD80C80:    2311 tokens, checkpoints:  0,   325.029 MiB
+srv  get_availabl: prompt cache update took 105.47 ms
+slot launch_slot_: id  0 | task -1 | sampler chain: logits -> penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> dist
+slot launch_slot_: id  0 | task 3966 | processing task, is_child = 0
+slot update_slots: id  0 | task 3966 | new prompt, n_ctx_slot = 4096, n_keep = 0, task.n_tokens = 1205
+slot update_slots: id  0 | task 3966 | n_tokens = 24, memory_seq_rm [24, end)
+slot update_slots: id  0 | task 3966 | prompt processing progress, n_tokens = 351, batch.n_tokens = 327, progress = 0.291286
+slot update_slots: id  0 | task 3966 | n_tokens = 351, memory_seq_rm [351, end)
+srv  process_chun: processing image...
+encoding image slice...
+image slice encoded in 2606 ms
+decoding image batch 1/1, n_tokens_batch = 630
+image decoded (batch 1/1) in 721 ms
+srv  process_chun: image processed in 3327 ms
+slot init_sampler: id  0 | task 3966 | init sampler, took 0.06 ms, tokens: text = 575, total = 1205
+slot update_slots: id  0 | task 3966 | prompt processing done, n_tokens = 1205, batch.n_tokens = 224
+slot print_timing: id  0 | task 3966 |
+prompt eval time =    3566.62 ms /  1181 tokens (    3.02 ms per token,   331.13 tokens per second)
+       eval time =   22185.21 ms /   946 tokens (   23.45 ms per token,    42.64 tokens per second)
+      total time =   25751.82 ms /  2127 tokens
+slot      release: id  0 | task 3966 | stop processing: n_tokens = 2150, truncated = 0
+srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200
+srv  update_slots: all slots are idle
+srv  params_from_: Chat format: peg-native
+slot get_availabl: id  0 | task -1 | selected slot by LCP similarity, sim_best = 0.291 (> 0.100 thold), f_keep = 0.163
+srv  get_availabl: updating prompt cache
+srv   prompt_save:  - saving prompt with length 2150, total state size = 302.386 MiB
+srv          load:  - looking for better prompt, base f_keep = 0.163, sim = 0.291
+srv        update:  - cache size limit reached, removing oldest entry (size = 325.029 MiB)
+srv        update:  - cache state: 1 prompts, 302.386 MiB (limits: 512.000 MiB, 4096 tokens, 4096 est)
+srv        update:    - prompt 0000022B1FD80AC0:    2150 tokens, checkpoints:  0,   302.386 MiB
+srv  get_availabl: prompt cache update took 94.40 ms
+slot launch_slot_: id  0 | task -1 | sampler chain: logits -> penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> dist
+slot launch_slot_: id  0 | task 4914 | processing task, is_child = 0
+slot update_slots: id  0 | task 4914 | new prompt, n_ctx_slot = 4096, n_keep = 0, task.n_tokens = 1205
+slot update_slots: id  0 | task 4914 | n_tokens = 351, memory_seq_rm [351, end)
+srv  process_chun: processing image...
+encoding image slice...
+image slice encoded in 2248 ms
+decoding image batch 1/1, n_tokens_batch = 630
+image decoded (batch 1/1) in 725 ms
+srv  process_chun: image processed in 2973 ms
+slot init_sampler: id  0 | task 4914 | init sampler, took 0.06 ms, tokens: text = 575, total = 1205
+slot update_slots: id  0 | task 4914 | prompt processing done, n_tokens = 1205, batch.n_tokens = 224
+slot print_timing: id  0 | task 4914 |
+prompt eval time =    3204.80 ms /   854 tokens (    3.75 ms per token,   266.48 tokens per second)
+       eval time =   17699.87 ms /   789 tokens (   22.43 ms per token,    44.58 tokens per second)
+      total time =   20904.67 ms /  1643 tokens
+slot      release: id  0 | task 4914 | stop processing: n_tokens = 1993, truncated = 0
+srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200
+srv  update_slots: all slots are idle
+srv  params_from_: Chat format: peg-native
+slot get_availabl: id  0 | task -1 | selected slot by LCP similarity, sim_best = 0.291 (> 0.100 thold), f_keep = 0.176
+srv  get_availabl: updating prompt cache
+srv   prompt_save:  - saving prompt with length 1993, total state size = 280.304 MiB
+srv          load:  - looking for better prompt, base f_keep = 0.176, sim = 0.291
+srv        update:  - cache size limit reached, removing oldest entry (size = 302.386 MiB)
+srv        update:  - cache state: 1 prompts, 280.304 MiB (limits: 512.000 MiB, 4096 tokens, 4096 est)
+srv        update:    - prompt 0000022B1D3EE070:    1993 tokens, checkpoints:  0,   280.304 MiB
+srv  get_availabl: prompt cache update took 87.41 ms
+slot launch_slot_: id  0 | task -1 | sampler chain: logits -> penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> dist
+slot launch_slot_: id  0 | task 5704 | processing task, is_child = 0
+slot update_slots: id  0 | task 5704 | new prompt, n_ctx_slot = 4096, n_keep = 0, task.n_tokens = 1205
+slot update_slots: id  0 | task 5704 | n_tokens = 351, memory_seq_rm [351, end)
+srv  process_chun: processing image...
+encoding image slice...
+image slice encoded in 2269 ms
+decoding image batch 1/1, n_tokens_batch = 630
+image decoded (batch 1/1) in 718 ms
+srv  process_chun: image processed in 2987 ms
+slot init_sampler: id  0 | task 5704 | init sampler, took 0.06 ms, tokens: text = 575, total = 1205
+slot update_slots: id  0 | task 5704 | prompt processing done, n_tokens = 1205, batch.n_tokens = 224
+slot print_timing: id  0 | task 5704 |
+prompt eval time =    3218.09 ms /   854 tokens (    3.77 ms per token,   265.37 tokens per second)
+       eval time =    2000.74 ms /    93 tokens (   21.51 ms per token,    46.48 tokens per second)
+      total time =    5218.83 ms /   947 tokens
+slot      release: id  0 | task 5704 | stop processing: n_tokens = 1297, truncated = 0
+srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200
+srv  update_slots: all slots are idle
+srv  params_from_: Chat format: peg-native
+slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 3185591185
+srv  get_availabl: updating prompt cache
+srv   prompt_save:  - saving prompt with length 1297, total state size = 182.416 MiB
+srv          load:  - looking for better prompt, base f_keep = 0.019, sim = 0.017
+srv        update:  - cache state: 2 prompts, 462.721 MiB (limits: 512.000 MiB, 4096 tokens, 4096 est)
+srv        update:    - prompt 0000022B1D3EE070:    1993 tokens, checkpoints:  0,   280.304 MiB
+srv        update:    - prompt 0000022B1FD815B0:    1297 tokens, checkpoints:  0,   182.416 MiB
+srv  get_availabl: prompt cache update took 68.01 ms
+slot launch_slot_: id  0 | task -1 | sampler chain: logits -> penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> dist
+slot launch_slot_: id  0 | task 5798 | processing task, is_child = 0
+slot update_slots: id  0 | task 5798 | new prompt, n_ctx_slot = 4096, n_keep = 0, task.n_tokens = 1379
+slot update_slots: id  0 | task 5798 | n_tokens = 24, memory_seq_rm [24, end)
+slot update_slots: id  0 | task 5798 | prompt processing progress, n_tokens = 386, batch.n_tokens = 362, progress = 0.279913
+slot update_slots: id  0 | task 5798 | n_tokens = 386, memory_seq_rm [386, end)
+srv  process_chun: processing image...
+encoding image slice...
+image slice encoded in 3011 ms
+decoding image batch 1/1, n_tokens_batch = 690
+image decoded (batch 1/1) in 743 ms
+srv  process_chun: image processed in 3754 ms
+slot init_sampler: id  0 | task 5798 | init sampler, took 0.09 ms, tokens: text = 689, total = 1379
+slot update_slots: id  0 | task 5798 | prompt processing done, n_tokens = 1379, batch.n_tokens = 303
+slot print_timing: id  0 | task 5798 |
+prompt eval time =    4200.33 ms /  1355 tokens (    3.10 ms per token,   322.59 tokens per second)
+       eval time =   16164.29 ms /   693 tokens (   23.33 ms per token,    42.87 tokens per second)
+      total time =   20364.62 ms /  2048 tokens
+slot      release: id  0 | task 5798 | stop processing: n_tokens = 2071, truncated = 0
+srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200
+srv  update_slots: all slots are idle
+srv  params_from_: Chat format: peg-native
+slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 6457024448
+srv  get_availabl: updating prompt cache
+srv   prompt_save:  - saving prompt with length 2071, total state size = 291.275 MiB
+srv          load:  - looking for better prompt, base f_keep = 0.012, sim = 0.022
+srv        update:  - cache size limit reached, removing oldest entry (size = 280.304 MiB)
+srv        update:  - cache state: 2 prompts, 473.691 MiB (limits: 512.000 MiB, 4096 tokens, 4096 est)
+srv        update:    - prompt 0000022B1FD815B0:    1297 tokens, checkpoints:  0,   182.416 MiB
+srv        update:    - prompt 0000022B1FD82110:    2071 tokens, checkpoints:  0,   291.275 MiB
+srv  get_availabl: prompt cache update took 121.57 ms
+slot launch_slot_: id  0 | task -1 | sampler chain: logits -> penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> dist
+slot launch_slot_: id  0 | task 6493 | processing task, is_child = 0
+slot update_slots: id  0 | task 6493 | new prompt, n_ctx_slot = 4096, n_keep = 0, task.n_tokens = 1071
+slot update_slots: id  0 | task 6493 | n_tokens = 24, memory_seq_rm [24, end)
+slot update_slots: id  0 | task 6493 | prompt processing progress, n_tokens = 154, batch.n_tokens = 130, progress = 0.143791
+slot update_slots: id  0 | task 6493 | n_tokens = 154, memory_seq_rm [154, end)
+srv  process_chun: processing image...
+encoding image slice...
+image slice encoded in 2565 ms
+decoding image batch 1/1, n_tokens_batch = 690
+image decoded (batch 1/1) in 727 ms
+srv  process_chun: image processed in 3292 ms
+slot init_sampler: id  0 | task 6493 | init sampler, took 0.06 ms, tokens: text = 381, total = 1071
+slot update_slots: id  0 | task 6493 | prompt processing done, n_tokens = 1071, batch.n_tokens = 227
+slot print_timing: id  0 | task 6493 |
+prompt eval time =    3681.24 ms /  1047 tokens (    3.52 ms per token,   284.41 tokens per second)
+       eval time =    6638.10 ms /   280 tokens (   23.71 ms per token,    42.18 tokens per second)
+      total time =   10319.34 ms /  1327 tokens
+slot      release: id  0 | task 6493 | stop processing: n_tokens = 1350, truncated = 0
+srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200
+srv  update_slots: all slots are idle
+srv  params_from_: Chat format: peg-native
+slot get_availabl: id  0 | task -1 | selected slot by LCP similarity, sim_best = 0.144 (> 0.100 thold), f_keep = 0.114
+srv  get_availabl: updating prompt cache
+srv   prompt_save:  - saving prompt with length 1350, total state size = 189.870 MiB
+srv          load:  - looking for better prompt, base f_keep = 0.114, sim = 0.144
+srv        update:  - cache size limit reached, removing oldest entry (size = 182.416 MiB)
+srv        update:  - cache state: 2 prompts, 481.145 MiB (limits: 512.000 MiB, 4096 tokens, 4096 est)
+srv        update:    - prompt 0000022B1FD82110:    2071 tokens, checkpoints:  0,   291.275 MiB
+srv        update:    - prompt 0000022B1D3EE5B0:    1350 tokens, checkpoints:  0,   189.870 MiB
+srv  get_availabl: prompt cache update took 66.80 ms
+slot launch_slot_: id  0 | task -1 | sampler chain: logits -> penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> dist
+slot launch_slot_: id  0 | task 6775 | processing task, is_child = 0
+slot update_slots: id  0 | task 6775 | new prompt, n_ctx_slot = 4096, n_keep = 0, task.n_tokens = 1071
+slot update_slots: id  0 | task 6775 | n_tokens = 154, memory_seq_rm [154, end)
+srv  process_chun: processing image...
+encoding image slice...
+image slice encoded in 2527 ms
+decoding image batch 1/1, n_tokens_batch = 690
+image decoded (batch 1/1) in 730 ms
+srv  process_chun: image processed in 3257 ms
+slot init_sampler: id  0 | task 6775 | init sampler, took 0.04 ms, tokens: text = 381, total = 1071
+slot update_slots: id  0 | task 6775 | prompt processing done, n_tokens = 1071, batch.n_tokens = 227
+slot print_timing: id  0 | task 6775 |
+prompt eval time =    3570.03 ms /   917 tokens (    3.89 ms per token,   256.86 tokens per second)
+       eval time =    1825.19 ms /    83 tokens (   21.99 ms per token,    45.47 tokens per second)
+      total time =    5395.22 ms /  1000 tokens
+slot      release: id  0 | task 6775 | stop processing: n_tokens = 1153, truncated = 0
+srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200
+srv  update_slots: all slots are idle
+
+
+
+
+
+
+Before vs After
+Metric	Before	After	Improvement
+Image tokens	1,218	630-690	43% fewer
+ViT encoding	11,891-13,258 ms	2,248-3,044 ms	~5x faster
+Image decode	963-1,205 ms	718-882 ms	25% faster
+Prompt prefill	13,000-14,800 ms	3,200-4,700 ms	~3.5x faster
+Prefill speed	100-134 t/s	240-338 t/s	2.5x faster
+Total per page	36,000 ms	10,319-25,751 ms	40-70% faster
+The ViT bottleneck is solved. Changes worked.
+
+Current Bottleneck: LLM Generation
+The remaining time is now entirely output-length dependent:
+
+
+Task 5704:  93 tokens  →  2,000 ms  →  total  5.2s   ← fast page
+Task 6775:  83 tokens  →  1,825 ms  →  total  5.4s   ← fast page
+Task 6493: 280 tokens  →  6,638 ms  →  total 10.3s
+Task  579: 410 tokens  →  9,887 ms  →  total 13.6s
+Task 5798: 693 tokens  → 16,164 ms  →  total 20.4s
+Task 3966: 946 tokens  → 22,185 ms  →  total 25.7s   ← slow page
+Generation speed is 22-46 t/s — this is hardware-bound on RTX 4060. Cannot be improved without a GPU upgrade.
+
+The only lever left is reducing output token count (shorter JSON = fewer tokens = faster).
+
+One Warning to Address
+
+load_hparams: Qwen-VL models require at minimum 1024 image tokens
+              to function correctly on grounding tasks
+load_hparams: if you encounter problems with accuracy, try adding
+              --image-min-tokens 1024
+You're getting 630-690 tokens, below the 1024 threshold. This is fine for text extraction, but if your system uses bounding boxes (bbox fields, spatial memory, field_locations), accuracy may degrade on some pages. Watch for bbox coordinates being slightly off.
+
+If you see bbox issues: change --image-min-tokens 192 → --image-min-tokens 1024. Encoding will go from ~2.5s back to ~5-6s, but bbox accuracy will be protected.
+
+Cache Working Correctly
+
+srv load_model: prompt cache is enabled, size limit: 512 MiB  ✓
+srv prompt_save: saving prompt ... 265.959 MiB
+srv update: cache size limit reached, removing oldest entry   ← minor issue
+The 512 MiB limit only fits 1-2 full prompts. When a third arrives, the oldest gets evicted. Since you have 64GB RAM, bump it:
+
+
+--cache-ram 1024
+This holds 3-4 prompts comfortably and stops the eviction churn.
+
+Summary
+Status
+ViT encoding bottleneck	Solved — 5x faster
+VRAM spill to shared RAM	Solved — ctx=4096
+LLM generation	Hardware-bound — cannot improve
+Bbox accuracy warning	Monitor — raise min-tokens if issues seen
+Cache evictions	Easy fix — raise to --cache-ram 1024
+
