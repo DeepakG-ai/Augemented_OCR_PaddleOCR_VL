@@ -30,132 +30,217 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
 
-try:
-    from . import db as db_mod
-    from . import extractor
-    from . import processor
-    from . import page_logger
-    from .contracts import build_purchase_order_contract
-    from . import logging_config as plog
-    from .logging_config import configure_logging
-    from .auth import (
-        assert_alias_access,
-        assert_extraction_access,
-        assert_job_access,
-        assert_vendor_access,
-        create_access_token,
-        get_current_user,
-        hash_password,
-        require_admin,
-        verify_password,
-    )
-    from .models import (
-        ExtractionJobStartOut,
-        ExtractionOut,
-        HealthOut,
-        JobOut,
-        JobStatusOut,
-        LoginRequest,
-        TemplateSaveResponse,
-        TemplateCreate,
-        TemplateListOut,
-        TemplateOut,
-        TokenOut,
-        UserCreate,
-        UserOut,
-        UserResetPassword,
-        VendorAliasCreate,
-        VendorAliasOut,
-        VendorCreate,
-        VendorOut,
-    )
-    from .object_store import ARTIFACTS_BUCKET, DOCUMENTS_BUCKET, EXPORTS_BUCKET, get_store
-    from .phoenix_tracing import (
-        setup_phoenix,
-        get_current_context,
-        attach_context,
-        detach_context,
-        current_trace_context,
-        use_trace_context,
-        trace_extraction_pipeline,
-        trace_extraction_root,
-        trace_span,
-        trace_named_step,
-        trace_file_upload,
-        trace_pdf_rendering,
-        trace_db_persist,
-        trace_paddle_ocr,
-    )
-except ImportError:
-    import db as db_mod
-    import extractor
-    import processor
-    import page_logger  # type: ignore[no-redef]
-    from contracts import build_purchase_order_contract
-    import logging_config as plog
-    from logging_config import configure_logging
-    from auth import (  # type: ignore[no-redef]
-        assert_alias_access,
-        assert_extraction_access,
-        assert_job_access,
-        assert_vendor_access,
-        create_access_token,
-        get_current_user,
-        hash_password,
-        require_admin,
-        verify_password,
-    )
-    from models import (
-        ExtractionJobStartOut,
-        ExtractionOut,
-        HealthOut,
-        JobOut,
-        JobStatusOut,
-        LoginRequest,
-        TemplateSaveResponse,
-        TemplateCreate,
-        TemplateListOut,
-        TemplateOut,
-        TokenOut,
-        UserCreate,
-        UserOut,
-        UserResetPassword,
-        VendorAliasCreate,
-        VendorAliasOut,
-        VendorCreate,
-        VendorOut,
-    )
-    from object_store import ARTIFACTS_BUCKET, DOCUMENTS_BUCKET, EXPORTS_BUCKET, get_store
-    from phoenix_tracing import (
-        setup_phoenix,
-        get_current_context,
-        attach_context,
-        detach_context,
-        current_trace_context,
-        use_trace_context,
-        trace_extraction_pipeline,
-        trace_extraction_root,
-        trace_span,
-        trace_named_step,
-        trace_file_upload,
-        trace_pdf_rendering,
-        trace_db_persist,
-        trace_paddle_ocr,
-    )
+from . import db as db_mod
+from . import extractor
+from . import processor
+from . import page_logger
+from .contracts import build_purchase_order_contract
+from . import logging_config as plog
+from .logging_config import configure_logging
+from .auth import (
+    assert_alias_access,
+    assert_extraction_access,
+    assert_job_access,
+    assert_vendor_access,
+    create_access_token,
+    get_current_user,
+    hash_password,
+    require_admin,
+    verify_password,
+)
+from .models import (
+    ExtractionJobStartOut,
+    ExtractionOut,
+    HealthOut,
+    JobOut,
+    JobStatusOut,
+    LoginRequest,
+    TemplateSaveResponse,
+    TemplateCreate,
+    TemplateListOut,
+    TemplateOut,
+    TokenOut,
+    UserCreate,
+    UserOut,
+    UserResetPassword,
+    VendorAliasCreate,
+    VendorAliasOut,
+    VendorCreate,
+    VendorOut,
+)
+from .object_store import ARTIFACTS_BUCKET, DOCUMENTS_BUCKET, get_store
+from .folder_watcher import FolderWatcherManager
+from .scheduler import (
+    init_scheduler, shutdown_scheduler, sync_job, remove_job,
+    get_next_run_times, reload_all_schedules, set_context,
+)
+from .mlflow_tracing import (
+    setup_mlflow,
+    get_current_context,
+    attach_context,
+    detach_context,
+    current_trace_context,
+    use_trace_context,
+    trace_extraction_pipeline,
+    trace_extraction_root,
+    trace_span,
+    trace_named_step,
+    trace_file_upload,
+    trace_pdf_rendering,
+    trace_db_persist,
+    trace_paddle_ocr,
+)
 
 from .config import LLM_URL, LLM_MODEL, RATE_LIMIT_PER_MINUTE as RATE_LIMIT, MAX_UPLOAD_BYTES
 from .config import DEFAULT_SUBSCRIPTION_LIMIT, SUBSCRIPTION_WARNING_THRESHOLD
+
+from pydantic import BaseModel
+
+
+class ScheduleCreate(BaseModel):
+    cron_expr: str
+    timezone: str = "UTC"
+    label: str = ""
+
+
+class ScheduleUpdate(BaseModel):
+    cron_expr: str | None = None
+    timezone: str | None = None
+    label: str | None = None
+    enabled: bool | None = None
+
 
 # ── Centralized logging (replaces inline basicConfig) ───────────────
 configure_logging()
 logger = logging.getLogger(__name__)
 
+# -- Config SSE state -------------------------------------------------------
+# Per-user list of open SSE queues for live config-change push.
+_config_sse_queues: dict[str, list[asyncio.Queue]] = {}
+
+_CONFIG_KEYS = frozenset({"input_folder", "output_folder", "upload_mode", "success_folder", "failed_folder"})
+_VALID_UPLOAD_MODES = frozenset({"ui", "folder"})
+
+
+def _broadcast_config_event(user_id: str, data: dict) -> None:
+    for q in _config_sse_queues.get(user_id, []):
+        try:
+            q.put_nowait(data)
+        except asyncio.QueueFull:
+            pass
+
+
+async def _folder_ingest_callback(user_id: str, pdf_path: str) -> None:
+    """Called by the watchdog thread (via asyncio bridge) when a new PDF lands."""
+    # app is defined at module level after the routes section; access via the
+    # global name — safe because this only runs after startup.
+    pool = app.state.pool
+    store = app.state.store
+    try:
+        import pathlib
+        path = pathlib.Path(pdf_path)
+        if not path.is_file():
+            return
+        file_bytes = path.read_bytes()
+        filename = path.name
+
+        # Lazy imports to avoid circular import at module load time.
+        from . import geometry as geo_mod
+        from . import vendor_detector as vd_mod
+        from . import ocr_runner as ocr_mod
+
+        # Render page 1 for vendor detection.
+        rendered = await processor.pdf_to_images(file_bytes, max_pages=1)
+        if not rendered:
+            logger.warning("folder_ingest: no pages rendered path=%s", pdf_path)
+            return
+        page1 = rendered[0]
+        page1_meta = {"page_number": 1, "width": page1.get("width", 0), "height": page1.get("height", 0)}
+        geo_pages = geo_mod.compute_pdf_geometry(file_bytes, [page1_meta])
+        page_words = (geo_pages[0].get("words", []) if geo_pages else [])
+        if not page_words:
+            ocr_pages = await ocr_mod.run_ocr_on_pages([{
+                "page_number": 1,
+                "image_b64": page1["image_b64"],
+                "mime_type": page1.get("mime_type", "image/jpeg"),
+            }])
+            page_words = ocr_pages[0].get("words", []) if ocr_pages else []
+
+        match = await vd_mod.detect_vendor(pool, page_words, user_id=user_id)
+        if match is None:
+            logger.warning("folder_ingest: vendor not detected path=%s user=%s", pdf_path, user_id)
+            _broadcast_config_event(user_id, {
+                "type": "folder_ingest_error",
+                "path": pdf_path,
+                "reason": "vendor_not_detected",
+            })
+            return
+
+        tmpl = await db_mod.get_template(pool, match.vendor_id)
+        if not tmpl:
+            logger.warning("folder_ingest: no template for vendor=%s", match.vendor_id)
+            _broadcast_config_event(user_id, {
+                "type": "folder_ingest_error",
+                "path": pdf_path,
+                "reason": "no_template",
+                "vendor_id": match.vendor_id,
+            })
+            return
+
+        result = await _submit_ingestion_job(
+            pool,
+            store,
+            file_bytes=file_bytes,
+            filename=filename,
+            vendor_id=match.vendor_id,
+            format_type=tmpl.get("format_type", "single_po_multipage"),
+            header_fields=list(tmpl.get("header_fields") or []),
+            line_item_fields=list(tmpl.get("line_item_fields") or []),
+            source_type="folder",
+            source_ref=pdf_path,
+        )
+        _broadcast_config_event(user_id, {
+            "type": "folder_ingest_started",
+            "path": pdf_path,
+            "vendor_id": match.vendor_id,
+            "vendor_name": match.vendor_name,
+            "job_id": result["job"]["id"],
+            "extraction_id": result["extraction"]["id"],
+        })
+        logger.info(
+            "folder_ingest: queued path=%s vendor=%s job=%s",
+            pdf_path, match.vendor_id, result["job"]["id"],
+        )
+    except Exception as exc:
+        logger.exception("folder_ingest: unexpected error path=%s: %s", pdf_path, exc)
+        _broadcast_config_event(user_id, {
+            "type": "folder_ingest_error",
+            "path": pdf_path,
+            "reason": str(exc),
+        })
+
+
+async def _reconfigure_user_watcher(app_ref, user_id: str) -> None:
+    """Start or stop the folder watcher for a user based on their current config."""
+    watcher_mgr = getattr(app_ref.state, "watcher_mgr", None)
+    if watcher_mgr is None:
+        return
+    config = await db_mod.get_user_config(app_ref.state.pool, user_id)
+    upload_mode = config.get("upload_mode", "ui")
+    input_folder = config.get("input_folder", "")
+    if upload_mode == "folder" and input_folder:
+        loop = asyncio.get_event_loop()
+        watcher_mgr.start_for_user(user_id, input_folder, _folder_ingest_callback, loop)
+    else:
+        watcher_mgr.stop_for_user(user_id)
+
+
 # -- Rate limiter -----------------------------------------------------------
 
 limiter = Limiter(key_func=get_remote_address, default_limits=[f"{RATE_LIMIT}/minute"])
 
-# -- Active extractions tracking for cancel/resume --------------------------
-_active_extractions: dict[str, asyncio.Event] = {}
+
+
 
 
 # -- Upload size middleware -------------------------------------------------
@@ -202,12 +287,12 @@ class MaxUploadSizeMiddleware(BaseHTTPMiddleware):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: create DB pool + object store + Phoenix + bootstrap admin. Shutdown: close pool."""
+    """Startup: create DB pool + object store + MLflow + bootstrap admin. Shutdown: close pool."""
     logger.info("Starting up -- creating DB pool")
     app.state.pool = await db_mod.create_pool()
     await db_mod.init(app.state.pool)
     app.state.store = get_store()
-    setup_phoenix()
+    setup_mlflow()
 
     # Bootstrap admin user from env vars on first startup
     admin_email = (os.getenv("ADMIN_EMAIL") or "").strip()
@@ -232,9 +317,34 @@ async def lifespan(app: FastAPI):
                 except Exception as exc:
                     logger.warning("Failed to bootstrap admin user %s: %s", admin_email, exc)
 
-    logger.info("DB pool, object store, and Phoenix ready")
+    # Start folder watchers for every user already configured for folder-mode
+    app.state.watcher_mgr = FolderWatcherManager()
+    loop = asyncio.get_event_loop()
+    try:
+        all_configs = await db_mod.get_all_user_configs(app.state.pool)
+        for user_cfg in all_configs:
+            cfg = user_cfg.get("config", {})
+            if cfg.get("upload_mode") == "folder" and cfg.get("input_folder"):
+                app.state.watcher_mgr.start_for_user(
+                    user_cfg["user_id"],
+                    cfg["input_folder"],
+                    _folder_ingest_callback,
+                    loop,
+                )
+    except Exception as exc:
+        logger.warning("Could not initialise folder watchers: %s", exc)
+
+    # Start APScheduler
+    from .config import DATABASE_URL as _DB_URL
+    await init_scheduler(_DB_URL)
+    set_context(app.state.pool, _folder_ingest_callback)
+    await reload_all_schedules(app.state.pool)
+
+    logger.info("DB pool, object store, and MLflow ready")
     yield
     logger.info("Shutting down -- closing connections")
+    shutdown_scheduler()
+    app.state.watcher_mgr.stop_all()
     await app.state.pool.close()
 
 
@@ -329,6 +439,16 @@ async def _submit_ingestion_job(
         line_item_fields=line_item_fields,
         document_id=document["id"],
     )
+
+    # If caller didn't provide a trace context (e.g. /ingest, folder-watcher),
+    # create a root span here so all 4 pipeline stages share one MLflow trace.
+    if not trace_context:
+        with trace_extraction_root(
+            extraction["id"], vendor_id, filename, 0,
+            resolved_format_type, header_fields, line_item_fields,
+        ):
+            trace_context = current_trace_context()
+
     job = await db_mod.enqueue_job(
         pool,
         extraction_id=extraction["id"],
@@ -520,6 +640,19 @@ async def admin_deactivate_user(
     return {"status": "deactivated", "user_id": user_id}
 
 
+@app.patch("/admin/users/{user_id}/reactivate")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_reactivate_user(
+    request: Request,
+    user_id: str,
+    _user: dict = Depends(require_admin),
+):
+    ok = await db_mod.reactivate_user(request.app.state.pool, user_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"status": "reactivated", "user_id": user_id}
+
+
 @app.patch("/admin/users/{user_id}/password")
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def admin_reset_user_password(
@@ -660,6 +793,23 @@ async def delete_alias(request: Request, alias_id: int, user: dict = Depends(get
     return {"status": "deleted", "alias_id": alias_id}
 
 
+@app.patch("/vendors/{vendor_id}/owner", response_model=VendorOut)
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def assign_vendor_owner(request: Request, vendor_id: str, body: dict, _user: dict = Depends(require_admin)):
+    pool = request.app.state.pool
+    new_owner_id = body.get("user_id")
+    if not new_owner_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    # Verify target user exists
+    target = await db_mod.get_user_by_id(pool, new_owner_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Target user not found")
+    row = await db_mod.assign_vendor_owner(pool, vendor_id, new_owner_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Vendor not found")
+    return VendorOut(**row)
+
+
 @app.delete("/vendors/{vendor_id}")
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def delete_vendor(request: Request, vendor_id: str, user: dict = Depends(get_current_user)):
@@ -689,14 +839,9 @@ async def detect_vendor_endpoint(
         200: {detected: true, vendor_id, vendor_name, score, page_source, matched_patterns}
         409: {detected: false, reason: "unknown_vendor", hint: "..."}
     """
-    try:
-        from . import geometry
-        from . import vendor_detector
-        from . import ocr_runner
-    except ImportError:
-        import geometry
-        import vendor_detector
-        import ocr_runner
+    from . import geometry
+    from . import vendor_detector
+    from . import ocr_runner
 
     pool = request.app.state.pool
     file_bytes = await file.read()
@@ -844,10 +989,7 @@ async def get_spatial_memory_fields(
     if not vendor_id:
         return {"extraction_id": extraction_id, "fields": {}}
 
-    try:
-        from .layout_key import compute_layout_key
-    except ImportError:
-        from layout_key import compute_layout_key
+    from .layout_key import compute_layout_key
     lk = compute_layout_key(vendor_id, template_id, [])
 
     memories = await db_mod.get_spatial_memory_for_layout(pool, vendor_id, lk)
@@ -878,6 +1020,12 @@ async def save_template(
                 detail="Admin must create the vendor via POST /vendors before saving a template",
             )
         owner_id = user["id"]
+
+    if not body.header_fields and not body.line_item_fields:
+        raise HTTPException(
+            status_code=400,
+            detail="Template must contain at least one header field or line item column.",
+        )
 
     # Auto-upsert vendor — frontend may have created vendor locally while offline.
     # Use vendor_name from body if provided, otherwise fall back to vendor_id as name.
@@ -969,12 +1117,6 @@ async def cancel_extraction(extraction_id: int, _user: dict = Depends(get_curren
         detail="The legacy /extract/cancel endpoint is deprecated. Use /jobs/extractions/{extraction_id}/cancel.",
     )
 
-    cancel_event = _active_extractions.get(extraction_id)
-    if not cancel_event:
-        raise HTTPException(404, detail="No active extraction with that ID")
-    cancel_event.set()
-    return {"status": "cancelling", "extraction_id": extraction_id}
-
 
 @app.post("/extract/resume/{extraction_id}")
 @limiter.limit("10/minute")
@@ -985,187 +1127,8 @@ async def resume_extraction(request: Request, extraction_id: int):
         detail="The legacy /extract/resume endpoint is deprecated. Use /jobs/extractions/{extraction_id}/resume.",
     )
 
-    pool = request.app.state.pool
 
-    # 1. Load existing extraction record
-    extraction = await db_mod.get_extraction(pool, extraction_id)
-    if not extraction:
-        raise HTTPException(404, detail="Extraction not found")
 
-    if extraction["status"] not in ("partial", "cancelled", "failed"):
-        raise HTTPException(400, detail=f"Cannot resume extraction with status '{extraction['status']}'")
-
-    vendor_id = extraction["vendor_id"]
-    filename = extraction["filename"]
-
-    # 2. Load template and existing data
-    tmpl = await db_mod.get_template(pool, vendor_id)
-
-    req_header = extraction.get("header_fields") or (tmpl["header_fields"] if tmpl else [])
-    req_items = extraction.get("line_item_fields") or (tmpl["line_item_fields"] if tmpl else [])
-    # Prefer current template format over stale extraction record — template is the source of truth
-    req_format = (tmpl["format_type"] if tmpl else None) or extraction.get("format_type") or "single_po_multipage"
-
-    # Get system prompt from template, or build fresh from extraction's saved fields
-    if tmpl and tmpl.get("system_prompt"):
-        system_prompt = tmpl["system_prompt"]
-    else:
-        instructions = tmpl["prompt_instructions"] if tmpl else None
-        rules = tmpl["extraction_rules"] if tmpl else []
-        system_prompt = extractor.build_system_prompt(
-            req_header, req_items, instructions, rules, req_format
-        )
-
-    # 3. Get page images and existing results
-    pages = await db_mod.get_pages(pool, extraction_id)
-    if not pages:
-        raise HTTPException(400, detail="No page images found for this extraction")
-
-    existing_page_results = extraction.get("page_results") or []
-    # Find pages that succeeded (no _error)
-    completed_page_nums = {pr.get("_page") for pr in existing_page_results
-                           if "_error" not in pr and pr.get("_page") is not None}
-    # Find the first page that still needs work (failed or never attempted)
-    all_page_nums = {p["page_number"] for p in pages}
-    missing_pages = sorted(all_page_nums - completed_page_nums)
-    start_from = missing_pages[0] if missing_pages else len(pages) + 1
-
-    # 4. SSE streaming response for resume
-    cancel_event = asyncio.Event()
-    _active_extractions[extraction_id] = cancel_event
-
-    # Capture OTel context for SSE generator
-    parent_otel_ctx = get_current_context()
-
-    async def event_stream() -> AsyncGenerator[str, None]:
-        ctx_token = attach_context(parent_otel_ctx)
-
-        try:
-          with trace_extraction_pipeline(
-            extraction_id, vendor_id, filename, len(pages),
-            req_format, req_header, req_items,
-          ) as pipeline:
-            start = time.perf_counter()
-            error_msg: str | None = None
-            final_result = None
-            page_results = None
-            was_cancelled = False
-            last_completed_page = start_from - 1
-
-            yield f"data: {json.dumps({'event': 'resume', 'status': 'resuming', 'start_from_page': start_from, 'total_pages': len(pages)})}\n\n"
-
-            async def on_page_done(page_num: int, total_pages: int, page_result: dict | None) -> None:
-                progress_events.append({
-                    "event": "progress", "status": "processing",
-                    "extraction_id": extraction_id,
-                    "page": page_num, "total_pages": total_pages,
-                })
-                if page_result is not None:
-                    try:
-                        await db_mod.update_extraction_result(
-                            pool, extraction_id, None, None, "processing", 0,
-                            page_results_partial=[page_result],
-                        )
-                    except Exception as exc:
-                        logger.warning("Failed to save incremental page result: %s", exc)
-
-            progress_events: list[dict] = []
-
-            try:
-                extract_task = asyncio.create_task(
-                    extractor.extract_document(
-                        pages=pages,
-                        header_fields=req_header,
-                        line_item_fields=req_items,
-                        system_prompt=system_prompt,
-                        format_type=req_format,
-                        llm_url=LLM_URL,
-                        model=LLM_MODEL,
-                        on_page_done=on_page_done,
-                        cancel_event=cancel_event,
-                        start_from_page=start_from,
-                        existing_page_results=existing_page_results,
-                    )
-                )
-
-                last_sent = 0
-                while not extract_task.done():
-                    await asyncio.sleep(0.3)
-                    while last_sent < len(progress_events):
-                        yield f"data: {json.dumps(progress_events[last_sent])}\n\n"
-                        last_sent += 1
-
-                output = await extract_task
-                final_result = output["result"]
-                page_results = output["page_results"]
-                was_cancelled = output.get("cancelled", False)
-                last_completed_page = output.get("last_completed_page", 0)
-
-                while last_sent < len(progress_events):
-                    yield f"data: {json.dumps(progress_events[last_sent])}\n\n"
-                    last_sent += 1
-
-            except Exception as exc:
-                error_msg = str(exc)
-                logger.error("Resume extraction %d failed: %s", extraction_id, error_msg)
-
-            elapsed_ms = int((time.perf_counter() - start) * 1000)
-            _active_extractions.pop(extraction_id, None)
-
-            if error_msg:
-                pipeline["status"] = "failed"
-                pipeline["error"] = error_msg
-                await db_mod.update_extraction_result(
-                    pool, extraction_id, None, None, "failed", elapsed_ms, error=error_msg
-                )
-                yield f"data: {json.dumps({'event': 'error', 'status': 'failed', 'error': error_msg})}\n\n"
-            elif was_cancelled:
-                status = "partial" if page_results else "cancelled"
-                pipeline["status"] = status
-                pipeline["result"] = final_result
-                await db_mod.update_extraction_result(
-                    pool, extraction_id, final_result, page_results, status, elapsed_ms
-                )
-                yield f"data: {json.dumps({'event': 'cancelled', 'status': status, 'extraction_id': extraction_id, 'result': final_result, 'page_results': page_results, 'last_completed_page': last_completed_page, 'total_pages': len(pages), 'duration_ms': elapsed_ms})}\n\n"
-            else:
-                # Trace PaddleOCR geometry for review.
-                field_locations = {}
-                try:
-                    try:
-                        from . import ocr_runner
-                    except ImportError:
-                        import ocr_runner  # type: ignore[no-redef]
-
-                    with trace_paddle_ocr(len(pages)) as ocr_ctx:
-                        ocr_pages = await ocr_runner.run_ocr_on_pages(pages)
-                        ocr_ctx["pages_processed"] = len(ocr_pages)
-                        ocr_ctx["total_words"] = sum(len(p.get("words", [])) for p in ocr_pages)
-
-                    with trace_db_persist(extraction_id, "persist_ocr"):
-                        await db_mod.save_ocr_data(pool, extraction_id, ocr_pages)
-                        await db_mod.save_field_locations(pool, extraction_id, field_locations)
-
-                except Exception as ocr_exc:
-                    logger.warning("OCR geometry save failed for resume %d: %s", extraction_id, ocr_exc)
-
-                # ── Trace: Final DB persist ──
-                with trace_db_persist(extraction_id, "persist_result"):
-                    await db_mod.update_extraction_result(
-                        pool, extraction_id, final_result, page_results, "done", elapsed_ms
-                    )
-
-                pipeline["status"] = "done"
-                pipeline["result"] = final_result
-                yield f"data: {json.dumps({'event': 'done', 'status': 'done', 'extraction_id': extraction_id, 'result': final_result, 'field_locations': field_locations, 'total_pages': len(pages), 'duration_ms': elapsed_ms})}\n\n"
-
-        finally:
-            detach_context(ctx_token)
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
-    )
 
 
 # -- Durable Job APIs -------------------------------------------------------
@@ -1187,6 +1150,14 @@ async def ingest_document(
         raise HTTPException(400, detail=f"Unsupported source_type '{source_type}'")
 
     pool = request.app.state.pool
+
+    # Block UI uploads when the scheduler is actively executing for this user
+    if source_type == "ui" and await db_mod.get_user_is_executing(pool, user["id"]):
+        raise HTTPException(
+            409,
+            detail="Scheduler is currently running. Please wait for it to finish before uploading manually.",
+        )
+
     # If caller pre-selected a vendor, enforce ownership before doing any work.
     if vendor_id:
         await assert_vendor_access(pool, vendor_id, user)
@@ -1259,16 +1230,14 @@ async def ingest_document(
         except HTTPException:
             raise
         except Exception as usage_exc:
-            logger.warning("Subscription usage check failed (non-blocking): %s", usage_exc)
+            logger.error("Subscription quota check failed — blocking upload: %s", usage_exc)
+            raise HTTPException(
+                status_code=503,
+                detail="Service temporarily unavailable. Please retry.",
+            )
 
-    plog.event(
-        "file_received",
-        stage="ingest",
-        filename=filename,
-        source_type=source_type,
-        size_bytes=len(file_bytes),
-        vendor_id=vendor_id,
-    )
+    logger.info("File received: %s (%d bytes, source=%s, vendor=%s)",
+                filename, len(file_bytes), source_type, vendor_id)
 
     with trace_extraction_pipeline(
         0,
@@ -1287,31 +1256,20 @@ async def ingest_document(
         ) as vendor_trace:
             # If vendor_id not provided, detect from page-1 text
             if not vendor_id:
-                try:
-                    from . import geometry as _geo
-                    from . import vendor_detector as _vd
-                    from . import ocr_runner as _ocr
-                except ImportError:
-                    import geometry as _geo
-                    import vendor_detector as _vd
-                    import ocr_runner as _ocr
+                from . import geometry as _geo
+                from . import vendor_detector as _vd
+                from . import ocr_runner as _ocr
 
                 # Render page 1 only for detection
-                with plog.timed("page1_rendered_for_vendor_detection", stage="vendor_detection", filename=filename) as log_ctx:
+                with plog.timed("render_p1") as t:
                     if filename.lower().endswith(".pdf"):
                         rendered = await processor.pdf_to_images(file_bytes, max_pages=1)
                     else:
                         rendered = await processor.image_file_to_b64(file_bytes)
-                    log_ctx["pages_rendered"] = len(rendered)
+                logger.info("Rendered page-1 for vendor detection (%d pages, %.0fms)", len(rendered), t["ms"])
 
                 if not rendered:
-                    plog.event(
-                        "vendor_detection_failed",
-                        stage="vendor_detection",
-                        filename=filename,
-                        status="error",
-                        reason="no_rendered_pages",
-                    )
+                    logger.warning("Vendor detection failed: no rendered pages")
                     raise HTTPException(400, detail="Could not render any pages from the uploaded file")
 
                 page1 = rendered[0]
@@ -1319,12 +1277,12 @@ async def ingest_document(
 
                 # Digital-first text extraction
                 if filename.lower().endswith(".pdf"):
-                    with plog.timed("page1_pypdfium_geometry", stage="vendor_detection", filename=filename) as log_ctx:
+                    with plog.timed("geometry_p1") as t:
                         geo_pages = _geo.compute_pdf_geometry(file_bytes, [page1_meta])
                         geo_page = geo_pages[0] if geo_pages else {}
-                        log_ctx["page_source"] = geo_page.get("source")
-                        log_ctx["char_count"] = geo_page.get("char_count", 0)
-                        log_ctx["word_count"] = len(geo_page.get("words", []) or [])
+                    logger.info("Page-1 text: source=%s, %d chars, %d words (%.0fms)",
+                                geo_page.get("source"), geo_page.get("char_count", 0),
+                                len(geo_page.get("words", []) or []), t["ms"])
                     page_words = geo_pages[0].get("words", []) if geo_pages else []
                     page_source = (geo_pages[0].get("source") if geo_pages else None) or "paddleocr"
                 else:
@@ -1333,13 +1291,8 @@ async def ingest_document(
 
                 # Scanned fallback if needed
                 if not page_words:
-                    plog.event(
-                        "page1_no_digital_words",
-                        stage="vendor_detection",
-                        filename=filename,
-                        fallback="paddleocr",
-                    )
-                    with plog.timed("page1_paddleocr_fallback", stage="vendor_detection", filename=filename) as log_ctx:
+                    logger.info("Page-1 has no digital text — falling back to PaddleOCR")
+                    with plog.timed("paddleocr_p1") as t:
                         ocr_pages = await _ocr.run_ocr_on_pages([{
                             "page_number": 1,
                             "image_b64": page1["image_b64"],
@@ -1347,19 +1300,15 @@ async def ingest_document(
                         }])
                         if ocr_pages:
                             page_words = ocr_pages[0].get("words", [])
-                        log_ctx["word_count"] = len(page_words)
-                        log_ctx["sample_words"] = [w.get("text") for w in page_words[:12]]
+                    logger.info("PaddleOCR fallback: %d words (%.0fms)", len(page_words), t["ms"])
                     page_source = "paddleocr"
 
                 _detect_uid = None if user.get("role") == "admin" else user["id"]
-                with plog.timed("vendor_matched", stage="vendor_detection", filename=filename, word_count=len(page_words)) as log_ctx:
+                with plog.timed("vendor_match") as t:
                     match = await _vd.detect_vendor(pool, page_words, user_id=_detect_uid)
-                    if match is not None:
-                        log_ctx["vendor_id"] = match.vendor_id
-                        log_ctx["vendor_name"] = match.vendor_name
-                        log_ctx["match_type"] = getattr(match, "match_type", "unknown")
-                        log_ctx["score"] = match.score
-                        log_ctx["matched_patterns"] = match.matched_patterns
+                if match:
+                    logger.info("Vendor matched: %s (id=%s, score=%.2f, %.0fms)",
+                                match.vendor_name, match.vendor_id, match.score, t["ms"])
                 if match is None:
                     vendor_trace["output"] = {
                         "detected": False,
@@ -1367,14 +1316,7 @@ async def ingest_document(
                         "page_source": page_source,
                         "word_count": len(page_words),
                     }
-                    plog.event(
-                        "unknown_vendor_blocked",
-                        stage="vendor_detection",
-                        filename=filename,
-                        status="blocked",
-                        word_count=len(page_words),
-                        hint="Create the vendor and vendor id first, then retry this document.",
-                    )
+                    logger.warning("Unknown vendor blocked for %s (%d words)", filename, len(page_words))
                     page_logger.append_log({
                         "extraction_id": None,
                         "filename": filename,
@@ -1452,20 +1394,8 @@ async def ingest_document(
             "vendor_id": vendor_id,
             "vendor_name": (detected_vendor or {}).get("vendor_name"),
         }
-        plog.event(
-            "ingestion_job_created",
-            stage="ingest",
-            extraction_id=submitted["extraction"]["id"],
-            document_id=submitted["extraction"].get("document_id"),
-            job_id=submitted["job"]["id"],
-            vendor_id=vendor_id,
-            vendor_name=(detected_vendor or {}).get("vendor_name"),
-            filename=filename,
-            status=submitted["job"]["status"],
-            template_id=submitted["extraction"].get("template_id"),
-            format_type=submitted["extraction"].get("format_type"),
-            log_paths=plog.log_paths(submitted["extraction"]["id"]),
-        )
+        logger.info("Ingestion job created: ext=%s vendor=%s file=%s",
+                    submitted["extraction"]["id"], vendor_id, filename)
         return result
 
 
@@ -1672,7 +1602,11 @@ async def queue_resume_extraction(
         except HTTPException:
             raise
         except Exception as usage_exc:
-            logger.warning("Subscription usage check failed on resume (non-blocking): %s", usage_exc)
+            logger.error("Subscription quota check failed — blocking upload: %s", usage_exc)
+            raise HTTPException(
+                status_code=503,
+                detail="Service temporarily unavailable. Please retry.",
+            )
 
     jobs = await db_mod.list_jobs_for_extraction(pool, extraction_id)
     inflight_jobs = [job for job in jobs if job["status"] in ("queued", "running", "cancelling")]
@@ -1771,16 +1705,8 @@ async def delete_extraction(
             document_key = doc.get("object_key")
 
     page_keys = await db_mod.get_page_object_keys(pool, extraction_id)
-    delivery_keys = await db_mod.list_delivery_object_keys(pool, extraction_id)
-
-    export_keys: set[str] = set()
-    export_object_key = extraction.get("export_object_key")
-    if export_object_key:
-        export_keys.add(export_object_key)
-        if export_object_key.endswith(".xlsx"):
-            export_keys.add(export_object_key[:-5] + ".csv")
-    for key in delivery_keys:
-        export_keys.add(key)
+    # 3. Delete from object store
+    deleted_objects = {"pages": 0, "exports": 0, "document": 0}
 
     deleted = await db_mod.delete_extraction(pool, extraction_id)
     if not deleted:
@@ -1801,12 +1727,7 @@ async def delete_extraction(
         except Exception:
             logger.warning("Failed deleting page object %s", object_key, exc_info=True)
 
-    for object_key in export_keys:
-        try:
-            store.delete_object(EXPORTS_BUCKET, object_key)
-            deleted_objects["exports"] += 1
-        except Exception:
-            logger.warning("Failed deleting export object %s", object_key, exc_info=True)
+
 
     if deleted_document and document_key:
         try:
@@ -2085,20 +2006,8 @@ async def save_extraction_corrections(
 
     # Compute correction diff
     correction_diff = _compute_correction_diff(original_result, corrected_result)
-    plog.event(
-        "review_correction_received",
-        stage="review",
-        **base,
-        actor=actor,
-        reason_code=reason_code,
-        changed_fields=list(correction_diff.keys()) if correction_diff else [],
-        correction_diff=correction_diff,
-        field_location_count=(
-            sum(len(v) for v in field_locations if isinstance(v, dict))
-            if isinstance(field_locations, list)
-            else len(field_locations or {})
-        ),
-    )
+    logger.info("Review correction received: ext=%s, changed=%s",
+                extraction_id, list(correction_diff.keys()) if correction_diff else [])
 
     correction_meta = {
         "corrected_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
@@ -2116,7 +2025,8 @@ async def save_extraction_corrections(
     )
     if not updated:
         raise HTTPException(404, detail=f"Extraction {extraction_id} not found")
-    plog.event("review_correction_saved", stage="review", **base, changed_fields=list(correction_diff.keys()))
+    logger.info("Review correction saved: ext=%s, changed=%s",
+                extraction_id, list(correction_diff.keys()))
 
     review_event_id = await db_mod.create_review_event(
         pool,
@@ -2149,14 +2059,7 @@ async def save_extraction_corrections(
             )
             logger.info("Gold example %d created for vendor=%s extraction=%d (changed: %s)",
                         gold_id, vendor_id, extraction_id, ", ".join(header_only_diff.keys()))
-            plog.event(
-                "gold_correction_saved",
-                stage="review",
-                **base,
-                gold_example_id=gold_id,
-                changed_fields=list(header_only_diff.keys()),
-                latest_per_field=True,
-            )
+
 
 
         except Exception as exc:
@@ -2166,10 +2069,7 @@ async def save_extraction_corrections(
     spatial_saved = 0
     if field_locations and vendor_id:
         try:
-            try:
-                from . import spatial_memory as _sm
-            except ImportError:
-                import spatial_memory as _sm
+            from . import spatial_memory as _sm
             spatial_saved = await _sm.save_from_corrections(
                 pool, extraction_id, field_locations, corrected_result,
             )
@@ -2178,21 +2078,10 @@ async def save_extraction_corrections(
                     "Spatial memory: %d regions saved for extraction=%d vendor=%s",
                     spatial_saved, extraction_id, vendor_id,
                 )
-            plog.event(
-                "review_spatial_memory_saved",
-                stage="review",
-                **base,
-                saved_count=spatial_saved,
-            )
+
         except Exception as exc:
             logger.warning("Failed to save spatial memory for extraction %d: %s", extraction_id, exc)
-            plog.event(
-                "review_spatial_memory_failed",
-                stage="review",
-                status="error",
-                **base,
-                error=str(exc),
-            )
+
 
     with use_trace_context(trace_context):
         with trace_named_step(
@@ -2218,17 +2107,6 @@ async def save_extraction_corrections(
                 "spatial_memory_saved": spatial_saved,
                 "corrected_result": corrected_result,
             }
-
-    outbound_payload = {"extraction_id": extraction_id, "trigger": "review"}
-    if trace_context:
-        outbound_payload["trace_context"] = trace_context
-    await db_mod.ensure_job(
-        pool,
-        extraction_id=extraction_id,
-        document_id=extraction.get("document_id"),
-        job_type="outbound",
-        payload=outbound_payload,
-    )
 
     return {
         "status": "saved",
@@ -2569,53 +2447,372 @@ async def get_extraction_contract(
     return build_purchase_order_contract(extraction)
 
 
-@app.get("/extractions/{extraction_id}/export.xlsx")
+# -- Config API -------------------------------------------------------------
+
+@app.get("/api/config")
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def download_extraction_excel(
-    request: Request, extraction_id: int, user: dict = Depends(get_current_user),
-):
+async def get_my_config(request: Request, user: dict = Depends(get_current_user)):
+    """Return the calling user's runtime configuration."""
+    config = await db_mod.get_user_config(request.app.state.pool, user["id"])
+    watcher_mgr = getattr(request.app.state, "watcher_mgr", None)
+    return {
+        "user_id": user["id"],
+        "config": config,
+        "watcher_active": watcher_mgr.is_active(user["id"]) if watcher_mgr else False,
+    }
+
+
+@app.put("/api/config")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def update_my_config(request: Request, user: dict = Depends(get_current_user)):
+    """Update the calling user's runtime configuration and restart watcher if needed."""
+    body = await request.json()
+    unknown = set(body) - _CONFIG_KEYS
+    if unknown:
+        raise HTTPException(400, detail=f"Unknown config keys: {sorted(unknown)}")
+    if "upload_mode" in body and body["upload_mode"] not in _VALID_UPLOAD_MODES:
+        raise HTTPException(400, detail=f"upload_mode must be one of {sorted(_VALID_UPLOAD_MODES)}")
+
     pool = request.app.state.pool
-    await assert_extraction_access(pool, extraction_id, user)
-    extraction = await db_mod.get_extraction(pool, extraction_id)
-    if not extraction:
-        raise HTTPException(404, detail="Extraction not found")
-    object_key = extraction.get("export_object_key")
-    if not object_key:
-        raise HTTPException(404, detail="Excel export not available yet")
-    payload = request.app.state.store.get_bytes(EXPORTS_BUCKET, object_key)
-    filename = f"extraction_{extraction_id}.xlsx"
-    return Response(
-        content=payload,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    updates = {k: str(v) for k, v in body.items() if k in _CONFIG_KEYS}
+    await db_mod.set_user_config(pool, user["id"], updates)
+    await _reconfigure_user_watcher(request.app, user["id"])
+
+    config = await db_mod.get_user_config(pool, user["id"])
+    watcher_mgr = getattr(request.app.state, "watcher_mgr", None)
+    payload = {
+        "user_id": user["id"],
+        "config": config,
+        "watcher_active": watcher_mgr.is_active(user["id"]) if watcher_mgr else False,
+    }
+    _broadcast_config_event(user["id"], {"type": "config_updated", **payload})
+    return payload
+
+
+@app.get("/api/config/stream")
+async def config_sse_stream(request: Request, user: dict = Depends(get_current_user)):
+    """SSE stream — pushes config_updated and folder_ingest_* events to this user."""
+    uid = user["id"]
+    queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+    _config_sse_queues.setdefault(uid, []).append(queue)
+
+    async def _gen():
+        try:
+            config = await db_mod.get_user_config(request.app.state.pool, uid)
+            watcher_mgr = getattr(request.app.state, "watcher_mgr", None)
+            connected_event = json.dumps({
+                "type": "connected",
+                "config": config,
+                "watcher_active": watcher_mgr.is_active(uid) if watcher_mgr else False,
+            })
+            yield f"data: {connected_event}\n\n"
+            while not await request.is_disconnected():
+                try:
+                    data = await asyncio.wait_for(queue.get(), timeout=25)
+                    yield f"data: {json.dumps(data)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            try:
+                _config_sse_queues[uid].remove(queue)
+            except (KeyError, ValueError):
+                pass
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
-@app.get("/extractions/{extraction_id}/export.csv")
+@app.get("/admin/config/users")
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def download_extraction_csv(
-    request: Request, extraction_id: int, user: dict = Depends(get_current_user),
-):
-    pool = request.app.state.pool
-    await assert_extraction_access(pool, extraction_id, user)
-    extraction = await db_mod.get_extraction(pool, extraction_id)
-    if not extraction:
-        raise HTTPException(404, detail="Extraction not found")
-    xlsx_key = extraction.get("export_object_key")
-    if not xlsx_key:
-        raise HTTPException(404, detail="CSV export not available yet")
-    csv_key = xlsx_key.replace(".xlsx", ".csv")
-    try:
-        payload = request.app.state.store.get_bytes(EXPORTS_BUCKET, csv_key)
-    except Exception as exc:
-        raise HTTPException(404, detail="CSV export not available yet") from exc
-    filename = f"extraction_{extraction_id}.csv"
-    return Response(
-        content=payload,
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+async def admin_get_all_configs(request: Request, _: dict = Depends(require_admin)):
+    """Admin: list every user's config."""
+    rows = await db_mod.get_all_user_configs(request.app.state.pool)
+    watcher_mgr = getattr(request.app.state, "watcher_mgr", None)
+    for row in rows:
+        row["watcher_active"] = watcher_mgr.is_active(row["user_id"]) if watcher_mgr else False
+    return rows
 
+
+@app.get("/admin/config/users/{target_user_id}")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_get_user_config(
+    request: Request, target_user_id: str, _: dict = Depends(require_admin)
+):
+    """Admin: get one user's config."""
+    config = await db_mod.get_user_config(request.app.state.pool, target_user_id)
+    watcher_mgr = getattr(request.app.state, "watcher_mgr", None)
+    return {
+        "user_id": target_user_id,
+        "config": config,
+        "watcher_active": watcher_mgr.is_active(target_user_id) if watcher_mgr else False,
+    }
+
+
+@app.put("/admin/config/users/{target_user_id}")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_update_user_config(
+    request: Request, target_user_id: str, admin: dict = Depends(require_admin)
+):
+    """Admin: update any user's config and restart their watcher."""
+    pool = request.app.state.pool
+    target = await db_mod.get_user_by_id(pool, target_user_id)
+    if not target:
+        raise HTTPException(404, detail="User not found")
+    body = await request.json()
+    unknown = set(body) - _CONFIG_KEYS
+    if unknown:
+        raise HTTPException(400, detail=f"Unknown config keys: {sorted(unknown)}")
+    if "upload_mode" in body and body["upload_mode"] not in _VALID_UPLOAD_MODES:
+        raise HTTPException(400, detail=f"upload_mode must be one of {sorted(_VALID_UPLOAD_MODES)}")
+
+    updates = {k: str(v) for k, v in body.items() if k in _CONFIG_KEYS}
+    await db_mod.set_user_config(pool, target_user_id, updates)
+    await _reconfigure_user_watcher(request.app, target_user_id)
+
+    config = await db_mod.get_user_config(pool, target_user_id)
+    watcher_mgr = getattr(request.app.state, "watcher_mgr", None)
+    payload = {
+        "user_id": target_user_id,
+        "config": config,
+        "watcher_active": watcher_mgr.is_active(target_user_id) if watcher_mgr else False,
+    }
+    _broadcast_config_event(target_user_id, {"type": "config_updated", **payload})
+    return payload
+
+
+# -- Vendor dashboard stats -------------------------------------------------
+
+@app.get("/admin/dashboard/vendors")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_vendor_summary(request: Request, _: dict = Depends(require_admin)):
+    """Admin: per-client summary — vendor_count + extraction_count."""
+    return await db_mod.get_client_vendor_summary(request.app.state.pool)
+
+
+@app.get("/admin/dashboard/clients/{target_user_id}/vendors")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_client_vendors(
+    request: Request, target_user_id: str, _: dict = Depends(require_admin)
+):
+    """Admin: vendor list with stats for one client."""
+    return await db_mod.get_client_vendors_with_stats(request.app.state.pool, target_user_id)
+
+
+@app.get("/admin/dashboard/vendors/{vendor_id}/stats")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_vendor_stats(
+    request: Request,
+    vendor_id: str,
+    days: int = 30,
+    _: dict = Depends(require_admin),
+):
+    """Admin: per-day + per-page stats for one vendor."""
+    pool = request.app.state.pool
+    daily = await db_mod.get_vendor_extraction_daily(pool, vendor_id, limit=days)
+    pages = await db_mod.get_vendor_page_stats(pool, vendor_id)
+    return {"vendor_id": vendor_id, "daily": daily, "pages": pages}
+
+
+@app.get("/user/dashboard/vendors")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def user_vendor_summary(request: Request, user: dict = Depends(get_current_user)):
+    """Client: own vendor list with extraction counts."""
+    return await db_mod.get_client_vendors_with_stats(request.app.state.pool, user["id"])
+
+
+@app.get("/user/dashboard/vendors/{vendor_id}/stats")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def user_vendor_stats(
+    request: Request,
+    vendor_id: str,
+    days: int = 30,
+    user: dict = Depends(get_current_user),
+):
+    """Client: per-day + per-page breakdown for one of their own vendors."""
+    pool = request.app.state.pool
+    await assert_vendor_access(pool, vendor_id, user)
+    daily = await db_mod.get_vendor_extraction_daily(pool, vendor_id, limit=days)
+    pages = await db_mod.get_vendor_page_stats(pool, vendor_id)
+    return {"vendor_id": vendor_id, "daily": daily, "pages": pages}
+
+
+# -- Schedule CRUD ----------------------------------------------------------
+
+@app.get("/api/schedules")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def list_user_schedules(request: Request, user: dict = Depends(get_current_user)):
+    return await db_mod.get_user_schedules(request.app.state.pool, user["id"])
+
+
+@app.post("/api/schedules", status_code=201)
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def create_schedule(
+    request: Request, body: ScheduleCreate, user: dict = Depends(get_current_user)
+):
+    row = await db_mod.create_user_schedule(
+        request.app.state.pool, user["id"], body.cron_expr, body.timezone, body.label
+    )
+    if row:
+        sync_job(row)
+    return row
+
+
+@app.get("/api/schedules/{schedule_id}")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_schedule_route(
+    request: Request, schedule_id: int, user: dict = Depends(get_current_user)
+):
+    row = await db_mod.get_schedule(request.app.state.pool, schedule_id)
+    if not row or str(row.get("user_id")) != user["id"]:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    return row
+
+
+@app.put("/api/schedules/{schedule_id}")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def update_schedule_route(
+    request: Request,
+    schedule_id: int,
+    body: ScheduleUpdate,
+    user: dict = Depends(get_current_user),
+):
+    existing = await db_mod.get_schedule(request.app.state.pool, schedule_id)
+    if not existing or str(existing.get("user_id")) != user["id"]:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    row = await db_mod.update_user_schedule(
+        request.app.state.pool, schedule_id,
+        **{k: v for k, v in body.model_dump().items() if v is not None},
+    )
+    if row:
+        sync_job(row)
+    return row
+
+
+@app.delete("/api/schedules/{schedule_id}", status_code=204)
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def delete_schedule_route(
+    request: Request, schedule_id: int, user: dict = Depends(get_current_user)
+):
+    existing = await db_mod.get_schedule(request.app.state.pool, schedule_id)
+    if not existing or str(existing.get("user_id")) != user["id"]:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    await db_mod.delete_user_schedule(request.app.state.pool, schedule_id)
+    remove_job(schedule_id)
+
+
+@app.get("/api/schedules/{schedule_id}/next")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def schedule_next_runs(
+    request: Request,
+    schedule_id: int,
+    count: int = 5,
+    user: dict = Depends(get_current_user),
+):
+    existing = await db_mod.get_schedule(request.app.state.pool, schedule_id)
+    if not existing or str(existing.get("user_id")) != user["id"]:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    return {"schedule_id": schedule_id, "next_runs": get_next_run_times(schedule_id, count)}
+
+
+@app.get("/admin/schedules")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_list_schedules(request: Request, _: dict = Depends(require_admin)):
+    return await db_mod.get_all_schedules(request.app.state.pool)
+
+
+# -- Per-user scheduler (up to 3 daily times per user) ----------------------
+
+_SCHED_MAX = 3
+
+
+def _row_to_sched(row: dict) -> dict:
+    """Convert a user_schedules DB row to API shape."""
+    parts = (row.get("cron_expr") or "").split()
+    utc_hour   = int(parts[1]) if len(parts) >= 2 else None
+    utc_minute = int(parts[0]) if len(parts) >= 1 else None
+    next_runs  = get_next_run_times(row["id"], 1)
+    return {
+        "id":           row["id"],
+        "enabled":      row.get("enabled", False),
+        "is_executing": row.get("is_executing", False),
+        "utc_hour":     utc_hour,
+        "utc_minute":   utc_minute,
+        "next_run":     next_runs[0] if next_runs else None,
+    }
+
+
+@app.get("/api/scheduler")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_user_scheduler(request: Request, user: dict = Depends(get_current_user)):
+    rows = await db_mod.get_user_schedules(request.app.state.pool, user["id"])
+    return {"schedules": [_row_to_sched(r) for r in rows], "max_schedules": _SCHED_MAX}
+
+
+@app.post("/api/scheduler/start")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def start_user_scheduler(request: Request, user: dict = Depends(get_current_user)):
+    """Create a new schedule or re-enable an existing one. Max 3 per user."""
+    body = await request.json()
+    utc_hour   = int(body.get("hour",   8))
+    utc_minute = int(body.get("minute", 0))
+    schedule_id = body.get("schedule_id")  # if provided, update that specific row
+    if not (0 <= utc_hour <= 23 and 0 <= utc_minute <= 59):
+        raise HTTPException(400, detail="hour must be 0-23 and minute must be 0-59")
+    cron_expr = f"{utc_minute} {utc_hour} * * *"
+    pool = request.app.state.pool
+
+    if schedule_id:
+        # Update existing — verify it belongs to this user
+        existing = await db_mod.get_schedule(pool, int(schedule_id))
+        if not existing or str(existing.get("user_id")) != str(user["id"]):
+            raise HTTPException(404, detail="Schedule not found")
+        row = await db_mod.update_user_schedule(pool, int(schedule_id), cron_expr=cron_expr, enabled=True)
+    else:
+        # Create new — enforce max limit
+        current = await db_mod.get_user_schedules(pool, user["id"])
+        if len(current) >= _SCHED_MAX:
+            raise HTTPException(400, detail=f"Maximum {_SCHED_MAX} schedules allowed per user")
+        row = await db_mod.create_user_schedule(pool, user["id"], cron_expr, "UTC", "daily run")
+
+    if row:
+        sync_job(row)
+    return _row_to_sched(row)
+
+
+@app.post("/api/scheduler/stop")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def stop_user_scheduler(request: Request, user: dict = Depends(get_current_user)):
+    """Disable a specific schedule without deleting it."""
+    body = await request.json()
+    schedule_id = body.get("schedule_id")
+    if not schedule_id:
+        raise HTTPException(400, detail="schedule_id required")
+    pool = request.app.state.pool
+    existing = await db_mod.get_schedule(pool, int(schedule_id))
+    if not existing or str(existing.get("user_id")) != str(user["id"]):
+        raise HTTPException(404, detail="Schedule not found")
+    row = await db_mod.update_user_schedule(pool, int(schedule_id), enabled=False)
+    if row:
+        sync_job(row)
+    return _row_to_sched(row)
+
+
+@app.delete("/api/scheduler/{schedule_id}")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def delete_user_schedule(
+    request: Request, schedule_id: int, user: dict = Depends(get_current_user)
+):
+    """Delete a schedule entirely."""
+    pool = request.app.state.pool
+    existing = await db_mod.get_schedule(pool, schedule_id)
+    if not existing or str(existing.get("user_id")) != str(user["id"]):
+        raise HTTPException(404, detail="Schedule not found")
+    remove_job(schedule_id)
+    await db_mod.delete_user_schedule(pool, schedule_id)
+    return {"deleted": True, "schedule_id": schedule_id}
 
 
 # -- Static Frontend --------------------------------------------------------

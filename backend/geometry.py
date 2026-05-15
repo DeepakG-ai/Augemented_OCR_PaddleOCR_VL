@@ -13,10 +13,7 @@ import logging
 
 import pypdfium2 as pdfium
 
-if __package__:
-    from . import pdf_extractor
-else:
-    import pdf_extractor  # type: ignore[no-redef]
+from . import pdf_extractor
 
 logger = logging.getLogger("geometry")
 
@@ -63,6 +60,14 @@ def _digital_words_for_page(
     h_pts = page.get_height()
     scale = pdf_extractor.compute_scale(w_pts, h_pts)
     raw = pdf_extractor.extract_words(textpage, h_pts, scale)
+    if not raw:
+        # Page has chars but no extractable word geometry — treat as scanned
+        logger.debug(
+            "Page %d reported digital (%d chars) but yielded 0 words — routing to OCR",
+            page_index + 1,
+            char_count,
+        )
+        return [], char_count, False
 
     native_w = max(1, int(w_pts * scale))
     native_h = max(1, int(h_pts * scale))

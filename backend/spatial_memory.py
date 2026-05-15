@@ -17,14 +17,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-if __package__:
-    from . import db as db_mod
-    from . import logging_config as plog
-    from .layout_key import compute_layout_key
-else:
-    import db as db_mod  # type: ignore[no-redef]
-    import logging_config as plog  # type: ignore[no-redef]
-    from layout_key import compute_layout_key  # type: ignore[no-redef]
+from . import db as db_mod
+
+from .layout_key import compute_layout_key
 
 logger = logging.getLogger("spatial_memory")
 
@@ -79,7 +74,7 @@ def _is_reusable_header_field(field_key: str, configured_header_fields: set[str]
         return False
     if configured_header_fields:
         return field_key in configured_header_fields
-    return True
+    return False
 
 
 
@@ -218,14 +213,7 @@ async def save_from_corrections(
         return 0
 
     configured_header_fields = await _load_configured_header_fields(pool, extraction, vendor_id)
-    plog.event(
-        "spatial_memory_save_started",
-        stage="review",
-        **base,
-        layout_key=lk,
-        configured_header_fields=sorted(configured_header_fields),
-        submitted_locations=len(field_locations),
-    )
+    logger.info("Spatial memory save: layout=%s, %d locations submitted", lk, len(field_locations))
     saved = 0
     for field_key, loc in field_locations.items():
         # Save reusable memory for configured top-level fields only.
@@ -239,15 +227,7 @@ async def save_from_corrections(
         # AGENTS.md rule: only human drag-box corrections become reusable memory.
         # Qwen anchors and previously applied memory are not value regions.
         if strategy != "manual":
-            plog.event(
-                "spatial_memory_save_skipped",
-                stage="review",
-                **base,
-                layout_key=lk,
-                field_key=field_key,
-                reason="not_manual_review_box",
-                strategy=strategy or None,
-            )
+            logger.debug("Spatial memory skip: field=%s strategy=%s (not manual)", field_key, strategy)
             continue
 
         box = loc.get("box")
@@ -278,16 +258,7 @@ async def save_from_corrections(
                 created_from_extraction_id=extraction_id,
             )
             saved += 1
-            plog.event(
-                "spatial_memory_saved",
-                stage="review",
-                **base,
-                layout_key=lk,
-                field_key=field_key,
-                page_number=page_num,
-                normalized_box=normalized,
-                source_engine=source_engine,
-            )
+
             logger.info(
                 "Spatial memory saved: vendor=%s layout=%s field=%s page=%d",
                 vendor_id, lk, field_key, page_num,
@@ -298,7 +269,7 @@ async def save_from_corrections(
                 field_key, exc,
             )
 
-    plog.event("spatial_memory_save_completed", stage="review", **base, layout_key=lk, saved_count=saved)
+    logger.info("Spatial memory save done: layout=%s, %d saved", lk, saved)
     return saved
 
 
@@ -333,13 +304,7 @@ async def _apply_to_po_per_page(
     }
 
     memories = await db_mod.get_spatial_memory_for_layout(pool, vendor_id, lk)
-    plog.event(
-        "spatial_memory_loaded",
-        stage="postprocess",
-        **base,
-        layout_key=lk,
-        memory_count=len(memories),
-    )
+    logger.info("Spatial memory loaded: layout=%s, %d regions (po_per_page)", lk, len(memories))
     if not memories:
         return result, field_locations, 0
 
@@ -368,8 +333,8 @@ async def _apply_to_po_per_page(
     applied = 0
     for mem in memories:
         field_key = mem["field_key"]
-        if configured_header_fields and field_key not in configured_header_fields:
-            logger.debug("Spatial memory skip: field=%s no longer in template", field_key)
+        if not configured_header_fields or field_key not in configured_header_fields:
+            logger.debug("Spatial memory skip: field=%s not in template (or template unavailable)", field_key)
             continue
 
         page_num = mem["page_number"]
@@ -396,50 +361,20 @@ async def _apply_to_po_per_page(
                 "Spatial memory skip: field=%s page=%d text too short (%d chars)",
                 field_key, page_num, len(current_text),
             )
-            plog.event(
-                "spatial_memory_skipped",
-                stage="postprocess",
-                **base,
-                layout_key=lk,
-                field_key=field_key,
-                page_number=page_num,
-                reason="no_current_text_in_saved_box",
-                pixel_box=pixel_box,
-            )
+
             continue
 
         if field_key in page_result:
             old_val = page_result[field_key]
             page_result[field_key] = current_text
-            plog.event(
-                "spatial_memory_overrode_field",
-                stage="postprocess",
-                **base,
-                layout_key=lk,
-                field_key=field_key,
-                page_number=page_num,
-                old_value=old_val,
-                new_value=current_text,
-                pixel_box=pixel_box,
-                matched_word_count=len(matched_words),
-            )
+
             logger.info(
                 "Spatial memory applied (po_per_page): field=%s page=%d old='%s' new='%s'",
                 field_key, page_num, str(old_val)[:50], current_text[:50],
             )
         else:
             page_result[field_key] = current_text
-            plog.event(
-                "spatial_memory_added_field",
-                stage="postprocess",
-                **base,
-                layout_key=lk,
-                field_key=field_key,
-                page_number=page_num,
-                new_value=current_text,
-                pixel_box=pixel_box,
-                matched_word_count=len(matched_words),
-            )
+
             logger.info(
                 "Spatial memory added (po_per_page): field=%s page=%d value='%s'",
                 field_key, page_num, current_text[:50],
@@ -519,13 +454,7 @@ async def apply_to_extraction(
 
     # Load spatial memory for this vendor+layout
     memories = await db_mod.get_spatial_memory_for_layout(pool, vendor_id, lk)
-    plog.event(
-        "spatial_memory_loaded",
-        stage="postprocess",
-        **base,
-        layout_key=lk,
-        memory_count=len(memories),
-    )
+    logger.info("Spatial memory loaded: layout=%s, %d regions", lk, len(memories))
     if not memories:
         return result, field_locations, 0
 
@@ -548,8 +477,8 @@ async def apply_to_extraction(
     applied = 0
     for mem in memories:
         field_key = mem["field_key"]
-        if configured_header_fields and field_key not in configured_header_fields:
-            logger.debug("Spatial memory skip: field=%s no longer in template", field_key)
+        if not configured_header_fields or field_key not in configured_header_fields:
+            logger.debug("Spatial memory skip: field=%s not in template (or template unavailable)", field_key)
             continue
 
         page_num = mem["page_number"]
@@ -573,34 +502,14 @@ async def apply_to_extraction(
                 "Spatial memory skip: field=%s text too short (%d chars)",
                 field_key, len(current_text),
             )
-            plog.event(
-                "spatial_memory_skipped",
-                stage="postprocess",
-                **base,
-                layout_key=lk,
-                field_key=field_key,
-                page_number=page_num,
-                reason="no_current_text_in_saved_box",
-                pixel_box=pixel_box,
-            )
+
             continue
 
         # Override result value
         if isinstance(result, dict) and field_key in result:
             old_val = result[field_key]
             result[field_key] = current_text
-            plog.event(
-                "spatial_memory_overrode_field",
-                stage="postprocess",
-                **base,
-                layout_key=lk,
-                field_key=field_key,
-                page_number=page_num,
-                old_value=old_val,
-                new_value=current_text,
-                pixel_box=pixel_box,
-                matched_word_count=len(matched_words),
-            )
+
             logger.info(
                 "Spatial memory applied: field=%s old='%s' new='%s' (from region on page %d)",
                 field_key, str(old_val)[:50], current_text[:50], page_num,
@@ -608,17 +517,7 @@ async def apply_to_extraction(
         elif isinstance(result, dict):
             # Field exists in memory but not in result — add it
             result[field_key] = current_text
-            plog.event(
-                "spatial_memory_added_field",
-                stage="postprocess",
-                **base,
-                layout_key=lk,
-                field_key=field_key,
-                page_number=page_num,
-                new_value=current_text,
-                pixel_box=pixel_box,
-                matched_word_count=len(matched_words),
-            )
+
             logger.info(
                 "Spatial memory added: field=%s value='%s' (from region on page %d)",
                 field_key, current_text[:50], page_num,

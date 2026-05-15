@@ -22,6 +22,25 @@ const MOCK_INGEST_RESPONSE = {
   detected_vendor: { vendor_id: 'RS001', vendor_name: 'ROBERT SCOTT' },
 };
 
+const MOCK_VENDOR_TEMPLATE = {
+  id: 1,
+  vendor_id: 'RS001',
+  format_type: 'single_po_multipage',
+  header_fields: ['po_number', 'bill_to'],
+  line_item_fields: ['item', 'qty'],
+  prompt_instructions: '',
+  extraction_rules: [],
+  system_prompt: null,
+  user_prompt: null,
+  system_prompt_page1: null,
+  user_prompt_page1: null,
+  system_prompt_page2: null,
+  user_prompt_page2: null,
+  prompt_hash: 'mockhash',
+  created_at: '2025-01-01T00:00:00Z',
+  updated_at: '2025-01-01T00:00:00Z',
+};
+
 // SSE stream that simulates the durable worker pipeline
 function buildSSE() {
   const events = [
@@ -58,6 +77,16 @@ test.describe('Ingestion Pipeline', () => {
       }
       return route.fallback();
     });
+
+    // Mock detected vendor template load. The extract page loads this after
+    // /ingest/ui returns detected_vendor so the test must keep the app on-page.
+    await page.route('**/vendors/RS001/template', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(MOCK_VENDOR_TEMPLATE),
+      })
+    );
 
     // Mock /upload-preview (file preview)
     await page.route('**/upload-preview', (route) =>

@@ -31,7 +31,7 @@ Core rules:
 | Review role | Human edits and manual drag boxes produce `corrected_result`, audit events, gold examples, and spatial memory. |
 | Spatial memory role | Store the field region. On the next document, read current words inside that region. Never reuse the old value. |
 | Gold examples role | Prompt hints for repeated formatting mistakes. Prompt injection uses the latest correction per field. |
-| Logging | `backend/logging_config.py` owns console logging and JSONL pipeline audit logging. |
+| Logging | `backend/logging_config.py` owns console logging and human-readable pipeline audit logging. |
 
 ## 2. Implemented vs Planned
 
@@ -48,7 +48,7 @@ Core rules:
 | Gold examples | Append-only audit table; prompt gets latest correction per field. | Add UI delete/deactivate for wrong gold examples. |
 | Debug dumps | Postprocess still writes `bbox/pdle_output` and `bbox/qwn_output`. | Gate behind env var or move to structured logs/object storage. |
 | Job enqueue | `ensure_job()` checks active job before insert. | Add DB-level partial unique index for active jobs. |
-| Vendor delete | DB rows are deleted. | Also delete associated document/page/export objects from object storage. |
+| Vendor delete | DB rows are deleted. | Also delete associated document/page objects from object storage. |
 
 ## 3. Architecture
 
@@ -57,21 +57,19 @@ graph TB
     UI["Browser SPA<br/>frontend"] --> API["FastAPI API<br/>backend.main"]
     API --> PG["PostgreSQL<br/>metadata, jobs, results"]
     API --> RD["Redis<br/>prompt/result cache"]
-    API --> MN["MinIO or local object store<br/>documents, pages, exports"]
+    API --> MN["MinIO or local object store<br/>documents, pages"]
 
     subgraph Workers
         NW["normalize-worker"]
         OW["ocr-worker"]
         LW["llm-worker"]
         PW["postprocess-worker"]
-        XW["outbound-worker"]
     end
 
     NW --> PG
     OW --> PG
     LW --> PG
     PW --> PG
-    XW --> PG
 
     NW --> MN
     OW --> MN
@@ -79,8 +77,8 @@ graph TB
     XW --> MN
 
     LW --> QWEN["Qwen3-VL endpoint<br/>OpenAI-compatible HTTP"]
-    API -. traces .-> PHX["Phoenix / OpenTelemetry"]
-    LW -. traces .-> PHX
+    API -. traces .-> MLF["MLflow"]
+    LW -. traces .-> MLF
 ```
 
 ## 4. End-to-End Pipeline
@@ -107,7 +105,6 @@ flowchart TD
     O --> P["postprocess-worker builds field_locations"]
     P --> Q["Apply spatial memory from current words"]
     Q --> R["Save result, field_locations, status done"]
-    R --> S["outbound-worker builds contract, Excel, CSV"]
     R --> T["Review UI"]
     T --> U["Manual correction confirmed"]
     U --> V["Save corrected_result and review event"]
@@ -278,7 +275,7 @@ It provides:
 |---|---|
 | `configure_logging()` | Configure standard console logging. |
 | `get_logger(name)` | Return normal Python logger. |
-| `event()` | Write one structured pipeline event as JSONL. |
+| `event()` | Write one human-readable pipeline event. |
 | `timed()` | Context manager that writes an event with duration. |
 | `log_paths()` | Return central and per-extraction log paths. |
 
@@ -286,10 +283,10 @@ Log outputs:
 
 | File | Meaning |
 |---|---|
-| `logs/pipeline/pipeline.jsonl` | Central chronological pipeline stream. |
-| `logs/pipeline/extractions/extraction_<id>.jsonl` | Per-extraction timeline. |
+| `logs/pipeline/pipeline.log` | Central chronological pipeline stream. |
+| `logs/pipeline/extractions/extraction_<id>.log` | Per-extraction timeline. |
 
-Pipeline logging is JSONL: one complete JSON object per line.
+Pipeline logging is human-readable text. The trace API parses pipeline event lines back into lightweight event dictionaries.
 
 Example:
 
@@ -312,7 +309,6 @@ erDiagram
     extractions ||--o{ pages : renders
     extractions ||--o{ jobs : processed_by
     extractions ||--o{ review_events : audited_by
-    extractions ||--o{ integration_deliveries : exported_by
 
     vendors {
         text id PK
@@ -440,8 +436,6 @@ erDiagram
 | `PUT` | `/extractions/{id}/corrections` | Save review corrections, gold examples, spatial memory. |
 | `GET` | `/extractions/{id}/reviews` | Review audit trail. |
 | `GET` | `/extractions/{id}/contract` | Normalized purchase order contract. |
-| `GET` | `/extractions/{id}/export.xlsx` | Excel export. |
-| `GET` | `/extractions/{id}/export.csv` | CSV export. |
 | `POST` | `/upload-preview` | Render preview pages without extraction. |
 
 Deprecated legacy endpoints:
@@ -613,7 +607,6 @@ not available.
 | `_process_ocr` | Run OCR only on scanned pages and save unified geometry. |
 | `_process_llm` | Load template/prompt, call Qwen, save result and page results. |
 | `_process_postprocess` | Build field locations, apply spatial memory, save mapping, mark done. |
-| `_process_outbound` | Build contract, Excel, CSV, and delivery records. |
 | `process_job` | Dispatch a claimed job to its stage handler. |
 | `run_worker` | Poll and claim jobs, log completion/failure. |
 | `main` | CLI entrypoint for stage-specific worker process. |
@@ -646,7 +639,6 @@ not available.
 | `save_extraction_corrections` | Persist review result, gold example, and spatial memory. |
 | `get_extraction_reviews` | Return review audit trail. |
 | `get_extraction_contract` | Return normalized contract. |
-| `download_extraction_excel`, `download_extraction_csv` | Return generated exports. |
 
 ### `backend/db.py`
 
@@ -661,11 +653,11 @@ not available.
 | Document functions | `create_document`, `get_document`, `update_document_status`, `delete_document`. |
 | Extraction functions | `create_extraction`, `update_extraction_result`, `list_extractions`, `list_all_extractions`, `get_extraction`, `delete_extraction`. |
 | Page/geometry functions | `save_pages`, `get_pages`, `get_page_object_keys`, `save_ocr_data`, `get_ocr_data`, `is_postprocess_ready`. |
-| Object key functions | `list_delivery_object_keys`, `get_vendor_object_keys`. |
+| Object key functions | `get_vendor_object_keys`. |
 | Review functions | `save_field_locations`, `save_corrections`, `get_effective_result`, `create_review_event`, `list_review_events`. |
 | Gold functions | `save_gold_example`, `get_gold_examples`, `get_latest_gold_correction_fields`. |
 | Job functions | `enqueue_job`, `has_active_job`, `ensure_job`, `claim_job`, `update_job_progress`, `complete_job`, `fail_job`, `cancel_jobs_for_extraction`, `get_job`, `get_latest_job_for_extraction`, `list_jobs_for_extraction`. |
-| Status/delivery functions | `set_extraction_status`, `update_extraction_progress`, `set_total_pages`, `set_cancel_requested`, `is_cancel_requested`, `upsert_delivery`, `list_deliveries`, `save_export_artifact`. |
+| Status functions | `set_extraction_status`, `update_extraction_progress`, `set_total_pages`, `set_cancel_requested`, `is_cancel_requested`. |
 
 ### Support modules
 
@@ -673,10 +665,9 @@ not available.
 |---|---|---|
 | `cache.py` | `get_redis`, prompt cache functions, extraction cache functions | Redis connection and cache helpers. |
 | `contracts.py` | `_header_fields`, `_document_payload`, `_multi_document_export_rows`, `build_purchase_order_contract` | Build canonical downstream purchase-order contract. |
-| `exporter.py` | `_stringify`, `_header_pairs`, `_line_items_table`, style helpers, `build_excel_bytes`, `build_csv_bytes` | Build Excel and CSV exports. |
 | `object_store.py` | `ObjectStore`, `get_store` | MinIO/local object storage with path validation. |
 | `models.py` | Pydantic classes | API request/response schemas. |
-| `phoenix_tracing.py` | `trace_*` context managers and setup helpers | Optional OpenTelemetry/Phoenix tracing. |
+| `mlflow_tracing.py` | `trace_*` context managers and setup helpers | Optional MLflow tracing. |
 
 ## 14. Function Reference - Frontend
 
@@ -711,7 +702,7 @@ state variables are not function logic.
 | `setupDropzone`, `handleFile`, `updatePageNav`, `changePage`, `renderCurrentPage`, `setupDragZoom`, `applyZoom` | File preview and zoom/pan controls. |
 | `buildPipelineHTML`, `showPipelinePanel`, `hidePipelinePanel`, `setPipelineStage`, `setPipelineProgress`, `updatePipelineFromSSE` | Visual pipeline progress UI. |
 | `showStopButton`, `resetExtractButtons`, `cancelExtract`, `showResumeButton`, `applyJobStatus`, `streamJob`, `runExtract`, `resumeExtract`, `retryLastExtract` | Durable job interaction and SSE handling. |
-| `showResult`, `loadExtractionPages`, `copyResult`, `downloadResult`, `downloadExcel`, `downloadCsv`, `setStatus` | Extraction result display and downloads. |
+| `showResult`, `loadExtractionPages`, `copyResult`, `downloadResult`, `setStatus` | Extraction result display and JSON download. |
 
 ### History page
 
@@ -750,7 +741,6 @@ For one uploaded PDF, production logs should show:
 8. LLM `template_loaded`, `llm_request_configured`, `qwen_http_completed`, `qwen_json_parsed`, `qwen_json_persisted`
 9. postprocess `field_locations_built`, `spatial_memory_loaded`, `spatial_memory_overrode_field` or skipped events, `field_locations_saved`
 10. review `review_correction_received`, `review_correction_saved`, `gold_correction_saved`, `spatial_memory_saved`
-11. outbound `contract_built`, `excel_export_built`, `csv_export_built`
 
 ## 16. Current Known Gaps
 
@@ -762,7 +752,7 @@ These are known and should not be confused with intended final behavior:
 | PaddleOCR output is named `words` but may be text-line/region boxes. | Manual selection and spatial memory can be less exact. | Split OCR regions into true word boxes or use Paddle word boxes if available in current API. |
 | Postprocess debug dumps are unconditional. | Runtime artifacts can pollute `bbox/`. | Gate with env var or move to object storage. |
 | Job enqueue race still possible under concurrent calls. | Duplicate active jobs possible. | Add partial unique index and transaction guard. |
-| Vendor deletion does not fully clean object store. | Orphan documents/pages/exports possible. | Use `get_vendor_object_keys()` before DB deletion and delete objects. |
+| Vendor deletion does not fully clean object store. | Orphan documents/pages possible. | Use `get_vendor_object_keys()` before DB deletion and delete objects. |
 | Spatial memory assumes one layout per vendor/template. | Multiple layouts under one template could share memory incorrectly. | Upgrade layout key when multi-layout clients matter. |
 | Line-item spatial memory is intentionally disabled. | Manual row boxes do not become reusable memory. | Reuse only column/header anchors until table logic is stable. |
 
@@ -780,7 +770,7 @@ Docker service verification:
 
 ```powershell
 docker compose ps
-docker compose logs --since 10m api normalize-worker ocr-worker llm-worker postprocess-worker outbound-worker
+docker compose logs --since 10m api normalize-worker ocr-worker llm-worker postprocess-worker
 ```
 
 Active spatial memory inspection:

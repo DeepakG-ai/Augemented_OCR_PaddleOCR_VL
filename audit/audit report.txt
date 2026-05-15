@@ -1,0 +1,1211 @@
+Claude code review: 
+
+Here is the complete audit — findings from all 5 parallel agents synthesized by area.
+
+---
+
+## Full Codebase Audit — No Code Changed
+
+---
+
+### TIER 1: CRITICAL (Breaks functionality or crashes)
+
+#### 1. `main.py` ~line 1044 — Syntax/Indentation Crash
+Inside the SSE async generator, `with trace_extraction_pipeline(` has 10-space indentation instead of 12. Python accepts it but it will cause a runtime IndentationError when this code path executes.
+
+#### 2. `db.py` `ensure_job()` — Race Condition Creates Duplicate Jobs
+`ensure_job()` calls `has_active_job()` then `enqueue_job()` as separate steps. Two workers completing simultaneously both see "no active job" and both enqueue the same stage. The `ON CONFLICT DO NOTHING` in `enqueue_job()` only protects within a single transaction — not across the two-step check.
+
+#### 3. `worker.py` `_process_postprocess()` — Can Run Twice Per Extraction
+Because `ensure_job()` has the race above, both an OCR and LLM completion can each enqueue postprocess simultaneously. Two postprocess workers can then run on the same extraction.
+
+#### 4. `db.py` `is_postprocess_ready()` — Digital-Only PDFs Stuck Forever
+The readiness check requires `ocr_data IS NOT NULL`. For fully digital PDFs, `ocr_data` is never populated. Postprocess is never enqueued. The extraction stays in "processing" state indefinitely.
+
+#### 5. `worker.py` `_stop_if_cancelled()` — Cancelled Extractions Spawn Orphan Jobs
+The cancel check stops processing but does NOT prevent the next `ensure_job()` call from firing. Normalize continues to enqueue OCR and LLM stages even after cancel is requested. These orphan jobs run to completion.
+
+#### 6. `extractor.py` line 456 — Crashes on Unexpected LLM Response
+`resp_json["choices"][0]["message"]["content"]` assumes the structure without any guard. If the LLM returns `{"error": "..."}` or an empty `choices` array, this throws `IndexError` and the entire page fails with no retry context.
+
+#### 7. `extractor.py` line 735 — Wrong "cancelled" Flag
+`"cancelled": cancelled or batch_had_failure` — a JSON parse failure or network timeout sets `batch_had_failure=True`, which then reports the extraction as "cancelled" to the caller. This conflates two completely different failure types and breaks retry logic.
+
+#### 8. `processor.py` line 36 — ThreadPoolExecutor Leaks Forever
+`_executor = ThreadPoolExecutor(max_workers=PDF_WORKERS)` is created at module load and never shut down. Worker threads live for the entire process lifetime and prevent clean shutdown.
+
+---
+
+### TIER 2: HIGH (Silent data loss or wrong results)
+
+#### 9. `extractor.py` `_strip_newlines()` — Destroys Multi-Line Address Fields
+Called on every LLM response and merged result. Recursively replaces ALL newlines in the JSON with spaces. A field like `"ship_to": "123 Main St\nSuite 4\nNew York"` becomes `"ship_to": "123 Main St Suite 4 New York"` silently. No way to preserve multi-line fields.
+
+#### 10. `extractor.py` `_combine_header_value()` — Case-Insensitive Deduplication Loses Data
+Called during multi-page merge. "Bill To" on page 1 and "BILL TO" on page 3 are treated as duplicates and one is silently dropped. If the value on page 1 says "John Doe" and page 3 says "john doe", one is discarded.
+
+#### 11. `extractor.py` line 818-843 — No Line Item Deduplication Across Pages
+When merging multi-page POs, identical line items from continuation pages are appended without checking for duplicates. Final count inflates. No warning is logged.
+
+#### 12. `extractor.py` line 522 — Regex Breaks Valid Numbers
+Pattern `r'([\[:,]\s*)(-?0[0-9]+)(\s*[\]},])'` is meant to fix JSON leading-zero errors but is too broad. It transforms `{"po_number": 0012}` into `{"po_number": "0012"}` — type change from int to string — silently.
+
+#### 13. `spatial_memory.py` lines 65-69 — Template Load Failure Bypasses Field Restrictions
+If the DB call to load configured header fields throws, the exception is caught at DEBUG level and `configured_header_fields` defaults to an empty set. Empty set means `_is_reusable_header_field()` returns True for ANY field including line items — completely bypassing the header-only restriction.
+
+#### 14. `extractor.py` line 497-498 — LLM Usage Recording Silently Lost
+If `db_mod.record_llm_usage()` fails, only a warning is logged. Extraction continues successfully. Token billing data is permanently lost with no retry mechanism.
+
+#### 15. `processor.py` lines 63-64 — Image Upscaling Degrades Quality
+`nw = max(32, round(nw / 32) * 32)` uses `round()` (banker's rounding). `nw=97` → rounds to 128, not 96. This upscales images, making OCR text blurry. Should use floor division `//`.
+
+#### 16. `processor.py` lines 107-112 — Corrupt Page Skip Causes Count Mismatch
+When a page render throws, the page is skipped and no placeholder is added. But `render_count = min(total_pages, max_pages)` counts ALL pages. Callers receive fewer results than expected, causing index misalignment.
+
+#### 17. `worker.py` line 695 — Page 1 Boxes Lost If Page 1 Failed
+If page 1 extraction fails, `next((pr for pr in _page_results if pr.get("_page") == 1 and "_error" not in pr), None)` correctly returns None. But then bbox data is never saved — no retry, no fallback. The document continues with no field_locations from page 1.
+
+#### 18. `worker.py` — Spatial Memory Apply Failure Silently Produces Stale Results
+If `apply_to_extraction()` throws inside postprocess, processing continues with the original unmodified `field_locations`. The extraction is marked `done`, but the user's corrections were silently ignored.
+
+#### 19. `exporter.py` lines 72-76 — Non-Dict Line Items Break Column Alignment
+If `line_items` contains any non-dict element, it's placed in row position 0 but columns still expect N values. The resulting CSV/Excel has mismatched column widths.
+
+#### 20. `vendor_detector.py` line 248 — No First-Page Enforcement
+The docstring says "detect vendor from page-1 words" but the function accepts any word list. If multi-page words are passed by a caller, vendor detection runs on page 2+ text.
+
+---
+
+### TIER 3: MEDIUM (Logic gaps, auth, missing validation)
+
+#### 21. `main.py` lines 1209-1237 — Soft Quota Race Condition
+The page limit check reads `u_used` from DB, checks if `u_used >= u_limit`, then allows the upload. With 10 concurrent uploads each reading `u_used = 990` on a 1000-page limit, all 10 pass — 200+ pages processed above limit. The soft-limit semantics (allow the final overage) are correct, but concurrent bypass is not.
+
+#### 22. `main.py` lines 1967-1985 — Correction Diff Boolean Bug
+`if isinstance(original, list) or isinstance(corrected, list):` — uses `or`, not `and`. If only one side is a list, the function enters the list branch and wraps the non-list side incorrectly. Should be `and` to only handle cases where both are lists.
+
+#### 23. `main.py` line 103 — JWT Token in Query String Exposed in Logs
+SSE connections send the token as `?token=<JWT>` because EventSource cannot send headers. This token appears in browser history, access logs, CDN logs, and referrer headers. By design, but undocumented risk.
+
+#### 24. `main.py` lines 941-976 — Dead Code Below First HTTPException
+The deprecated `/extract` endpoint raises `HTTPException` on line 941, then has 30+ unreachable lines below. `_active_extractions` dict (line 158) is initialized but never used.
+
+#### 25. `main.py` lines 1706-1785 — Extraction Delete Does Not Cascade Jobs
+Deleting an extraction removes the extraction row but not the related `jobs` rows. If the extraction is stuck in a crashed `running` state, it can't be deleted (409 guard), and stale jobs accumulate.
+
+#### 26. `db.py` `cancel_jobs_for_extraction()` — "cancelling" Is a Zombie State
+Jobs are set to `cancelling` but no code anywhere polls for or transitions out of this state. Jobs stuck in `cancelling` are never recovered, never retried, never failed. The stale recovery threshold (10 min) doesn't handle `cancelling`.
+
+#### 27. `db.py` `recover_stale_jobs()` — Missing `cancelling` State
+The stale job recovery query looks for `running` status only. Jobs in `cancelling` state that crash never get recovered.
+
+#### 28. `db.py` line 2207 — Fragile String Parsing of asyncpg Result
+`int(result.split()[-1]) if result else 0` assumes asyncpg returns "UPDATE N" format. If the library ever changes its return format, this crashes with IndexError or ValueError silently.
+
+#### 29. `page_logger.py` line 43-45 — `count_result_fields()` Crashes on Non-Dict List
+The function iterates a list and calls `.items()` on each element. If the list contains a string or None, it throws `AttributeError`. The check `if isinstance(r, dict)` is missing from the loop body.
+
+#### 30. `page_logger.py` line 88 — `overage` Calculation Semantically Backwards
+`overage = subscription_limit - total_extracted_pages` produces a negative number when over limit. The variable name implies "amount over", but it stores "amount remaining (negative)". The value -3 means 3 pages over, not -3 pages.
+
+#### 31. `spatial_memory.py` lines 125-128 — Banker's Rounding Causes Coordinate Drift
+Python 3's `round()` uses banker's rounding (0.5 rounds to nearest even). Saved spatial memory boxes can shift 1-2 pixels between save and apply cycles, causing progressively misaligned regions.
+
+#### 32. `layout_key.py` line 39 — `None` vs. `"default"` Collision
+`template_id or 'default'` means `compute_layout_key(v_id, None)` and `compute_layout_key(v_id, "default")` produce identical keys. A vendor with no template and a vendor with a template named "default" share spatial memory.
+
+---
+
+### TIER 4: Frontend Bugs
+
+#### 33. `dashboard.js` / `extract.js` — Global State Never Cleared on Logout
+`_clientDashboardData`, `_userDocsData`, `_activeStreamAbort`, and similar module-level variables persist across browser sessions. If Admin A views Client B's data, then Client B logs in from the same browser, stale admin data is still in memory.
+
+#### 34. `vendors.js` lines 113-150 — System Prompt Visibility Enforced Client-Side Only
+The frontend hides system prompts based on `isAdmin` read from localStorage. Any user who modifies `role: "admin"` in localStorage sees the prompt HTML. The API correctly withholds prompt content, but the frontend logic is trivially bypassable.
+
+#### 35. `extract.js` lines 706-752 — SSE Race on Concurrent Extractions
+`activeJobId` is set at line 693 and cleared at line 742. Two rapid extraction starts from the same tab cause the second to overwrite `activeJobId`, losing track of the first stream.
+
+#### 36. `review.js` — No Unsaved Changes Warning
+`_rvDirty` is tracked but never checked before navigation. Edited correction fields are silently discarded if the user clicks back.
+
+#### 37. `extract.js` lines 487-592 — Pipeline Stage Order Hardcoded
+The visual stage progression is a hardcoded array `['upload', 'detect', 'normalize', 'ocr', 'llm', 'json', 'postprocess']`. If the backend sends stages out of expected order (e.g., on retry), the UI marks them all done regardless.
+
+---
+
+### Non-Obvious Functions You May Not Be Aware Of
+
+| Function | File | What it does |
+|---|---|---|
+| `_text_windows()` | `vendor_detector.py` | Sliding-window tokenizer that adapts window size to the alias pattern's word count. Used in fuzzy matching. |
+| `_effective_fuzzy_score()` | `vendor_detector.py` | Adds bonus points for multi-word patterns (+2 pts) and penalizes single-word patterns if non-exact (−3 pts). Explains why 1-word aliases score lower. |
+| `_reading_order()` | `spatial_memory.py` | Sorts OCR words by Y/10 (groups into ~10px rows) then by X. The `/10` quantization means words within 10px vertically are treated as same row. |
+| `_configured_field_names()` | `spatial_memory.py` | Falls through multiple dict key names (`field_key` → `key` → `name` → `id`) to extract a field name. Silent if none match. |
+| `_correction_hint()` | `extractor.py` | Summarizes original→corrected diff without values (for prompt safety). Has a bug: `_has_value({})` returns True, so empty-dict→value corrections show backwards. |
+| `normalize_header_values()` | `extractor.py` | Post-merge step that deduplicates multi-page header values case-insensitively. Silently drops one when duplicates differ only by casing. |
+| `_make_loc()` | `qwen_layout_apply.py` | Builds field location records from normalized bbox coordinates. Does not validate NaN or Inf inputs. |
+| `_stringify()` | `exporter.py` | Escapes CSV formula injection (`=`, `+`, `@`) with a leading `'`. Does not remove the characters — just prepends a quote that Excel may still interpret as a formula character. |
+| `_ensure_vendor_namespace()` | `object_store.py` | Prefixes all object keys with `vendor_{id}/` to namespace MinIO storage per vendor. Exists even in local fallback mode. |
+| `PARALLEL_BATCH = 1` | `extractor.py` line 586 | Docstring says "parallel batches of 2" but this constant is 1, making processing fully sequential. The parallelism was never enabled. |
+
+---
+
+### What's Missing Entirely (Not Yet Built)
+
+Based on your requirements vs. the current code:
+
+1. **Subscription hard-stop logic** — Soft limit works; negative-balance hard-stop on next upload is not enforced at the ingest route
+2. **Per-client dashboard isolation** — Backend admin stats exist, but no dedicated client-facing stats endpoint that filters by `user_id`
+3. **History page delete cascade** — Delete removes the extraction DB row but billable page counts are in a separate `llm_usage` table that is NOT deleted
+4. **Vendor page "create with exact-match ID"** — The vendor creation flow doesn't expose the `vendor_id` to the user or validate uniqueness against aliases
+5. **Line-item bbox persistence in review** — UI shows the drag-select interface but `PUT /extractions/{id}/corrections` does not persist line-item bounding boxes back to `field_locations`
+6. **PaddleOCR `rec_boxes=True`** — The CLAUDE.md mentions this flag should be used; current PaddleOCR call in `processor.py` does not pass `rec_boxes=True`
+7. **Template page 4-prompt admin preview** — Backend generates page-1 system/user prompts and page-N system/user prompts, but the frontend template page shows only one combined prompt, not the four-panel split you described
+
+
+
+
+
+
+
+
+
+
+
+
+codex review: 
+Hybrid Vendor-Aware PDF Pipeline Audit Report
+Date: 2026-05-13
+Workspace: C:\Users\aigroup5\PycharmProjects\Augemented_OCR_PaddleOCR_VL
+Branch observed: feat/qwen-two-agent-bbox-fields
+Mode: Read-only audit. No code changes were made during the audit.
+
+Purpose
+-------
+This report combines the findings from the parallel audit agents plus the
+local consolidation pass. It checks the current code against the requested
+workflow:
+
+- Vendors must be created first with explicit vendor id.
+- Vendor detector must read first page only and exact-match known vendor name,
+  vendor id, and aliases.
+- Templates must define format type, header fields, line-item fields, prompt
+  instructions, extraction rules, and aliases.
+- Admin can see four prompt previews; clients/users must not see system prompts.
+- Extraction must support mixed digital/scanned PDFs using pypdfium2 and
+  PaddleOCR page by page.
+- Unknown vendors must hard stop.
+- Review corrections must store reusable geometry memory, not old answer values.
+- History, dashboard, users, and subscription page limits must be tenant-safe.
+
+
+============================================================
+Agent 1: Vendor, Template, Ingest Audit
+============================================================
+
+Findings
+--------
+
+1. Vendor page can create vendors without a user-chosen vendor ID.
+
+   frontend/vendors.js:80
+   saveNewVendor() auto-generates a random vendor id when the Vendor ID input
+   is blank. Backend requires id, but the frontend silently supplies one.
+
+   Impact:
+   This violates the requirement that the user first create the vendor with
+   vendor id.
+
+2. Admin cannot create a new vendor from the vendor page.
+
+   backend/main.py:604
+   frontend/vendors.js:56
+
+   Backend requires admin users to provide user_id when creating a new vendor.
+   The vendor modal sends only {id, name}. Result: admin create vendor fails
+   for new vendors.
+
+3. Template save can auto-create client vendors, bypassing the vendor page.
+
+   backend/main.py:868
+
+   save_template() auto-upserts a missing vendor for clients. This conflicts
+   with the rule that vendors must be explicitly created with vendor id first.
+
+4. Vendor detection is not exact-match only.
+
+   backend/vendor_detector.py:258
+   tests/test_vendor_detector.py:48
+
+   detect_vendor() exact-matches first, then falls back to fuzzy matching.
+   Existing tests explicitly assert fuzzy detection.
+
+   Impact:
+   This violates the requested exact-match behavior.
+
+5. Vendor ID is not included as a detection candidate.
+
+   backend/vendor_detector.py:104
+
+   The detector comment says it falls back to names/ids, but
+   _load_detection_aliases() appends vendor names only, plus DB aliases.
+   Vendor IDs are not matched unless manually added as aliases.
+
+6. "Exact" matching is substring matching and can pick ambiguous winners.
+
+   backend/vendor_detector.py:124
+
+   _detect_exact() checks "pattern in text_blob". This is substring matching,
+   not token-boundary equality. If aliases overlap or tie, max() picks one
+   vendor by score/order instead of reporting ambiguity.
+
+7. Ingest can skip first-page vendor detection entirely.
+
+   backend/main.py:1190
+   backend/main.py:1417
+   frontend/extract.js:774
+
+   If vendor_id is supplied, backend checks ownership and records mode
+   "preselected"; it does not verify the current PDF first page. The frontend
+   sends vendor_id from template/extract shortcuts and tells the user detection
+   was skipped.
+
+8. Template fields are supported but not mandatory.
+
+   backend/models.py:93
+   backend/main.py:289
+   frontend/vendors.js:289
+
+   API defaults header_fields and line_item_fields to empty lists. UI allows
+   saving empty lists. Ingest only blocks when the template has zero total
+   fields, not when either header or line-item fields are missing.
+
+9. Format type is only partially used.
+
+   backend/models.py:84
+   frontend/vendors.js:158
+   backend/extractor.py:277
+   backend/extractor.py:702
+
+   UI/API support single_po_multipage, po_per_page, and single_page. Merge
+   behavior branches on it. But the system/user prompts do not include
+   format-specific instructions; every page prompt asks for header fields and
+   all visible line items.
+
+10. REST ingest can override template field lists.
+
+    backend/main.py:321
+    backend/worker.py:547
+
+    _submit_ingestion_job() stores request-provided field lists. Worker then
+    prefers extraction-row fields over template fields. A non-frontend caller
+    can extract fields that do not match the saved template.
+
+What Meets Requirement
+----------------------
+
+- First-page-only vendor detection path exists for /detect-vendor and for
+  auto-ingest when no vendor is preselected.
+  backend/main.py:705
+  backend/main.py:1299
+
+- Unknown vendor blocks with a 409 and "create vendor and vendor id first" hint.
+  backend/main.py:1391
+
+- Aliases are supported by DB/API/UI.
+  backend/main.py:628
+  frontend/vendors.js:248
+
+- Admin can see four prompt previews; clients receive None for prompt fields,
+  and the frontend hides the prompt panel.
+  backend/main.py:777
+  frontend/vendors.js:111
+  tests/test_template_prompt_visibility.py:61
+
+- Prompt instructions and extraction rules are included in generated system
+  prompts used by worker page extraction.
+  backend/extractor.py:141
+  backend/extractor.py:148
+  backend/worker.py:578
+
+
+============================================================
+Agent 2: Hybrid PDF Geometry and Qwen Audit
+============================================================
+
+Findings
+--------
+
+1. Digital fallback misses the "0 usable words" case.
+
+   backend/geometry.py:56
+   backend/geometry.py:105
+
+   _digital_words_for_page() marks a page digital from char count, then returns
+   is_digital=True even if extract_words() returns zero words. That prevents
+   PaddleOCR from running in normalize/OCR routing.
+
+   Impact:
+   A digital-looking page with unusable extracted words can end up with no
+   useful geometry instead of falling back to OCR.
+
+2. Wrong-vendor Qwen verification can hang the job stream.
+
+   backend/worker.py:620
+   backend/worker.py:747
+   backend/main.py:1557
+   backend/main.py:1636
+
+   Page 1 vendor_confirmed=false becomes _error="vendor_unverified". Extraction
+   status is set to "unverified". SSE terminal states do not include
+   "unverified", and resume does not allow it.
+
+3. PaddleOCR backend is not producing true word-level geometry.
+
+   backend/ocr_runner.py:57
+   backend/ocr_runner.py:97
+   tests/test_word_pdlocr.py:18
+
+   PaddleOCR is initialized with return_word_box=True, but _run_ocr_on_page()
+   consumes rec_texts + rec_boxes only. It ignores text_word / text_word_boxes.
+   Review selection and spatial memory therefore operate on OCR line/region
+   boxes, not reliable word boxes.
+
+4. Spatial memory layout safety is too weak.
+
+   backend/layout_key.py:21
+
+   layout_key is explicitly only vendor_id:template_id. It does not include
+   stable anchor/header fingerprinting. Manual regions can leak across multiple
+   layouts under one vendor/template.
+
+5. single_page format falls back to multipage merge when a PDF has more than
+   one page.
+
+   backend/extractor.py:702
+
+   The single_page branch only applies when len(page_results) == 1. Otherwise
+   it uses merge_results() like single_po_multipage.
+
+6. Current-text vendor detection can be bypassed by preselected vendor.
+
+   backend/main.py:1288
+   backend/main.py:1417
+   frontend/extract.js:781
+
+   /ingest/ui skips page-1 detection when vendor_id is submitted.
+
+7. Qwen contract mismatch if vendor_detected / bbox is literal.
+
+   backend/extractor.py:170
+   backend/extractor.py:249
+
+   Current page-1 schema is:
+   - vendor_confirmed
+   - fields
+   - boxes
+
+   Worker consumes boxes. If the intended contract is vendor_detected and bbox,
+   the current code does not match that naming.
+
+8. llama.cpp context size 8192 is not enforced from this code.
+
+   backend/config.py:25
+   backend/extractor.py:418
+
+   Backend targets port 8001 and sends one page per request. The code sets
+   max_tokens but does not verify or pass ctx=8192.
+
+9. backend/qwen_bbox_parser.py is absent.
+
+   The docs and AGENTS brief mention backend/qwen_bbox_parser.py, but the file
+   is not in the current repo listing. Active bbox conversion is inline in:
+
+   backend/worker.py:706
+
+   docs/qwen_bbox_github_issue.md also references missing bbox_agent.py /
+   qwen_bbox_parser.py names, while current code uses qwen_layout_apply.py and
+   inline worker conversion.
+
+
+============================================================
+Agent 3: Review, Manual Corrections, Spatial Memory Audit
+============================================================
+
+Findings
+--------
+
+1. Typed edits can still carry or refresh boxes.
+
+   frontend/review.js:366
+   frontend/review.js:1263
+   backend/main.py:2000
+   backend/main.py:2135
+
+   A changed field with any existing strategy="manual" location is not treated
+   as typed-only, so no value-only warning is shown. rvConfirm() sends all
+   field_locations. Backend saves them wholesale and calls spatial-memory save.
+
+   Impact:
+   A user typing over a previously boxed field can silently re-upsert spatial
+   memory from an old box.
+
+2. Layout safety is too weak.
+
+   backend/layout_key.py:21
+
+   compute_layout_key() is just vendor_id:template_id. Since templates are
+   unique per vendor, this is effectively one memory bucket per vendor/template.
+   It does not include stable anchors/header positions.
+
+3. Drag-select is not header-only.
+
+   frontend/review.js:484
+   frontend/review.js:512
+   backend/spatial_memory.py:74
+
+   rvRenderLineItems() makes line-item cells clickable and starts selection for
+   line_item_{row}_{col} keys. Backend spatial memory skips these, but the UI
+   still supports row-specific draw corrections and saves row-specific
+   per-extraction field_locations.
+
+4. No guard prevents selecting key/label text instead of value text.
+
+   frontend/review.js:905
+   frontend/review.js:978
+
+   rvApplySelection() accepts any words inside the rectangle. rvAcceptSelection()
+   stores that box as strategy="manual". There is no check that selected words
+   are the header value rather than the field label/key.
+
+5. Override confirmation is incomplete.
+
+   frontend/review.js:988
+   frontend/review.js:396
+
+   rvAcceptSelection() confirms only when prior gold correction or spatial
+   memory exists. It does not confirm before replacing a normal Qwen value or
+   an existing non-memory field location. Typed edits do get final confirmation.
+
+6. Review UI still consumes /ocr, not /geometry.
+
+   frontend/review.js:233
+   backend/main.py:1890
+
+   This works because ocr_data is overloaded with unified geometry, but it
+   bypasses the explicit geometry API and keeps UI status/naming OCR-specific.
+
+What Looks Correct
+------------------
+
+- spatial_memory.apply_to_extraction() reads current words inside saved boxes
+  and overrides current result values, not old corrected values.
+  backend/spatial_memory.py:466
+
+- spatial_memory.save_from_corrections() persists normalized geometry only into
+  spatial_memory.
+  backend/spatial_memory.py:160
+
+- Line-item spatial memory is blocked backend-side.
+  backend/spatial_memory.py:74
+
+- Prompt hints are value-redacted before being injected.
+  backend/extractor.py:99
+
+- Audit tables still store full corrected payloads. That is acceptable for audit
+  history, but those values must not be reused as future answers.
+
+
+============================================================
+Agent 4: History, Dashboard, Users, Subscription Audit
+============================================================
+
+Findings
+--------
+
+1. Deleting history currently removes pages from billable usage.
+
+   backend/db.py:186
+   backend/main.py:1747
+   backend/db.py:2475
+
+   llm_usage.extraction_id is ON DELETE SET NULL. delete_extraction() deletes
+   the extraction row. get_user_billable_pages() requires:
+
+   lu.extraction_id IS NOT NULL
+
+   Result:
+   Deleting a successful extraction history row can reduce /me/usage and future
+   quota enforcement.
+
+2. Page-limit boundary does not match the requested rule.
+
+   backend/main.py:1211
+   tests/test_page_limits.py:206
+
+   Current code blocks when u_used >= u_limit. The requested rule allows an
+   upload that starts while remaining pages are >= 0. That means used == limit
+   should still be allowed, and only the next upload after negative remaining
+   should hard stop.
+
+   Existing tests currently encode the opposite behavior.
+
+3. Subscription enforcement fails open on quota lookup errors.
+
+   backend/main.py:1259
+
+   If get_user_billable_pages() raises, ingest logs and continues. That can
+   bypass the hard stop while a client is already negative.
+
+4. Dashboard page totals are history-derived, not billing-stable.
+
+   backend/db.py:653
+   backend/db.py:799
+
+   Admin/client token charts come from llm_usage, but page/extraction totals
+   come from extractions. Deleting history lowers dashboard page counts even if
+   token rows remain.
+
+5. History list fetches heavyweight extraction payloads.
+
+   backend/db.py:1499
+   frontend/history.js:18
+
+   /extractions uses list_all_extractions() and parses result, page_results,
+   field_locations, and ocr_data for every history row. The UI only needs
+   filename/vendor/status/pages/date/latency/id for the list.
+
+   Impact:
+   History can become slow as OCR JSON grows.
+
+6. Near-limit warning is generated but not surfaced.
+
+   backend/main.py:1442
+   frontend/extract.js:785
+
+   Backend returns usage_warning from ingest. runExtract() ignores it before
+   streaming the job.
+
+What Looks Correct
+------------------
+
+- History shows date, total pages, review link, latency, and delete UI.
+  frontend/history.js:18
+
+- Admin dashboard uses all-user stats plus client breakdown.
+
+- Client dashboard uses /user/stats and /user/documents scoped by current user.
+
+- Admin user creation and page-limit editing exist.
+  frontend/admin.js:139
+  frontend/admin.js:269
+
+
+============================================================
+Local Consolidation Findings
+============================================================
+
+Most important risks across all agents
+--------------------------------------
+
+1. Vendor detection behavior is weaker than requested.
+
+   It is not exact-only, vendor_id is not a built-in candidate, and ingest can
+   skip detection completely with a preselected vendor_id.
+
+2. Mixed digital/scanned routing mostly exists, but the digital zero-word
+   fallback bug can leave pages misclassified as digital with unusable words.
+
+3. PaddleOCR is not yet true word geometry.
+
+   The review/spatial-memory workflow depends on exact value text inside boxes.
+   With line/region boxes, selections and future region reads can be too coarse.
+
+4. Spatial memory stores geometry and reads current text, which is correct.
+
+   However, layout_key is too broad and can leak across layouts for the same
+   vendor/template.
+
+5. Review UI still allows line-item drag-select.
+
+   Backend blocks reusable line-item memory, but the UI lets users create
+   row-specific locations. This can confuse reviewers because the requested
+   workflow says drag/drop should be header-only.
+
+6. Billing is not immutable after history delete.
+
+   This is a major business-risk bug. Page usage should survive history deletion.
+
+7. Page-limit behavior does not match the stated negative-overage policy.
+
+   Current code blocks at zero remaining. Requested behavior allows the upload
+   that starts at zero remaining, then blocks once remaining is negative.
+
+
+Functions and Modules Worth Knowing
+-----------------------------------
+
+These are useful current code paths that may not be obvious:
+
+- backend.geometry.compute_pdf_geometry(pdf_bytes, page_sizes)
+  Runs pypdfium2 page classification and digital word extraction.
+
+- backend.geometry.merge_scanned_into_geometry(base_geometry, ocr_pages)
+  Merges PaddleOCR results into scanned pages while preserving digital geometry.
+
+- backend.geometry.image_page_geometry(page_number)
+  Creates a placeholder scanned-source geometry entry for non-PDF image uploads.
+
+- backend.vendor_detector.detect_vendor(pool, page_words, user_id)
+  Detects vendor from page-1 words. Current behavior is exact substring first,
+  fuzzy fallback second.
+
+- backend.spatial_memory.save_from_corrections(pool, extraction_id,
+  field_locations, corrected_result)
+  Saves manual review boxes as normalized reusable geometry for eligible header
+  fields.
+
+- backend.spatial_memory.apply_to_extraction(pool, extraction_id, result,
+  field_locations, page_geometry)
+  Reads current document text inside saved spatial-memory regions and overrides
+  current result fields.
+
+- backend.layout_key.compute_layout_key(vendor_id, template_id, page_results)
+  Current layout key is vendor_id:template_id only.
+
+- backend.qwen_layout_apply.build_field_locations_from_layout(qwen_boxes,
+  pages_with_words, result, page_results)
+  Converts saved Qwen label/header boxes into field_locations for the Review UI.
+
+- backend.extractor.build_system_prompt(...)
+  Builds prompt instructions, extraction rules, value-redacted hints, and
+  optional page-1 box/vendor verification contract.
+
+- backend.extractor.build_user_message(...)
+  Builds per-page user prompt. Currently not strongly format-specific.
+
+- backend.extractor.extract_document(...)
+  Sends pages one by one to Qwen/llama.cpp and merges final results.
+
+- backend.extractor.merge_results(...)
+  Merges single_po_multipage page results: header from first page and line_items
+  from all pages.
+
+- backend.db.get_user_billable_pages(pool, user_id)
+  Counts billable pages from llm_usage using distinct (extraction_id, page_num).
+  This is currently affected by history delete because deleted extraction ids
+  become null.
+
+- backend.main._submit_ingestion_job(...)
+  Validates template exists, stores document, creates extraction, and queues
+  normalize job.
+
+- backend.worker._process_normalize(...)
+  Renders pages, computes pypdfium/PaddleOCR routing, stores page artifacts, and
+  queues OCR + LLM jobs.
+
+- backend.worker._process_ocr(...)
+  Runs PaddleOCR only for scanned pages, or skips OCR for all-digital documents.
+
+- backend.worker._process_llm(...)
+  Builds prompts, calls Qwen extraction, saves page-1 boxes into
+  qwen_layout_boxes.
+
+- backend.worker._process_postprocess(...)
+  Builds field_locations from Qwen layout boxes, applies spatial memory, saves
+  final field_locations, and marks extraction done.
+
+
+Recommended Fix Order
+---------------------
+
+1. Vendor creation and detection:
+   - Require explicit vendor id in UI.
+   - Fix admin vendor creation owner selection.
+   - Remove template auto-create vendor behavior.
+   - Make vendor detector exact-only if that is the desired rule.
+   - Add vendor_id as a detection candidate.
+   - Add ambiguity handling for exact overlaps/ties.
+   - Decide whether preselected vendor_id should still verify first page.
+
+2. Geometry correctness:
+   - Treat digital pages with zero extracted words as scanned.
+   - Parse PaddleOCR true word boxes from return_word_box output.
+   - Update Review UI to consume /geometry directly.
+
+3. Qwen contract:
+   - Align names: vendor_confirmed/boxes vs vendor_detected/bbox.
+   - Add/verify llama.cpp ctx=8192 server configuration outside request code.
+   - Make prompts format-specific for single_po_multipage, po_per_page,
+     and single_page.
+
+4. Spatial memory safety:
+   - Strengthen layout_key with stable anchor/header fingerprint.
+   - Prevent line-item drag-select in UI or clearly make it non-reusable.
+   - Remove stale manual box from typed-only edits unless user confirms keeping
+     that geometry.
+   - Add warning when selected text appears to equal the field key/label.
+
+5. Billing/history:
+   - Make billing page counts immutable after extraction deletion.
+   - Fix page-limit boundary to hard stop only when current remaining is
+     negative, not zero.
+   - Do not fail open when quota lookup fails for clients.
+   - Keep dashboard billing totals from stable usage records, not only
+     extraction history.
+
+6. Performance:
+   - Add lightweight history list query that excludes large JSONB columns.
+
+
+End of report.
+
+
+
+
+
+
+
+
+
+antigravity review: 
+# Deep-Dive Pipeline Audit
+
+> **Scope**: `backend/` — extraction pipeline, tenant isolation, billing, spatial memory, review loop  
+> **Method**: Static code analysis across all 12 core modules  
+> **Date**: 2026-05-13
+
+---
+
+## 1. Vendor Detection & Tenant Isolation
+
+### 1A. ✅ Alias-Based Matching Is Tenant-Scoped
+
+[vendor_detector.py](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/vendor_detector.py) `detect_vendor()` accepts `user_id` and passes it to [db.py:1056–1072](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/db.py#L1056-L1072) `get_all_aliases_for_detection()`.
+
+The SQL correctly filters: `WHERE ($1::UUID IS NULL OR v.user_id = $1)`. Admins pass `None` (global visibility), clients pass their `user_id` (tenant-scoped). **This is correct.**
+
+### 1B. ✅ Post-Detection Ownership Enforcement
+
+[main.py:1403](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/main.py#L1403): After auto-detection, `assert_vendor_access()` is called on the detected vendor. A client cannot ingest into a vendor they don't own even if aliases match. **This is correct.**
+
+### 1C. ⚠️ MEDIUM — `delete_vendor` Doesn't Clean Up Spatial Memory or Layout Boxes
+
+[db.py:989–998](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/db.py#L989-L998): `delete_vendor()` deletes `extractions` and `documents` but does **not** delete:
+- `vendor_aliases`
+- `spatial_memory`
+- `qwen_layout_boxes`
+- `templates`
+- `gold_examples`
+
+These orphaned rows won't cause data leaks (they're keyed by `vendor_id`), but they waste storage and could confuse if the same `vendor_id` string is reused.
+
+> **Fix**: Add explicit deletes for all 5 dependent tables inside the transaction.
+
+### 1D. ⚠️ MEDIUM — `list_vendor_aliases` Has No Tenant Filter
+
+[db.py:1023–1046](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/db.py#L1023-L1046): When `vendor_id=None`, `list_vendor_aliases()` returns **all** aliases globally. If exposed to a client endpoint, this leaks other tenants' patterns.
+
+The API endpoint in `main.py` does call `assert_vendor_access()` before listing, so this is safe **today**. But the DB function itself is unsafe for reuse without a `user_id` filter.
+
+> **Fix**: Add optional `user_id` parameter with `JOIN vendors v … WHERE v.user_id = $1` when listing all aliases.
+
+---
+
+## 2. Subscription / Quota Enforcement
+
+### 2A. ✅ Soft-Limit Model Is Correctly Implemented
+
+[main.py:1199–1262](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/main.py#L1199-L1262): The ingestion endpoint checks `u_used >= u_limit` and raises HTTP 402. The request that **pushed** usage to/past the limit was allowed through; every subsequent request is blocked. Admins are exempt. **This is the documented soft-limit model, correctly implemented.**
+
+### 2B. 🔴 CRITICAL — Billable Pages Count Survives Extraction Deletion
+
+[db.py:1805–1812](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/db.py#L1805-L1812): `delete_extraction()` runs `DELETE FROM extractions WHERE id = $1`.
+
+[db.py:2456–2496](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/db.py#L2456-L2496): `get_user_billable_pages()` counts `DISTINCT (lu.extraction_id, lu.page_num)` from `llm_usage`.
+
+**Problem**: Deleting an extraction does NOT delete its `llm_usage` rows. The billable page count remains inflated permanently. Users who delete failed/test extractions will still be billed for those pages.
+
+This is **by design for audit integrity** but is **not communicated** to users. No admin recourse exists to adjust billable counts.
+
+> **Fix**: Either (a) cascade-delete `llm_usage` rows when an extraction is deleted, OR (b) add an admin endpoint to manually adjust/credit billable pages, OR (c) document this clearly in the UI with a warning before deletion.
+
+### 2C. ⚠️ MEDIUM — Overage Display Shows Wrong Sign
+
+[main.py:1221](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/main.py#L1221):
+```python
+overage = u_limit - u_used  # negative number, e.g. -3
+```
+
+The variable is named `overage` but the value is actually `remaining` (negative when over). The error message says "Overage: -3 pages" which is confusing. Should be `overage = u_used - u_limit` for a positive overage number.
+
+> **Fix**: `overage = u_used - u_limit` and update the message string.
+
+---
+
+## 3. Digital/Scanned Page Routing & Billing
+
+### 3A. ✅ Page-Level Classification Is Correct
+
+[worker.py:228–291](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/worker.py#L228-L291) (`_process_normalize`): Uses `geometry.compute_pdf_geometry()` which calls `pdf_extractor.page_is_digital()` per page. Each page gets independently classified. Mixed PDFs are handled correctly.
+
+[geometry.py:74–116](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/geometry.py#L74-L116): Falls back to `SOURCE_SCANNED` on any exception. **Robust.**
+
+### 3B. ✅ OCR Worker Correctly Skips Digital Pages
+
+[worker.py:409–461](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/worker.py#L409-L461): When all pages are digital, PaddleOCR is skipped entirely. Digital `word_geometry` is promoted to `ocr_data` directly. **Correct.**
+
+### 3C. 🔴 CRITICAL — Billable Pages = `len(pages)` Regardless of Success
+
+[worker.py:780](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/worker.py#L780):
+```python
+"billable_pages": len(pages),
+```
+
+All pages are counted as billable even if some failed LLM extraction (returned `_error`). The `llm_usage` table correctly records only successful calls, but the `page_logger` CSV/JSON counts all pages.
+
+This creates a **discrepancy** between `page_logger` billing and `llm_usage` billing. The `get_user_billable_pages()` function uses `llm_usage` (correct), but admin reports using the page log will show inflated numbers.
+
+> **Fix**: Change to `"billable_pages": _extracted` (the count of pages without `_error`).
+
+### 3D. ⚠️ MEDIUM — `_process_ocr` Loads ALL Page Images Even When Only Some Need OCR
+
+[worker.py:471](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/worker.py#L471):
+```python
+all_pages_loaded = await _load_pages(pool, extraction_id)
+```
+
+This loads **every** page image from object storage (including digital pages), then filters. For a 50-page PDF with 48 digital pages and 2 scanned, this unnecessarily downloads 48 images.
+
+> **Fix**: Load only pages matching `scanned_set` from the store.
+
+---
+
+## 4. Review-to-Hint Feedback Loop
+
+### 4A. ✅ Gold Examples Are Value-Redacted
+
+[extractor.py:99–120](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/extractor.py#L99-L120): `_safe_gold_correction_hints()` strips all old/corrected values and returns only field-level hints like "reviewer replaced the extracted value". **This correctly prevents value leakage per AGENTS.md §2–3.**
+
+### 4B. ✅ Spatial Memory Saves Geometry, Not Values
+
+[spatial_memory.py:160–302](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/spatial_memory.py#L160-L302): `save_from_corrections()` persists only `normalized_box`, `page_number`, `source_engine`. No text values are stored. On reuse, [spatial_memory.py:466–643](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/spatial_memory.py#L466-L643) `apply_to_extraction()` reads **current document words** inside the saved box. **This is correct.**
+
+### 4C. 🔴 CRITICAL — Spatial Memory `matched_text` in `field_locations` Persists Old Values
+
+[spatial_memory.py:628–634](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/spatial_memory.py#L628-L634):
+```python
+field_locations[field_key] = {
+    "page": page_num,
+    "box": pixel_box,
+    "strategy": "spatial_memory",
+    "confidence": "high",
+    "matched_text": current_text,  # ← current text, this is fine
+}
+```
+
+This stores the **current** text, which is correct. However, when `save_from_corrections()` runs next time on a *different* document, the review UI sends back `field_locations` that may contain `matched_text` from the **previous** document's spatial memory application. The `save_from_corrections()` function at [spatial_memory.py:241](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/spatial_memory.py#L241) correctly filters `strategy != "manual"`, so spatial-memory-applied locations **won't** be re-saved. **This is actually safe.** No bug here upon deeper analysis.
+
+### 4D. 🔴 CRITICAL — Qwen Layout Boxes Overwrite Manual Spatial Memory
+
+[worker.py:692–743](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/worker.py#L692-L743): Every extraction saves page 1 boxes to `qwen_layout_boxes` via `upsert_qwen_layout_boxes()`.
+
+[worker.py:869–903](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/worker.py#L869-L903) (`_process_postprocess`): `build_field_locations_from_layout()` runs **before** spatial memory apply.
+
+[worker.py:922–962](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/worker.py#L922-L962): Spatial memory runs **after** and overrides Qwen locations.
+
+**This ordering is correct**: spatial memory takes priority. However, the `field_locations` dict is first populated by Qwen anchors (strategy=`qwen_anchor`), then spatial memory overwrites specific fields (strategy=`spatial_memory`). If spatial memory has no words in the saved box (< 2 chars), **Qwen's location stays**. This means the UI shows the Qwen label box, not the value box the user previously selected. 
+
+This is **acceptable behavior** (fallback to Qwen when spatial memory finds nothing), but it can be confusing if the user expects their correction to persist permanently.
+
+### 4E. ⚠️ LOW — `layout_key` Doesn't Discriminate Multi-Layout Vendors
+
+[layout_key.py:21–45](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/layout_key.py#L21-L45): The key is just `{vendor_id}:{template_id}`. If a vendor sends documents with different physical layouts but the same template, spatial memory from layout A will apply to layout B.
+
+Per AGENTS.md, this is a known Phase 1 limitation. The comment in the file acknowledges this.
+
+> **Recommendation**: Add anchor-hash-based layout discrimination in Phase 2.
+
+---
+
+## 5. Pipeline Reliability & Error Handling
+
+### 5A. 🔴 CRITICAL — OCR and LLM Jobs Run in Parallel Without Coordination Guard
+
+[worker.py:370–384](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/worker.py#L370-L384): After normalize, both `ocr` and `llm` jobs are enqueued simultaneously:
+```python
+await db_mod.ensure_job(pool, extraction_id, document["id"], "ocr", ...)
+await db_mod.ensure_job(pool, extraction_id, document["id"], "llm", ...)
+```
+
+Both can finish independently. `_maybe_enqueue_postprocess()` is called at the end of **both** `_process_ocr` and `_process_llm`. It checks `is_postprocess_ready()` which requires both `result IS NOT NULL AND ocr_data IS NOT NULL`.
+
+[db.py:1728–1743](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/db.py#L1728-L1743): The check is a simple SELECT. There is a **race condition**: if both workers finish within milliseconds of each other, both could see the "ready" state and both could enqueue a postprocess job.
+
+**However**, `ensure_job()` uses `ON CONFLICT ... DO NOTHING` with a unique constraint on `(extraction_id, job_type) WHERE status IN ('queued', 'running')`, so only one postprocess job will actually be created. **This is safe** due to the DB constraint.
+
+### 5B. 🔴 CRITICAL — Dead Code After `raise HTTPException` in Resume/Cancel
+
+[main.py:972–976](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/main.py#L972-L976): Code after `raise HTTPException(410, ...)` in `cancel_extraction()` is unreachable. Same at [main.py:988](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/main.py#L988) in `resume_extraction()`.
+
+This is **not a bug** (these are deprecated endpoints that correctly return 410). The dead code is harmless but should be cleaned up.
+
+### 5C. 🔴 CRITICAL — `_process_llm` Logs `source` from Image Metadata, Not Page Table
+
+[worker.py:781–782](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/worker.py#L781-L782):
+```python
+"digital_pages": sum(1 for p in pages if p.get("source") == "pypdfium"),
+"scanned_pages": sum(1 for p in pages if p.get("source") == "paddleocr"),
+```
+
+The `pages` variable here comes from `_load_pages()` which loads from object storage + pages table. The `source` field is set from the pages table ([worker.py:140](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/worker.py#L140)). 
+
+**Problem**: Pages with `source=None` (old extractions, migration gaps) are counted as neither digital nor scanned. The sum doesn't equal `total_pages`. This affects page_logger accuracy but not billing.
+
+> **Fix**: Default `source` to `"paddleocr"` when `None`: `p.get("source") or "paddleocr"`.
+
+### 5D. ⚠️ LOW — No Timeout on Stale SSE Connections
+
+[main.py:1529–1588](file:///c:/Users/aigroup5/PycharmProjects/Augemented_OCR_PaddleOCR_VL/backend/main.py#L1529-L1588): The SSE stream `_generate()` polls every 1 second with no maximum duration. If a job gets stuck in a non-terminal state (e.g., `processing` with a dead worker), the connection stays open forever.
+
+> **Fix**: Add a `max_duration` timeout (e.g., 30 minutes) that sends a `timeout` event and closes.
+
+---
+
+## Summary Table
+
+| # | Severity | Module | Issue | Impact |
+|---|----------|--------|-------|--------|
+| 2B | 🔴 Critical | db.py | Billable pages survive extraction deletion | Phantom billing |
+| 3C | 🔴 Critical | worker.py | `billable_pages` counts failed pages in page_logger | Inflated admin reports |
+| 5C | 🔴 Critical | worker.py | `source=None` pages uncounted in digital/scanned split | Incorrect audit logs |
+| 2C | ⚠️ Medium | main.py | Overage calculation shows wrong sign | Confusing error message |
+| 1C | ⚠️ Medium | db.py | `delete_vendor` leaves orphaned spatial_memory/aliases | Storage waste |
+| 1D | ⚠️ Medium | db.py | `list_vendor_aliases()` has no tenant filter | Potential leak if reused |
+| 3D | ⚠️ Medium | worker.py | OCR loads all page images, not just scanned | Unnecessary I/O |
+| 4E | ⚠️ Low | layout_key.py | No multi-layout discrimination | Phase 1 limitation |
+| 5B | ⚠️ Low | main.py | Dead code after deprecated endpoint raises | Cleanup needed |
+| 5D | ⚠️ Low | main.py | No SSE connection timeout | Resource leak risk |
+
+> **Next Steps**: Prioritize fixes for items 2B (phantom billing), 3C (page_logger accuracy), and 2C (overage sign). Items 1C and 3D are quality-of-life improvements for the next sprint.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+gemini cli review: 
+
+
+
+Codebase Audit Report
+Date: 13 May 2026
+
+1. Extraction Pipeline (PDFs, OCR, & Qwen)
+---------------------------------------------------------
+What is happening:
+- Vendor detection acts as a hard stop (vendor_detector.py) by reading only the first page.
+- Digital vs. Scanned detection uses pypdfium2 with a 50-character threshold (more robust than strict "0 words") before falling back to PaddleOCR.
+- Qwen sequentially processes pages (PARALLEL_BATCH=1). Page 1 is used for vendor verification + boxes; Page 2+ for fields only.
+- merge_results in extractor.py correctly consolidates multi-page JSONs.
+
+Where it is wrong (Bugs & Risks):
+- Context Window Risk: Page 1 prompts are massive. Combined with high-res images and a 6000 max token output limit, you risk exceeding the 8192 llama.cpp context window for dense invoices.
+- Single Page Format Fallback: If a template is set to single_page but a client uploads a multi-page PDF, the system silently falls back to single_po_multipage logic instead of raising an error or hard-stopping.
+
+2. Review System & Spatial Memory
+---------------------------------------------------------
+What is happening:
+- The system captures PyPDFium2/PaddleOCR bounding boxes of selected areas in the UI and stores them as Spatial Memory.
+- In future runs, worker.py applies these overrides *after* Qwen finishes its extraction.
+
+Where it is wrong (Bugs & Errors):
+- Hint Redaction Bug: backend/extractor.py redacts all historical values in the Qwen hints for security purposes (using _safe_gold_correction_hints). This breaks the spec which states hints should be passed as "original: X, corrected: Y". Typed corrections are logged but not effective as LLM hints.
+- Key vs. Value Selection Vulnerability: No validation exists in review.js or spatial_memory.py to prevent a user from selecting a Key/Label box instead of a Value box. Doing so breaks future extractions by mapping the label text to the field value.
+- Line Items UI Gap: The backend correctly restricts reusable spatial memory to header fields. However, the frontend (review.js) allows users to drag-and-drop on line-item fields without any warning that these selections will not be saved for future documents.
+- Fragile Box Extraction: spatial_memory.py uses a fragile "word center point" check (_words_in_box). If a user makes a very tight selection, future extractions might miss characters because the center point of the word bounding box falls slightly outside the user's saved box.
+
+3. Dashboard, Subscriptions & Isolation
+---------------------------------------------------------
+What is happening:
+- Data isolation is strictly enforced via JWT and user_id filtering at the database layer (db.py).
+- The Template page correctly handles configurations and hides the 4 system prompt components from non-admin clients.
+
+Where it is wrong (Bugs & Errors):
+- Overage Logic Flaw: The subscription logic in ingest_document checks `u_used >= u_limit`. If a client has a limit of 1000 and has used exactly 1000, it hard stops. A strict interpretation of the spec ("allow the upload that pushes them negative, stop on the *next* upload after going negative") means it should technically allow an upload if `u_used == u_limit`, and only stop when `u_used > u_limit`.
+- Missing Dashboard Metrics: The client dashboard displays total usage but lacks a "Remaining Pages" or "Negative Balance" KPI.
+- Date Ranges Ignored: The frontend does not send date ranges to get_user_stats or get_admin_stats, even though the backend database queries actually support date filtering.
+
+4. Hidden Functions / Undocumented Features
+---------------------------------------------------------
+- /upload-preview Endpoint: An endpoint in main.py that allows rendering and viewing PDF pages without starting an extraction job or charging page limits.
+- /detect-vendor Endpoint: An isolated endpoint that attempts to auto-detect a vendor from Page 1 text without requiring a full document ingestion.
+- Real-Time Job Streaming: There is an SSE (Server-Sent Events) endpoint at /jobs/{job_id}/stream designed to stream extraction progress to the frontend in real-time.
+- Unused system_prompt DB Column: The templates table has a system_prompt column that gets populated when saved, but worker.py completely ignores it, choosing instead to rebuild the 4 prompt components dynamically from the template fields on every run.
+- Gold Corrections Endpoint: /vendors/{vendor_id}/gold-corrections exists to pull the latest historical manual corrections to display as warnings/hints in the UI before a user overrides them again.
+
+
+
+
+
+
+
+
+
+
+
+
+opencode review: 
+
+Comprehensive Code Audit Report
+Based on my deep dive into your codebase, here's a detailed analysis of what's implemented vs. what's needed:
+---
+1. VENDORS PAGE ✅
+Current Implementation:
+- backend/db.py - vendors table with id, name, user_id, created_at
+- backend/vendor_detector.py - uses exact match first, then fuzzy match
+- Auto-creates vendor alias from vendor name in main.py:617-620
+- Frontend vendors.js - create/delete vendors with modal
+Issues Found:
+1. No mandatory vendor ID validation - Users can create any vendor ID, but detection uses exact match on aliases only (not vendor_id directly)
+2. vendor_detector.py - Uses both exact AND fuzzy matching. The requirement says "exact match in which is used vendor detector.py". Currently fuzzy is fallback.
+Functions you may not be aware of:
+- db.get_all_aliases_for_detection() - loads aliases for detection
+- db.insert_vendor_alias() - creates aliases for vendors  
+- db.delete_vendor_alias() - removes aliases
+---
+2. TEMPLATE PAGE ⚠️ (Partial)
+Current Implementation:
+- Format types: single_po_multipage, po_per_page, single_page
+- Header fields, line item fields, prompt instructions, extraction rules
+- Vendor aliases management
+- Admin sees 4 prompts (page1 system/user, page2+ system/user) in main.py:761-816
+Issues Found:
+1. No mandatory field validation - Users can save template without any fields. Should enforce at least one header field.
+2. System prompt visibility - Admin-only, clients can't see. ✅ Correctly implemented.
+Functions you may not be aware of:
+- extractor.build_system_prompt() - builds prompt with gold examples
+- extractor.build_user_message() - builds per-page user message
+- extractor.compute_prompt_hash() - caches prompts
+- db.upsert_template() - saves template to DB
+---
+3. EXTRACTION PAGE - WORKFLOW ✅
+Current Implementation:
+- backend/geometry.py - Unified geometry for digital/scanned
+- backend/pdf_extractor.py - pypdfium2 word extraction  
+- backend/ocr_runner.py - PaddleOCR with return_word_box=True
+- Vendor detection in main.py:1289-1418 (reads page 1 only)
+- Unknown vendor returns 409 with "create vendor first" error ✅
+- Mixed PDF support via merge_scanned_into_geometry() ✅
+Edge Cases Handled:
+- Page-level routing: digital pages use pypdfium, scanned fallback to PaddleOCR ✅
+- Zero-word detection triggers OCR fallback ✅
+Functions you may not be aware of:
+- geometry.compute_pdf_geometry() - main entry for PDF geometry
+- geometry.merge_scanned_into_geometry() - merges OCR into base geometry
+- geometry.image_page_geometry() - for non-PDF images
+- pdf_extractor.page_is_digital() - detects if page has embedded text
+- pdf_extractor.compute_scale() - calculates render scale
+---
+4. QWEN BOUNDING BOX ✅ (Fixed)
+Current Implementation:
+- docs/qwen_bbox_github_issue.md documents the fix
+- Two-step mapping through 32-pixel aligned dimensions
+- backend/qwen_layout_apply.py - applies layout boxes
+Issue was:
+- Model returns 0-1000 coordinates relative to aligned image (multiples of 32)
+- Need to map through aligned dimensions, not original
+This is correctly implemented now.
+---
+5. REVIEW SYSTEM ⚠️ (Partial)
+Current Implementation:
+- frontend/review.js - drag-select rectangles
+- Stores field_locations with bounding boxes ✅
+- Stores corrected_result for values ✅
+- Uses PaddleOCR for word geometry (_rvOcrData)
+- Spatial memory table exists (backend/db.py:317-333)
+Issues Found:
+1. No UI warning for manual typed values - If user manually edits a field without drag-select, no warning that bounding box won't be saved
+2. User selection validation - No validation that user selected VALUE area, not KEY area. Could result in "ship_to": "ship_to"
+3. Line item spatial memory - Currently restricted but need to verify it's only column headers, not row values
+4. Correction hints - Gold examples are created but need to verify hints are properly used in prompts
+Functions you may not be aware of:
+- db.upsert_spatial_memory() - saves spatial memory
+- db.get_spatial_memory_for_layout() - loads spatial memory
+- db.get_qwen_layout_boxes() - gets Qwen-learned boxes
+- db.get_latest_gold_correction_fields() - gets correction fields for UI
+---
+6. HISTORY PAGE ✅
+Current Implementation:
+- frontend/history.js - shows date, pages, status, latency, review button
+- Delete functionality with deleteExtractionSafe()
+Critical Issue Found:
+- Token/billable pages NOT affected by deletion - get_user_billable_pages() counts from llm_usage table, which is NOT deleted when extraction is deleted. This is actually CORRECT behavior per your note - billable pages persist even after history deletion.
+---
+7. DASHBOARD ✅
+Current Implementation:
+- frontend/dashboard.js - admin sees all users, clients see own data only
+- Bar chart and pie chart for tokens
+- Proper tenant isolation via user_id filtering
+Functions you may not be aware of:
+- db.get_usage_stats() - aggregate usage for dashboard
+- db.get_llm_usage_daily_summary() - daily breakdown
+- db.get_usage_by_client() - per-client aggregation
+---
+8. SUBSCRIPTION LIMITS ❌ (Wrong Implementation)
+Current Code (main.py:1211-1237):
+if u_used >= u_limit:  # HARD STOP
+    raise HTTPException(status_code=402, ...)
+Required Behavior:
+- limit=1000, used=998, upload 5 pages → ALLOW (goes to 1003, -3 remaining)
+- Next upload after negative → HARD STOP
+Bug: Current implementation hard stops immediately when hitting limit, doesn't allow the request that pushes over.
+---
+9. USER/SUBSCRIPTION MANAGEMENT ✅
+Current Implementation:
+- main.py:563-581 - admin can update subscription limit
+- db.update_user_subscription_limit() - updates the limit
+- db.get_user_billable_pages() - tracks usage
+All correctly implemented.
+---
+Summary of Gaps
+Feature	Status
+Vendor detection (exact match)	⚠️
+Template mandatory fields	❌
+System prompt hiding	✅
+Digital/Scanned routing	✅
+Mixed PDF support	✅
+Unknown vendor blocking	✅
+Qwen bbox alignment	✅
+Review drag-select	⚠️
+Manual edit warning	❌
+History deletion (tokens)	✅
+Dashboard isolation	✅
+Subscription soft limit	❌
+---
+Additional Functions You May Not Know About
+1. db.get_latest_gold_correction_fields() - Get latest corrections per field for UI warnings
+2. db.upsert_qwen_layout_boxes() - Store Qwen-learned boxes
+3. db.delete_stale_qwen_layout_boxes() - Clean up removed template fields
+4. db.delete_stale_spatial_memory() - Clean up removed fields
+5. layout_key.compute_layout_key() - Creates layout fingerprint for spatial memory
+6. extractor._safe_gold_correction_hints() - Creates value-redacted hints (no old values leaked)
+7. page_logger.log_limit_alert() - Logs quota warnings
+8. geometry.image_page_geometry() - Returns scanned-source placeholder for non-PDFs

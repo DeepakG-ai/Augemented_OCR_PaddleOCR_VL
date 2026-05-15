@@ -13,14 +13,12 @@ from dataclasses import dataclass, field
 
 from rapidfuzz import fuzz
 
-if __package__:
-    from . import db as db_mod
-else:
-    import db as db_mod  # type: ignore[no-redef]
+from . import db as db_mod
 
 logger = logging.getLogger("vendor_detector")
 
 MIN_SCORE = 1
+EXACT_MIN_MARGIN = 1.0
 FUZZY_MIN_SCORE = 88.0
 FUZZY_MIN_MARGIN = 5.0
 FUZZY_MIN_PATTERN_CHARS = 5
@@ -116,9 +114,25 @@ async def _load_detection_aliases(pool, user_id: str | None = None) -> list[dict
                 "vendor_name": v["name"],
                 "pattern": v["name"],
                 "weight": 1,
+                "source": "vendor_name",
             }
         )
     return aliases
+
+
+def _is_strong_exact_match(alias: dict, pattern: str) -> bool:
+    """Return True when an exact match is distinctive enough to identify a vendor."""
+    if len(pattern.split()) > 1:
+        return True
+
+    vendor_name = _normalize_text(str(alias.get("vendor_name") or ""))
+    source = str(alias.get("source") or "").lower()
+    if source in {"vendor_name", "auto_from_name"} and pattern == vendor_name:
+        return True
+
+    # Some tests and older query rows may not include source. Still treat a
+    # one-token full vendor name, such as "Ferguson", as strong.
+    return bool(vendor_name and pattern == vendor_name)
 
 
 def _detect_exact(aliases: list[dict], text_blob: str) -> VendorMatch | None:
@@ -127,7 +141,14 @@ def _detect_exact(aliases: list[dict], text_blob: str) -> VendorMatch | None:
         variants = _alias_variants(alias["pattern"])
         if not variants:
             continue
-        matched_pattern = next((pattern for pattern in variants if pattern in text_blob), None)
+        matched_pattern = next(
+            (
+                pattern
+                for pattern in variants
+                if re.search(r"(?<![a-z0-9])" + re.escape(pattern) + r"(?![a-z0-9])", text_blob)
+            ),
+            None,
+        )
         if not matched_pattern:
             continue
 
@@ -137,14 +158,37 @@ def _detect_exact(aliases: list[dict], text_blob: str) -> VendorMatch | None:
                 "vendor_name": alias["vendor_name"],
                 "score": 0.0,
                 "matched_patterns": [],
+                "strong_patterns": [],
+                "weak_patterns": [],
             }
         scores[vid]["score"] += float(alias.get("weight", 1))
         scores[vid]["matched_patterns"].append(matched_pattern)
+        if _is_strong_exact_match(alias, matched_pattern):
+            scores[vid]["strong_patterns"].append(matched_pattern)
+        else:
+            scores[vid]["weak_patterns"].append(matched_pattern)
 
     if not scores:
         return None
 
-    best_vid = max(scores, key=lambda v: scores[v]["score"])
+    supported_scores: dict[str, dict] = {}
+    for vid, data in scores.items():
+        vendor_tokens = set(_normalize_text(str(data["vendor_name"])).split())
+        weak_vendor_name_tokens = {p for p in data["weak_patterns"] if p in vendor_tokens}
+        if data["strong_patterns"] or len(weak_vendor_name_tokens) >= 2:
+            supported_scores[vid] = data
+            continue
+        logger.warning(
+            "Ignoring weak exact vendor match for '%s' from single-token alias(es) %s",
+            vid,
+            data["weak_patterns"],
+        )
+
+    if not supported_scores:
+        return None
+
+    ranked = sorted(supported_scores.items(), key=lambda item: item[1]["score"], reverse=True)
+    best_vid, best = ranked[0]
     best = scores[best_vid]
     if best["score"] < MIN_SCORE:
         logger.info(
@@ -155,6 +199,27 @@ def _detect_exact(aliases: list[dict], text_blob: str) -> VendorMatch | None:
         )
         return None
 
+    if len(ranked) > 1:
+        second_vid, second = ranked[1]
+        margin = best["score"] - second["score"]
+        if margin < EXACT_MIN_MARGIN:
+            logger.warning(
+                "Ambiguous exact vendor match: %s=%.1f, %s=%.1f (margin %.1f < %.1f)",
+                best_vid,
+                best["score"],
+                second_vid,
+                second["score"],
+                margin,
+                EXACT_MIN_MARGIN,
+            )
+            return None
+
+    if best["weak_patterns"]:
+        logger.warning(
+            "Exact match for vendor '%s' included weak single-token alias evidence %s",
+            best_vid,
+            best["weak_patterns"],
+        )
     logger.info(
         "Vendor detected by exact match: %s (score=%.1f, patterns=%s)",
         best_vid,
@@ -174,6 +239,8 @@ def _detect_fuzzy(aliases: list[dict], text_blob: str) -> VendorMatch | None:
     best_by_vendor: dict[str, dict] = {}
     for alias in aliases:
         for pattern in _alias_variants(alias["pattern"]):
+            if len(pattern.split()) == 1 and not _is_strong_exact_match(alias, pattern):
+                continue
             raw_score, window = _best_window_score(pattern, text_blob)
             if not window:
                 continue

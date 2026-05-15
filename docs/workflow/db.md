@@ -125,7 +125,7 @@ CREATE TABLE IF NOT EXISTS extractions (
     ocr_data            JSONB,           -- unified per-page geometry (digital + scanned)
     corrected_result    JSONB,           -- after manual review
     correction_meta     JSONB,           -- metadata about the corrections applied
-    export_object_key   TEXT,            -- MinIO key for the .xlsx export
+    export_object_key   TEXT,            -- legacy export key, currently unused
     progress            JSONB,           -- live progress {stage, message, page, total_pages}
     cancel_requested    BOOLEAN NOT NULL DEFAULT FALSE,
     status              TEXT DEFAULT 'pending',  -- pending|processing|done|failed|partial|cancelled
@@ -244,7 +244,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     id               SERIAL PRIMARY KEY,
     extraction_id    INT REFERENCES extractions(id) ON DELETE CASCADE,
     document_id      INT REFERENCES documents(id) ON DELETE CASCADE,
-    job_type         TEXT NOT NULL,    -- normalize|ocr|llm|postprocess|outbound
+    job_type         TEXT NOT NULL,    -- normalize|ocr|llm|postprocess
     status           TEXT NOT NULL DEFAULT 'queued',  -- queued|running|done|failed
     payload          JSONB,             -- arbitrary stage-specific data
     progress         JSONB,             -- live progress for SSE
@@ -286,26 +286,6 @@ CREATE TABLE IF NOT EXISTS review_events (
 ```
 
 Append-only log. Every save in the review page produces one row. Useful for retrospective debugging ("why was this field changed?") and for training data export.
-
-### `integration_deliveries` — outbound exports
-```sql
-CREATE TABLE IF NOT EXISTS integration_deliveries (
-    id              SERIAL PRIMARY KEY,
-    extraction_id   INT REFERENCES extractions(id) ON DELETE CASCADE,
-    contract_type   TEXT NOT NULL,        -- e.g. "purchase_order.v1"
-    target_type     TEXT NOT NULL,        -- "excel" | "csv"
-    status          TEXT NOT NULL DEFAULT 'pending',
-    payload         JSONB,                -- full contract object
-    object_key      TEXT,                 -- MinIO key for the rendered file
-    error           TEXT,
-    created_at      TIMESTAMPTZ DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE UNIQUE INDEX integration_deliveries_unique_target_idx
-    ON integration_deliveries (extraction_id, contract_type, target_type);
-```
-
-`upsert_delivery` uses the unique index for idempotency. Re-running the outbound stage updates the existing row instead of creating a duplicate.
 
 ### `llm_usage` — token accounting
 ```sql

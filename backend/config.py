@@ -24,12 +24,12 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://augocr:augocr@localhost:5
 # ---------------------------------------------------------------------------
 LLM_URL              = os.getenv("LLM_URL",   "http://localhost:8001/v1/chat/completions")
 LLM_MODEL            = os.getenv("LLM_MODEL", "qwen3vl")
-LLM_TEMPERATURE      = float(os.getenv("LLM_TEMPERATURE",      "0.1"))
-LLM_TOP_P            = float(os.getenv("LLM_TOP_P",            "0.8"))
-LLM_PRESENCE_PENALTY = float(os.getenv("LLM_PRESENCE_PENALTY", "1.5"))
-LLM_MAX_TOKENS_FIELDS = int(os.getenv("LLM_MAX_TOKENS_FIELDS", "6000"))  # fields extraction
-LLM_MAX_TOKENS_BBOX   = int(os.getenv("LLM_MAX_TOKENS_BBOX",   "1500"))  # bbox-agent only
-LLM_TIMEOUT           = float(os.getenv("LLM_TIMEOUT",          "300"))   # seconds per LLM HTTP call
+LLM_TEMPERATURE      = float(os.getenv("LLM_TEMPERATURE",      "0.6"))
+LLM_TOP_P            = float(os.getenv("LLM_TOP_P",            "0.95"))
+LLM_PRESENCE_PENALTY = float(os.getenv("LLM_PRESENCE_PENALTY", "1.0"))
+LLM_MAX_TOKENS_FIELDS = int(os.getenv("LLM_MAX_TOKENS_FIELDS", "6000"))
+LLM_MAX_TOKENS_BBOX   = int(os.getenv("LLM_MAX_TOKENS_BBOX",   "1500"))
+LLM_TIMEOUT           = float(os.getenv("LLM_TIMEOUT",          "300"))
 
 # ---------------------------------------------------------------------------
 # Worker
@@ -46,11 +46,11 @@ MAX_UPLOAD_BYTES      = MAX_UPLOAD_MB * 1024 * 1024
 # ---------------------------------------------------------------------------
 # PDF / image processing
 # ---------------------------------------------------------------------------
-MAX_LONG_SIDE_PX = int(os.getenv("MAX_LONG_SIDE_PX", "1344"))
-MAX_PIXELS       = int(os.getenv("MAX_PIXELS",       str(1344 * 1344)))
-JPEG_QUALITY     = int(os.getenv("JPEG_QUALITY",     "90"))
+MAX_LONG_SIDE_PX = int(os.getenv("MAX_LONG_SIDE_PX", "960"))
+MAX_PIXELS       = int(os.getenv("MAX_PIXELS",       str(960 * 720)))   # 691,200 px
+JPEG_QUALITY     = int(os.getenv("JPEG_QUALITY",     "92"))
 DPI_FLOOR        = int(os.getenv("DPI_FLOOR",        "96"))
-DPI_DEFAULT      = int(os.getenv("DPI_DEFAULT",      "150"))
+DPI_DEFAULT      = int(os.getenv("DPI_DEFAULT",      "120"))
 PDF_WORKERS      = int(os.getenv("PDF_WORKERS",      "2"))
 
 # ---------------------------------------------------------------------------
@@ -62,24 +62,19 @@ MINIO_SECRET_KEY       = os.getenv("MINIO_SECRET_KEY",       "minioadmin")
 MINIO_SECURE           = os.getenv("MINIO_SECURE", "false").lower() in {"1", "true", "yes", "on"}
 MINIO_DOCUMENTS_BUCKET = os.getenv("MINIO_DOCUMENTS_BUCKET", "augocr-documents")
 MINIO_ARTIFACTS_BUCKET = os.getenv("MINIO_ARTIFACTS_BUCKET", "augocr-artifacts")
-MINIO_EXPORTS_BUCKET   = os.getenv("MINIO_EXPORTS_BUCKET",   "augocr-exports")
 LOCAL_OBJECT_STORE_DIR = Path(os.getenv("LOCAL_OBJECT_STORE_DIR", ".local_object_store"))
 
 # ---------------------------------------------------------------------------
-# Phoenix tracing (OpenTelemetry)
+# MLflow observability
 # ---------------------------------------------------------------------------
-PHOENIX_ENABLED            = os.getenv("PHOENIX_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
-PHOENIX_COLLECTOR_ENDPOINT = os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:4317")
+MLFLOW_ENABLED      = os.getenv("MLFLOW_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
 
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-LOG_LEVEL                 = os.getenv("LOG_LEVEL", "INFO").upper()
-PIPELINE_LOG_DIR          = Path(os.getenv("PIPELINE_LOG_DIR", "logs/pipeline"))
-PIPELINE_LOG_MAX_BYTES    = int(os.getenv("PIPELINE_LOG_MAX_BYTES",    str(25 * 1024 * 1024)))
-PIPELINE_LOG_BACKUP_COUNT = int(os.getenv("PIPELINE_LOG_BACKUP_COUNT", "10"))
-PIPELINE_LOG_VALUES       = os.getenv("PIPELINE_LOG_VALUES", "1").lower() not in {"0", "false", "no"}
-PIPELINE_LOG_VALUE_LIMIT  = int(os.getenv("PIPELINE_LOG_VALUE_LIMIT", "160"))
+LOG_LEVEL        = os.getenv("LOG_LEVEL", "INFO").upper()
+PIPELINE_LOG_DIR = Path(os.getenv("PIPELINE_LOG_DIR", "logs/pipeline"))
 
 # ---------------------------------------------------------------------------
 # Subscription / page limits

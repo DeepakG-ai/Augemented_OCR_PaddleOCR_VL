@@ -3,10 +3,28 @@
 // ══════════════════════════════════════════════════════════════════════
 // PAGE 1: VENDORS
 // ══════════════════════════════════════════════════════════════════════
+let _vendorPageClients = [];
+
 async function renderVendorsPage(app) {
     let vendors = [];
     try { vendors = await apiJSON('/vendors'); } catch (e) { console.warn(e); }
     db.vendors = vendors;
+
+    const isAdmin = (getAuthUser() || {}).role === 'admin';
+    _vendorPageClients = [];
+    if (isAdmin) {
+        try {
+            const allUsers = await apiJSON('/admin/users');
+            _vendorPageClients = allUsers.filter(u => u.role === 'client' && u.is_active);
+        } catch (e) { console.warn(e); }
+    }
+
+    const bottomBarExtra = isAdmin && _vendorPageClients.length
+        ? _vendorPageClients.map(u => {
+            const count = vendors.filter(v => v.user_id === u.id).length;
+            return `<span style="margin-right:12px;color:var(--text-dim)">${escapeHtml(u.email.split('@')[0])}: <strong style="color:var(--text)">${count}</strong></span>`;
+          }).join('') + '<span style="margin-right:12px;color:var(--border)">|</span>'
+        : '';
 
     app.innerHTML = headerHTML() + `
     <div class="page-content">
@@ -15,11 +33,94 @@ async function renderVendorsPage(app) {
         <button class="add-vendor-btn" style="max-width:300px;margin-top:12px" onclick="openAddVendor()">+ Add New Vendor</button>
     </div>
     <div class="bottom-bar">
-        <span style="font-size:10px;color:var(--text-dim);letter-spacing:0.1em">${vendors.length} VENDOR${vendors.length !== 1 ? 'S' : ''} REGISTERED</span>
+        <span style="font-size:10px;letter-spacing:0.1em">${bottomBarExtra}<span style="color:var(--text-dim)">${vendors.length} VENDOR${vendors.length !== 1 ? 'S' : ''} REGISTERED</span></span>
     </div>` + vendorModalHTML();
 
-    renderVendorCards(vendors);
+    if (isAdmin) {
+        renderVendorCardsByClient(vendors, _vendorPageClients);
+    } else {
+        renderVendorCards(vendors);
+    }
     updateNavActive();
+}
+
+function renderVendorCardsByClient(vendors, clients) {
+    const c = document.getElementById('vendorCards');
+    if (!c) return;
+    if (!vendors.length) {
+        c.innerHTML = '<div style="color:var(--text-dim);padding:20px">No vendors yet. Add one to get started.</div>';
+        return;
+    }
+
+    const clientMap = {};
+    clients.forEach(u => { clientMap[u.id] = u.email; });
+
+    const groups = {};
+    vendors.forEach(v => {
+        const key = v.user_id || '__unassigned__';
+        if (!groups[key]) groups[key] = [];
+        groups[key].push(v);
+    });
+
+    const orderedKeys = clients.map(u => u.id).filter(k => groups[k]);
+    Object.keys(groups).forEach(k => { if (k !== '__unassigned__' && !orderedKeys.includes(k)) orderedKeys.push(k); });
+    if (groups['__unassigned__']) orderedKeys.push('__unassigned__');
+
+    const assignSelect = clients.length
+        ? `<select class="modal-input" id="assignClientSelect" style="font-size:10px;padding:2px 6px;height:24px;cursor:pointer">
+               ${clients.map(u => `<option value="${escapeHtml(u.id)}">${escapeHtml(u.email)}</option>`).join('')}
+           </select>`
+        : '';
+
+    c.innerHTML = orderedKeys.map(key => {
+        const groupVendors = groups[key];
+        const label = key === '__unassigned__' ? 'UNASSIGNED' : escapeHtml(clientMap[key] || key).toUpperCase();
+        const isUnassigned = key === '__unassigned__';
+        const vendorRows = groupVendors.map((v, i) => `
+            <div class="vendor-card" style="margin-left:16px;border-left:2px solid var(--border)">
+                <div class="vendor-card-info" onclick="navigate('#/template/${escapeInlineJsString(v.id)}')">
+                    <div class="vendor-card-name" style="font-size:11px">${i + 1}. ${escapeHtml(v.name)}</div>
+                    <div class="vendor-card-id">ID: ${escapeHtml(v.id)} · Created: ${new Date(v.created_at).toLocaleDateString()}</div>
+                </div>
+                <div class="vendor-card-actions">
+                    <a class="link-btn" href="#/template/${escapeHtml(v.id)}">⚙ Template</a>
+                    <a class="link-btn" href="#/extract" onclick="localStorage.setItem('extractVendor','${escapeInlineJsString(v.id)}')">▶ Extract</a>
+                    ${isUnassigned && assignSelect ? `<button class="small-btn" style="font-size:9px" onclick="event.stopPropagation();openAssignVendor('${escapeInlineJsString(v.id)}','${escapeInlineJsString(v.name)}')">Assign</button>` : ''}
+                    <button class="del-btn" onclick="event.stopPropagation();deleteVendor('${escapeInlineJsString(v.id)}','${escapeInlineJsString(v.name)}')">✕ Delete</button>
+                </div>
+            </div>
+        `).join('');
+        return `
+            <div style="margin-bottom:20px">
+                <div style="font-size:10px;font-weight:600;letter-spacing:0.12em;color:${isUnassigned ? 'var(--text-dim)' : 'var(--blue)'};padding:6px 0 4px;border-bottom:1px solid var(--border);margin-bottom:4px">
+                    ${label} <span style="font-weight:400;color:var(--text-dim)">(${groupVendors.length})</span>
+                </div>
+                ${vendorRows}
+            </div>
+        `;
+    }).join('');
+}
+
+function openAssignVendor(vendorId, vendorName) {
+    document.getElementById('assignVendorModal').classList.add('open');
+    document.getElementById('assignVendorTitle').textContent = `Assign "${vendorName}" to a client`;
+    document.getElementById('assignVendorId').value = vendorId;
+}
+
+async function submitAssignVendor() {
+    const vendorId = document.getElementById('assignVendorId').value;
+    const userId = document.getElementById('assignClientSelect').value;
+    if (!userId) return;
+    try {
+        await apiJSON(`/vendors/${vendorId}/owner`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user_id: userId }),
+        });
+        showToast('Vendor assigned');
+        closeModal('assignVendorModal');
+        router();
+    } catch (e) { showToast('Failed: ' + e.message); }
 }
 
 function renderVendorCards(vendors) {
@@ -54,6 +155,18 @@ async function deleteVendor(id, name) {
 }
 
 function vendorModalHTML() {
+    const isAdmin = (getAuthUser() || {}).role === 'admin';
+    const clientOptions = _vendorPageClients.map(u =>
+        `<option value="${escapeHtml(u.id)}">${escapeHtml(u.email)}</option>`
+    ).join('');
+    const clientField = isAdmin ? `
+        <div class="modal-field">
+            <label class="modal-label">Assign to Client</label>
+            <select class="modal-input" id="newVendorClient">
+                ${clientOptions || '<option value="">No clients yet</option>'}
+            </select>
+        </div>` : '';
+
     return `
     <div class="modal-overlay" id="vendorModal">
         <div class="modal">
@@ -66,9 +179,27 @@ function vendorModalHTML() {
                 <label class="modal-label">Vendor ID</label>
                 <input class="modal-input" id="newVendorId" placeholder="e.g. RS001" style="text-transform:uppercase">
             </div>
+            ${clientField}
             <div class="modal-actions">
                 <button class="modal-btn secondary" onclick="closeModal('vendorModal')">Cancel</button>
                 <button class="modal-btn primary" onclick="saveNewVendor()">Create Vendor</button>
+            </div>
+        </div>
+    </div>
+    <div class="modal-overlay" id="assignVendorModal">
+        <div class="modal">
+            <div class="modal-title">Assign Vendor</div>
+            <div id="assignVendorTitle" style="font-size:11px;color:var(--text-dim);margin-bottom:14px"></div>
+            <input type="hidden" id="assignVendorId">
+            <div class="modal-field">
+                <label class="modal-label">Client</label>
+                <select class="modal-input" id="assignClientSelect">
+                    ${clientOptions || '<option value="">No clients yet</option>'}
+                </select>
+            </div>
+            <div class="modal-actions">
+                <button class="modal-btn secondary" onclick="closeModal('assignVendorModal')">Cancel</button>
+                <button class="modal-btn primary" onclick="submitAssignVendor()">Assign</button>
             </div>
         </div>
     </div>`;
@@ -81,8 +212,12 @@ async function saveNewVendor() {
     const name = document.getElementById('newVendorName').value.trim().toUpperCase();
     const id = document.getElementById('newVendorId').value.trim().toUpperCase() || Math.random().toString(36).slice(2, 10).toUpperCase();
     if (!name) return;
+    const isAdmin = (getAuthUser() || {}).role === 'admin';
+    const clientEl = document.getElementById('newVendorClient');
+    const payload = { id, name };
+    if (isAdmin && clientEl && clientEl.value) payload.user_id = clientEl.value;
     try {
-        await apiJSON('/vendors', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, name }) });
+        await apiJSON('/vendors', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
         showToast(`Vendor ${name} created`);
     } catch (e) { showToast('Failed: ' + e.message); }
     closeModal('vendorModal');
@@ -308,30 +443,126 @@ async function renderSavedTemplatesPage(app) {
     let templates = [];
     try { templates = await apiJSON('/templates'); } catch (e) { console.warn(e); }
 
+    const isAdmin = (getAuthUser() || {}).role === 'admin';
+    let vendorClientMap = {};   // vendor_id → email
+    let clientOrder = [];
+    if (isAdmin) {
+        try {
+            const [vendors, users] = await Promise.all([apiJSON('/vendors'), apiJSON('/admin/users')]);
+            const userEmailMap = {};
+            users.forEach(u => { userEmailMap[u.id] = u.email; });
+            vendors.forEach(v => {
+                vendorClientMap[v.id] = v.user_id ? (userEmailMap[v.user_id] || 'Unassigned') : 'Unassigned';
+            });
+            clientOrder = users.filter(u => u.role === 'client' && u.is_active).map(u => u.email);
+        } catch (e) { console.warn(e); }
+    }
+
+    const fmtLabel = { single_po_multipage: 'MULTI-PAGE', po_per_page: 'PER-PAGE', single_page: 'SINGLE' };
+    const fmtColor = { single_po_multipage: 'var(--blue)', po_per_page: 'var(--green)', single_page: 'var(--amber,#e5c07b)' };
+
+    function _templateCard(t) {
+            const hf = t.header_fields || [];
+            const li = t.line_item_fields || [];
+            const rules = t.extraction_rules || [];
+            const fmt = fmtLabel[t.format_type] || t.format_type.toUpperCase();
+            const fmtC = fmtColor[t.format_type] || 'var(--text-dim)';
+            const hfChips = hf.map(f => `<span class="tag-chip" style="margin:2px 2px 2px 0;font-size:9px">${escapeHtml(f)}</span>`).join('');
+            const liChips = li.map(f => `<span class="tag-chip" style="margin:2px 2px 2px 0;font-size:9px;background:var(--green-bg,rgba(152,195,121,.08));border-color:var(--green,#98c379);color:var(--green,#98c379)">${escapeHtml(f)}</span>`).join('');
+            const rulesPreview = rules.length
+                ? rules.map(r => `<div style="font-size:9px;color:var(--text-dim);line-height:1.5;padding-left:6px;border-left:2px solid var(--border)">— ${escapeHtml(r)}</div>`).join('')
+                : '<div style="font-size:9px;color:var(--text-dim)">No rules</div>';
+
+            return `
+            <div style="background:var(--bg2);border:1px solid var(--border);border-radius:4px;overflow:hidden;display:flex;flex-direction:column">
+                <div style="padding:12px 14px;display:flex;align-items:flex-start;justify-content:space-between;gap:8px;border-bottom:1px solid var(--border)">
+                    <div>
+                        <div style="font-size:13px;font-weight:700;letter-spacing:0.06em;color:var(--text)">${escapeHtml(t.vendor_name)}</div>
+                        <div style="display:flex;align-items:center;gap:6px;margin-top:4px">
+                            <span style="font-size:9px;color:var(--text-dim);letter-spacing:0.08em">ID: ${escapeHtml(t.vendor_id)}</span>
+                            <span style="font-size:9px;font-weight:600;letter-spacing:0.1em;color:${fmtC};background:var(--bg);border:1px solid ${fmtC};border-radius:2px;padding:1px 5px">${fmt}</span>
+                        </div>
+                    </div>
+                    <div style="display:flex;gap:6px;flex-shrink:0">
+                        <a class="link-btn" href="#/template/${escapeHtml(t.vendor_id)}">⚙ Edit</a>
+                        <a class="link-btn" href="#/extract" onclick="localStorage.setItem('extractVendor','${escapeInlineJsString(t.vendor_id)}')">▶ Use</a>
+                    </div>
+                </div>
+                <div style="padding:10px 14px;display:grid;grid-template-columns:1fr 1fr;gap:10px;border-bottom:1px solid var(--border)">
+                    <div>
+                        <div style="font-size:9px;font-weight:600;letter-spacing:0.1em;color:var(--blue);margin-bottom:5px">HEADER FIELDS <span style="color:var(--text-dim);font-weight:400">(${hf.length})</span></div>
+                        <div style="line-height:1.8">${hfChips || '<span style="font-size:9px;color:var(--text-dim)">None</span>'}</div>
+                    </div>
+                    <div>
+                        <div style="font-size:9px;font-weight:600;letter-spacing:0.1em;color:var(--green,#98c379);margin-bottom:5px">LINE ITEMS <span style="color:var(--text-dim);font-weight:400">(${li.length})</span></div>
+                        <div style="line-height:1.8">${liChips || '<span style="font-size:9px;color:var(--text-dim)">None</span>'}</div>
+                    </div>
+                </div>
+                <div style="padding:8px 14px;display:flex;align-items:flex-start;gap:10px">
+                    <span style="font-size:9px;font-weight:600;letter-spacing:0.08em;color:var(--text-dim);white-space:nowrap;padding-top:1px">${rules.length} RULE${rules.length !== 1 ? 'S' : ''}</span>
+                    <div style="flex:1">${rulesPreview}</div>
+                </div>
+            </div>`;
+    }
+
+    // Build content — grouped by client for admin, flat grid for clients
+    let bodyHTML;
+    if (templates.length === 0) {
+        bodyHTML = '<div style="color:var(--text-dim);padding:20px">No templates saved yet. Create one from a vendor page.</div>';
+    } else if (!isAdmin) {
+        bodyHTML = `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(480px,1fr));gap:12px">${templates.map(_templateCard).join('')}</div>`;
+    } else {
+        const groups = {};
+        templates.forEach(t => {
+            const key = vendorClientMap[t.vendor_id] || 'Unassigned';
+            if (!groups[key]) groups[key] = [];
+            groups[key].push(t);
+        });
+        const keys = [...clientOrder.filter(k => groups[k])];
+        Object.keys(groups).forEach(k => { if (k !== 'Unassigned' && !keys.includes(k)) keys.push(k); });
+        if (groups['Unassigned']) keys.push('Unassigned');
+
+        bodyHTML = keys.map(key => {
+            const isUnassigned = key === 'Unassigned';
+            return `
+            <div style="margin-bottom:24px">
+                <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;padding-bottom:6px;border-bottom:2px solid var(--border)">
+                    <span style="font-size:10px;font-weight:700;letter-spacing:0.12em;color:${isUnassigned ? 'var(--text-dim)' : 'var(--blue)'}">${escapeHtml(key.toUpperCase())}</span>
+                    <span style="font-size:9px;color:var(--text-dim)">${groups[key].length} TEMPLATE${groups[key].length !== 1 ? 'S' : ''}</span>
+                </div>
+                <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(480px,1fr));gap:12px">
+                    ${groups[key].map(_templateCard).join('')}
+                </div>
+            </div>`;
+        }).join('');
+    }
+
+    const bottomExtra = isAdmin && Object.keys(vendorClientMap).length
+        ? (() => {
+            const groups = {};
+            templates.forEach(t => {
+                const key = (vendorClientMap[t.vendor_id] || 'Unassigned').split('@')[0];
+                groups[key] = (groups[key] || 0) + 1;
+            });
+            return Object.entries(groups).map(([k, n]) =>
+                `<span style="margin-right:14px;color:var(--text-dim)">${escapeHtml(k)}: <strong style="color:var(--text)">${n}</strong></span>`
+            ).join('') + '<span style="color:var(--border);margin-right:14px">|</span>';
+          })()
+        : '';
+
     app.innerHTML = headerHTML() + `
     <div class="page-content">
-        <div class="page-title">📋 Saved Templates</div>
-        ${templates.length === 0 ? '<div style="color:var(--text-dim);padding:20px">No templates saved yet. Create one from a vendor page.</div>' : `
-        <table class="tpl-table">
-            <thead><tr>
-                <th>Vendor</th><th>ID</th><th>Format</th><th>Header Fields</th><th>Line Items</th><th>Rules</th><th>Actions</th>
-            </tr></thead>
-            <tbody>${templates.map(t => `<tr>
-                <td style="color:var(--text);font-weight:500">${escapeHtml(t.vendor_name)}</td>
-                <td>${escapeHtml(t.vendor_id)}</td>
-                <td><span class="tag-chip">${escapeHtml(t.format_type)}</span></td>
-                <td>${(t.header_fields || []).map(f => `<span class="tag-chip">${escapeHtml(f)}</span>`).join(' ')}</td>
-                <td>${(t.line_item_fields || []).map(f => `<span class="tag-chip">${escapeHtml(f)}</span>`).join(' ')}</td>
-                <td>${(t.extraction_rules || []).length} rule${(t.extraction_rules || []).length !== 1 ? 's' : ''}</td>
-                <td>
-                    <a class="link-btn" href="#/template/${escapeHtml(t.vendor_id)}">⚙ Edit</a>
-                    <a class="link-btn" href="#/extract" onclick="localStorage.setItem('extractVendor','${escapeInlineJsString(t.vendor_id)}')">▶ Use</a>
-                </td>
-            </tr>`).join('')}</tbody>
-        </table>`}
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+            <div class="page-title" style="margin:0">Templates</div>
+            <div style="display:flex;gap:8px;align-items:center">
+                <span style="font-size:9px;color:var(--text-dim);letter-spacing:0.1em">${templates.length} SAVED</span>
+                <button class="small-btn" onclick="navigate('#/vendors')">+ New Vendor</button>
+            </div>
+        </div>
+        ${bodyHTML}
     </div>
     <div class="bottom-bar">
-        <span style="font-size:10px;color:var(--text-dim);letter-spacing:0.1em">${templates.length} TEMPLATE${templates.length !== 1 ? 'S' : ''} SAVED</span>
+        <span style="font-size:10px;letter-spacing:0.1em">${bottomExtra}<span style="color:var(--text-dim)">${templates.length} TEMPLATE${templates.length !== 1 ? 'S' : ''} SAVED · ${templates.reduce((s,t)=>(t.header_fields||[]).length+s,0)} HEADER FIELDS · ${templates.reduce((s,t)=>(t.line_item_fields||[]).length+s,0)} LINE COLUMNS</span></span>
     </div>`;
     updateNavActive();
 }

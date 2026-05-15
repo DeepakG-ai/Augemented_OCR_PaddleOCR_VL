@@ -70,7 +70,12 @@ async function apiFetch(path, opts = {}) {
         window.location.reload();
         throw new Error('HTTP 401: not authenticated');
     }
-    if (!res.ok) { const b = await res.text(); throw new Error(`HTTP ${res.status}: ${b}`); }
+    if (!res.ok) {
+        const b = await res.text();
+        let msg = b;
+        try { const j = JSON.parse(b); if (j.detail) msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail); } catch (_) {}
+        throw new Error(`HTTP ${res.status}: ${msg}`);
+    }
     return res;
 }
 async function apiJSON(path, opts = {}) { return (await apiFetch(path, opts)).json(); }
@@ -163,6 +168,11 @@ async function router() {
         activeJobId = null;
     }
 
+    // Close config SSE when leaving the settings page
+    if (!route.startsWith('/settings') && typeof _stopConfigSSE === 'function') {
+        _stopConfigSSE();
+    }
+
     // Update nav active state
     document.querySelectorAll('.nav-tab').forEach(t => {
         t.classList.remove('active');
@@ -200,6 +210,18 @@ async function router() {
         app.className = 'app';
         const userId = decodeURIComponent(route.split('/admin/client/')[1] || '');
         await renderClientDashboardPage(app, userId);
+    } else if (route.startsWith('/vendor-breakdown/')) {
+        app.className = 'app';
+        const userId = decodeURIComponent(route.split('/vendor-breakdown/')[1] || '');
+        await renderVendorBreakdownPage(app, userId);
+    } else if (route.startsWith('/vendor-stats/')) {
+        app.className = 'app';
+        const vendorId = decodeURIComponent(route.split('/vendor-stats/')[1] || '');
+        await renderVendorStatsPage(app, vendorId);
+    } else if (route === '/settings') {
+        app.className = 'app';
+        _stopConfigSSE();  // clean up any previous SSE before re-rendering
+        await renderSettingsPage(app);
     } else if (route === '/admin/users') {
         app.className = 'app';
         await renderAdminUsersPage(app);
@@ -261,6 +283,7 @@ function headerHTML() {
             <a class="nav-tab" data-route="/history" href="#/history">History</a>
             <a class="nav-tab" data-route="/review" href="#/review">Review</a>
             <a class="nav-tab" data-route="/dashboard" href="#/dashboard">Dashboard</a>
+            <a class="nav-tab" data-route="/settings" href="#/settings">Settings</a>
             ${isAdmin ? `<a class="nav-tab" data-route="/admin/users" href="#/admin/users" style="color:var(--blue)">Users</a>` : ''}
         </nav>
         <div class="header-right">

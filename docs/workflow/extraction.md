@@ -6,7 +6,7 @@
 > - LLM call: [backend/extractor.py](../../backend/extractor.py)
 > - Frontend: [frontend/extract.js](../../frontend/extract.js)
 
-When a user uploads a document, **5 background workers** process it in sequence: normalize → ocr → llm → postprocess → outbound. Each stage claims a row from the `jobs` table, does its work, and enqueues the next stage. The frontend watches via SSE.
+When a user uploads a document, **4 background workers** process it in sequence: normalize → ocr → llm → postprocess. Each stage claims a row from the `jobs` table, does its work, and enqueues the next stage. The frontend watches via SSE.
 
 ---
 
@@ -16,20 +16,20 @@ When a user uploads a document, **5 background workers** process it in sequence:
 
 **Backpressure.** Each stage has its own poll interval and concurrency. The LLM stage is the bottleneck (Qwen3-VL is GPU-bound at ~2 pages/sec), so a single LLM worker is enough; the OCR worker can scale separately.
 
-**Observability.** Every stage transition is logged via `plog.event(...)` with `stage_started` / `stage_completed` markers and surfaces in Phoenix tracing for full LLM call inspection.
+**Observability.** Every stage transition is logged via `plog.event(...)` with `stage_started` / `stage_completed` markers and surfaces in MLflow tracing for LLM call inspection.
 
 ---
 
 ## Sequence diagram
 
 ```
-User                Frontend           API (FastAPI)        normalize  ocr   llm   postprocess  outbound
- │                     │                    │                  │       │      │         │           │
- │  Upload PDF         │                    │                  │       │      │         │           │
- │ ──────────────────> │                    │                  │       │      │         │           │
- │                     │  POST /ingest/ui   │                  │       │      │         │           │
- │                     │ ─────────────────> │                  │       │      │         │           │
- │                     │                    │ detect_vendor()  │       │      │         │           │
+User                Frontend           API (FastAPI)        normalize  ocr   llm   postprocess
+ │                     │                    │                  │       │      │         │
+ │  Upload PDF         │                    │                  │       │      │         │
+ │ ──────────────────> │                    │                  │       │      │         │
+ │                     │  POST /ingest/ui   │                  │       │      │         │
+ │                     │ ─────────────────> │                  │       │      │         │
+ │                     │                    │ detect_vendor()  │       │      │         │
  │                     │                    │ create_doc()     │       │      │         │           │
  │                     │                    │ create_extr()    │       │      │         │           │
  │                     │                    │ ensure_job(norm) │       │      │         │           │
@@ -435,40 +435,14 @@ For each saved memory region, read the current document's text inside the region
 
 Spatial memory reflects past corrections. If a user fixed `vendor_address` last week by drawing a box, this week's extraction reads from that same box and overrides whatever Qwen guessed.
 
-### 4.3 — Persist + enqueue outbound
+### 4.3 — Persist completion
 
 ```python
 await db_mod.save_field_locations(pool, ext_id, field_locations)
 await db_mod.set_extraction_status(pool, ext_id, "done", progress=...)
-await db_mod.ensure_job(pool, ext_id, doc_id, "outbound", ...)
 ```
 
 Status becomes `done`. The SSE stream emits the terminal `done` event; the frontend re-fetches the full extraction (with `corrected_result`, `field_locations`, etc.) and renders the result panel.
-
----
-
-## Stage 5 — `outbound` (`worker.py:_process_outbound` lines 989–1076)
-
-**Goal**: render the contract to Excel + CSV, store in MinIO, write `integration_deliveries` rows.
-
-```python
-contract = build_purchase_order_contract(extraction_row)
-excel_bytes = build_excel_bytes(contract)
-csv_bytes = build_csv_bytes(contract)
-store.put_bytes(EXPORTS_BUCKET, xlsx_key, excel_bytes, ...)
-store.put_bytes(EXPORTS_BUCKET, csv_key, csv_bytes, ...)
-await db_mod.save_export_artifact(pool, ext_id, xlsx_key)
-await db_mod.upsert_delivery(pool, ext_id, ..., target_type="excel", object_key=xlsx_key)
-await db_mod.upsert_delivery(pool, ext_id, ..., target_type="csv", object_key=csv_key)
-```
-
-See [export.md](export.md) for the contract shape and how the Excel/CSV are built.
-
-This stage is "fire and forget" relative to the user — by the time outbound finishes, the user has already seen the result. The exports are downloadable on demand via:
-- `GET /extractions/{id}/export.xlsx`
-- `GET /extractions/{id}/export.csv`
-
-If outbound fails (e.g. MinIO unreachable), the extraction stays `done` (correct, the result is good); the delivery row is marked `failed` with an error message; the user can retry from the UI.
 
 ---
 

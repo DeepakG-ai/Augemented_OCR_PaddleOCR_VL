@@ -19,40 +19,22 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
-if __package__:
-    from . import db as db_mod
-    from . import logging_config as plog
-    from .logging_config import get_logger
-    from .config import (
-        LLM_TEMPERATURE,
-        LLM_TOP_P,
-        LLM_PRESENCE_PENALTY,
-        LLM_MAX_TOKENS_FIELDS,
-        LLM_TIMEOUT,
-    )
-    from .phoenix_tracing import (
-        trace_llm_call,
-        trace_page_extraction,
-        trace_build_user_message,
-        trace_merge_results,
-    )
-else:
-    import db as db_mod  # type: ignore[no-redef]
-    import logging_config as plog  # type: ignore[no-redef]
-    from logging_config import get_logger  # type: ignore[no-redef]
-    from config import (  # type: ignore[no-redef]
-        LLM_TEMPERATURE,
-        LLM_TOP_P,
-        LLM_PRESENCE_PENALTY,
-        LLM_MAX_TOKENS_FIELDS,
-        LLM_TIMEOUT,
-    )
-    from phoenix_tracing import (  # type: ignore[no-redef]
-        trace_llm_call,
-        trace_page_extraction,
-        trace_build_user_message,
-        trace_merge_results,
-    )
+from . import db as db_mod
+
+from .logging_config import get_logger
+from .config import (
+    LLM_TEMPERATURE,
+    LLM_TOP_P,
+    LLM_PRESENCE_PENALTY,
+    LLM_MAX_TOKENS_FIELDS,
+    LLM_TIMEOUT,
+)
+from .mlflow_tracing import (
+    trace_llm_call,
+    trace_page_extraction,
+    trace_build_user_message,
+    trace_merge_results,
+)
 
 logger = get_logger(__name__)
 
@@ -177,7 +159,7 @@ Use this only as a warning that the field needs careful current-document reading
 
         bbox_rules = """
 <bbox_rules>
-- For each header field, return the bounding box of the LABEL text (e.g., the words "PO Number:"), NOT the value next to it.
+- For each header field, return the bounding box of the LABEL text (e.g., word "PO Number:"), NOT the value next to it.
 - For each line item column, return the bounding box of the COLUMN HEADER text in the table header row.
 - Coordinates use bbox_2d format: [x1, y1, x2, y2] in a 0-1000 normalized grid relative to the full page image.
 - If a label or column header is not visible on this page, set its box to null.
@@ -187,7 +169,7 @@ Use this only as a warning that the field needs careful current-document reading
         if vendor_name:
             vendor_section = f"""
 <vendor_verification>
-The system detected this document belongs to: "{vendor_name}"
+System detected this document belongs to: "{vendor_name}"
 Check the document header, letterhead, or company name in the image.
 Return vendor_confirmed: true if correct, false if the document belongs to a different company.
 </vendor_verification>"""
@@ -453,28 +435,19 @@ async def call_llm(
             resp.raise_for_status()
 
         resp_json = resp.json()
-        trace_ctx["response"] = resp_json["choices"][0]["message"]["content"]
+        _c0 = (resp_json.get("choices") or [{}])[0]
+        _content = (_c0.get("message", {}).get("content", "") if isinstance(_c0, dict) else "")
+        trace_ctx["response"] = _content
         usage = resp_json.get("usage") or {}
         prompt_tokens = _usage_int(usage.get("prompt_tokens"))
         completion_tokens = _usage_int(usage.get("completion_tokens"))
         total_tokens = _usage_int(usage.get("total_tokens")) or (prompt_tokens + completion_tokens)
         duration_ms = (time.perf_counter() - start) * 1000
         trace_ctx["usage"] = usage
-        if pipeline_context is not None:
-            plog.event(
-                "qwen_http_completed",
-                stage="llm",
-                duration_ms=duration_ms,
-                page=page_num,
-                total_pages=total_pages,
-                model=model,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=total_tokens,
-                usage=usage,
-                response_chars=len(trace_ctx["response"]),
-                **pipeline_context,
-            )
+        logger.info(
+            "LLM tokens page=%d/%d prompt=%d completion=%d total=%d elapsed=%.0fms",
+            page_num, total_pages, prompt_tokens, completion_tokens, total_tokens, duration_ms,
+        )
         if pool is not None:
             context = pipeline_context or {}
             try:
@@ -497,7 +470,14 @@ async def call_llm(
             except Exception as exc:
                 logger.warning("Failed to record LLM usage for extraction page %s: %s", page_num, exc)
 
-    raw: str = resp_json["choices"][0]["message"]["content"].strip()
+    _choices = resp_json.get("choices") or []
+    if not _choices or not isinstance(_choices[0], dict) or "message" not in _choices[0]:
+        logger.error(
+            "LLM response missing choices[0].message — raw: %s",
+            str(resp_json)[:500],
+        )
+        return {}
+    raw: str = (_choices[0].get("message") or {}).get("content", "").strip()
     raw = _JSON_FENCE_RE.sub("", raw)
     raw = _FENCE_END_RE.sub("", raw)
     raw = raw.strip()
@@ -507,15 +487,9 @@ async def call_llm(
         parsed = json.loads(raw)
         if pipeline_context is not None:
             fields = parsed.get("fields", parsed) if isinstance(parsed, dict) else {}
-            plog.event(
-                "qwen_json_parsed",
-                stage="llm",
-                page=page_num,
-                total_pages=total_pages,
-                field_count=len([k for k in fields.keys() if k != "line_items"]) if isinstance(fields, dict) else 0,
-                line_item_count=len(fields.get("line_items") or []) if isinstance(fields, dict) else 0,
-                **pipeline_context,
-            )
+            fc = len([k for k in fields.keys() if k != "line_items"]) if isinstance(fields, dict) else 0
+            li = len(fields.get("line_items") or []) if isinstance(fields, dict) else 0
+            logger.info("Parsed page %d/%d: %d fields, %d line items", page_num, total_pages, fc, li)
         return _strip_newlines(parsed)
     except json.JSONDecodeError:
         # Fallback 1: fix leading-zero numbers (e.g. 0070 -> "0070")
@@ -542,15 +516,7 @@ async def call_llm(
         # All recovery attempts failed
         logger.error("LLM JSON parse failed after all fallbacks. Raw response:\n%s", raw[:500])
         if pipeline_context is not None:
-            plog.event(
-                "qwen_json_parse_failed",
-                stage="llm",
-                status="error",
-                page=page_num,
-                total_pages=total_pages,
-                raw_preview=raw[:500],
-                **pipeline_context,
-            )
+            logger.error("LLM JSON parse failed on page %d — raw: %s", page_num, raw[:200])
         raise ValueError(f"LLM returned invalid JSON: {raw[:200]}")
 
 
@@ -643,9 +609,19 @@ async def extract_document(
                 result["_total_pages"] = total
                 # Count line items for logging (handle both v3 and legacy format)
                 _fields = result.get("fields", result)
-                _li_count = len(_fields.get("line_items") or [])
+                _li = (_fields.get("line_items") or []) if isinstance(_fields, dict) else []
+                _li_count = len(_li)
                 logger.info("Page %d/%d done — %d line item(s)",
                             page_num, total, _li_count)
+                if pipeline_context is not None:
+                    _header_out = {
+                        k: v for k, v in _fields.items()
+                        if k not in ("line_items", "boxes", "vendor_confirmed")
+                        and not k.startswith("_")
+                    } if isinstance(_fields, dict) else {}
+                    logger.info("Page %d/%d extracted: %d line items | %s",
+                                page_num, total, _li_count,
+                                ", ".join(f"{k}={v}" for k, v in _header_out.items()) if _header_out else "(no fields)")
                 page_ctx["result"] = result
                 return result
             except asyncio.CancelledError:

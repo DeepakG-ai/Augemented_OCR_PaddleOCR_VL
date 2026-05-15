@@ -142,6 +142,22 @@ class PageLimitsQueryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["remaining"], 0)
 
+    async def test_billing_query_uses_user_id_not_vendor_join(self) -> None:
+        """Billing query must filter by lu.user_id, not JOIN vendors.
+        After vendor deletion vendor_id is detached; user_id persists on llm_usage."""
+        pool = MagicMock()
+        conn = AsyncMock()
+        pool.acquire.return_value = _fake_acquire(conn)
+        conn.fetchrow.return_value = {"subscription_limit": 1000, "billable_pages": 75}
+
+        await db_mod.get_user_billable_pages(
+            pool, "12345678-1234-5678-1234-567812345678"
+        )
+
+        sql = _compact(conn.fetchrow.call_args[0][0])
+        self.assertIn("lu.user_id = $1", sql)
+        self.assertNotIn("JOIN vendors", sql)
+
     async def test_update_user_subscription_limit_query_structure(self) -> None:
         pool = MagicMock()
         conn = AsyncMock()
@@ -389,22 +405,20 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
         mock_check.assert_not_called()
         self.assertNotEqual(r.status_code, 402)
 
-    # -- Quota check failure is non-blocking ---------------------------------
+    # -- Quota check failure is now fail-closed (503) -------------------------
 
-    def test_quota_check_failure_is_non_blocking(self):
-        """If get_user_billable_pages raises, the request still proceeds."""
+    def test_quota_check_db_failure_blocks_upload_with_503(self):
+        """If get_user_billable_pages raises, the upload is blocked with 503 (fail-closed)."""
         self._use_client()
         with patch.object(main.db_mod, "get_user_billable_pages",
                           new=AsyncMock(side_effect=RuntimeError("db down"))), \
-             patch.object(main, "_submit_ingestion_job",
-                          new=AsyncMock(return_value=_fake_submission())), \
              patch.object(main, "assert_vendor_access", new=AsyncMock()):
             r = self.client.post(
                 "/ingest/ui",
                 files={"file": ("doc.pdf", b"%PDF-fake", "application/pdf")},
                 data={"vendor_id": "acme"},
             )
-        self.assertNotEqual(r.status_code, 402)
+        self.assertEqual(r.status_code, 503)
 
 
 # ---------------------------------------------------------------------------

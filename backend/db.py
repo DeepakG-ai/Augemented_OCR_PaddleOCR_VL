@@ -11,10 +11,7 @@ from uuid import UUID
 
 import asyncpg
 
-if __package__:
-    from .config import DATABASE_URL
-else:
-    from config import DATABASE_URL  # type: ignore[no-redef]
+from .config import DATABASE_URL
 
 
 # -- Pool creation ---------------------------------------------------------
@@ -165,19 +162,6 @@ CREATE TABLE IF NOT EXISTS review_events (
     created_at       TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS integration_deliveries (
-    id              SERIAL PRIMARY KEY,
-    extraction_id   INT REFERENCES extractions(id) ON DELETE CASCADE,
-    contract_type   TEXT NOT NULL,
-    target_type     TEXT NOT NULL,
-    status          TEXT NOT NULL DEFAULT 'pending',
-    payload         JSONB,
-    object_key      TEXT,
-    error           TEXT,
-    created_at      TIMESTAMPTZ DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ DEFAULT NOW()
-);
-
 CREATE TABLE IF NOT EXISTS llm_usage (
     id                SERIAL PRIMARY KEY,
     ts                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -259,9 +243,6 @@ async def init(pool: asyncpg.Pool) -> None:
             ON jobs (extraction_id, job_type) 
             WHERE status IN ('queued', 'running') AND extraction_id IS NOT NULL;
             
-            CREATE UNIQUE INDEX IF NOT EXISTS integration_deliveries_unique_target_idx
-            ON integration_deliveries (extraction_id, contract_type, target_type);
-
             CREATE INDEX IF NOT EXISTS llm_usage_doc_ts_idx
             ON llm_usage (doc_id, ts DESC);
 
@@ -297,6 +278,45 @@ async def init(pool: asyncpg.Pool) -> None:
                 ) THEN
                     ALTER TABLE llm_usage ADD COLUMN extraction_id INT
                         REFERENCES extractions(id) ON DELETE SET NULL;
+                END IF;
+            END $$;
+        """)
+        # Fix A4-1 / P1: detach both FKs on llm_usage that used ON DELETE SET NULL so
+        # that deleting an extraction or vendor never nullifies historical usage rows.
+        # Also add user_id to llm_usage so billing survives vendor deletion.
+        await conn.execute("""
+            DO $$ BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.table_constraints
+                    WHERE constraint_name = 'llm_usage_extraction_id_fkey'
+                      AND table_name = 'llm_usage'
+                ) THEN
+                    ALTER TABLE llm_usage DROP CONSTRAINT llm_usage_extraction_id_fkey;
+                END IF;
+            END $$;
+        """)
+        await conn.execute("""
+            DO $$ BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.table_constraints
+                    WHERE constraint_name = 'llm_usage_vendor_id_fkey'
+                      AND table_name = 'llm_usage'
+                ) THEN
+                    ALTER TABLE llm_usage DROP CONSTRAINT llm_usage_vendor_id_fkey;
+                END IF;
+            END $$;
+        """)
+        await conn.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'llm_usage' AND column_name = 'user_id'
+                ) THEN
+                    ALTER TABLE llm_usage ADD COLUMN user_id UUID;
+                    UPDATE llm_usage lu
+                       SET user_id = v.user_id
+                      FROM vendors v
+                     WHERE lu.vendor_id = v.id AND lu.user_id IS NULL;
                 END IF;
             END $$;
         """)
@@ -439,6 +459,43 @@ async def init(pool: asyncpg.Pool) -> None:
                 END IF;
             END $$;
         """)
+        # Migration: per-user runtime configuration (input/output folders, upload mode)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_config (
+                user_id    UUID REFERENCES users(id) ON DELETE CASCADE,
+                key        TEXT NOT NULL,
+                value      TEXT,
+                updated_at TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (user_id, key)
+            );
+            CREATE INDEX IF NOT EXISTS user_config_user_id_idx ON user_config (user_id);
+        """)
+        # Migration: per-user ingestion schedules
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_schedules (
+                id          SERIAL PRIMARY KEY,
+                user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                label       TEXT NOT NULL DEFAULT '',
+                cron_expr   TEXT NOT NULL,
+                timezone    TEXT NOT NULL DEFAULT 'UTC',
+                enabled     BOOLEAN NOT NULL DEFAULT TRUE,
+                last_ran_at TIMESTAMPTZ,
+                created_at  TIMESTAMPTZ DEFAULT NOW(),
+                updated_at  TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS user_schedules_user_id_idx ON user_schedules (user_id);
+        """)
+        # Migration: is_executing flag for conflict detection between UI uploads and scheduler
+        await conn.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='user_schedules' AND column_name='is_executing'
+                ) THEN
+                    ALTER TABLE user_schedules ADD COLUMN is_executing BOOLEAN NOT NULL DEFAULT FALSE;
+                END IF;
+            END $$;
+        """)
 
 
 # -- Helpers ---------------------------------------------------------------
@@ -527,14 +584,23 @@ async def record_llm_usage(
     request_id_str = str(request_id) if request_id is not None else None
 
     async with pool.acquire() as conn:
+        # Resolve user_id from vendor now so billing survives future vendor deletion.
+        resolved_user_id: UUID | None = None
+        if vendor_id:
+            row_uid = await conn.fetchval(
+                "SELECT user_id FROM vendors WHERE id = $1", vendor_id
+            )
+            if row_uid is not None:
+                resolved_user_id = row_uid if isinstance(row_uid, UUID) else _uuid_or_none(str(row_uid))
+
         row = await conn.fetchrow(
             """
             INSERT INTO llm_usage
-                (request_id, doc_id, extraction_id, vendor_id, page_num, total_pages,
+                (request_id, doc_id, extraction_id, vendor_id, user_id, page_num, total_pages,
                  call_type, model, prompt_tokens, completion_tokens, total_tokens,
                  duration_ms, llm_url)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-            RETURNING id, ts, request_id, doc_id, extraction_id, vendor_id,
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            RETURNING id, ts, request_id, doc_id, extraction_id, vendor_id, user_id,
                       page_num, total_pages, call_type, model, prompt_tokens,
                       completion_tokens, total_tokens, duration_ms, llm_url
             """,
@@ -542,6 +608,7 @@ async def record_llm_usage(
             resolved_doc_id_str,
             extraction_id,
             vendor_id,
+            resolved_user_id,
             page_num,
             total_pages,
             call_type,
@@ -553,6 +620,24 @@ async def record_llm_usage(
             llm_url,
         )
         return dict(row)
+
+
+async def get_extraction_token_totals(pool: asyncpg.Pool, extraction_id: int) -> dict:
+    """Return summed token counts for all LLM calls belonging to one extraction."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                COALESCE(SUM(prompt_tokens), 0)::BIGINT     AS prompt_tokens,
+                COALESCE(SUM(completion_tokens), 0)::BIGINT AS completion_tokens,
+                COALESCE(SUM(total_tokens), 0)::BIGINT      AS total_tokens,
+                COUNT(*)::INT                               AS llm_calls
+            FROM llm_usage
+            WHERE extraction_id = $1
+            """,
+            extraction_id,
+        )
+    return dict(row) if row else {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "llm_calls": 0}
 
 
 async def get_llm_usage_document_summary(
@@ -863,7 +948,20 @@ async def list_vendors(pool: asyncpg.Pool, user_id: str | None = None) -> list[d
             """,
             user_id,
         )
-        return [dict(r) for r in rows]
+        return [_stringify_uuid_fields(dict(r), "user_id") for r in rows]
+
+
+async def assign_vendor_owner(pool: asyncpg.Pool, vendor_id: str, user_id: str) -> dict | None:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE vendors SET user_id = $1::UUID
+            WHERE id = $2
+            RETURNING id, name, status, user_id, created_at
+            """,
+            user_id, vendor_id,
+        )
+        return _stringify_uuid_fields(dict(row), "user_id") if row else None
 
 
 async def upsert_vendor(
@@ -975,6 +1073,17 @@ async def deactivate_user(pool: asyncpg.Pool, user_id: str) -> bool:
         return result.endswith(" 1")
 
 
+async def reactivate_user(pool: asyncpg.Pool, user_id: str) -> bool:
+    user_uuid = _uuid_or_none(user_id)
+    if user_uuid is None:
+        return False
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE users SET is_active = TRUE WHERE id = $1", user_uuid,
+        )
+        return result.endswith(" 1")
+
+
 async def reset_user_password(pool: asyncpg.Pool, user_id: str, hashed_pw: str) -> bool:
     user_uuid = _uuid_or_none(user_id)
     if user_uuid is None:
@@ -994,6 +1103,10 @@ async def delete_vendor(pool: asyncpg.Pool, vendor_id: str) -> bool:
             # CASCADE, so delete dependents explicitly before removing the vendor.
             await conn.execute("DELETE FROM extractions WHERE vendor_id = $1", vendor_id)
             await conn.execute("DELETE FROM documents WHERE vendor_id = $1", vendor_id)
+            await conn.execute("DELETE FROM vendor_aliases WHERE vendor_id = $1", vendor_id)
+            await conn.execute("DELETE FROM templates WHERE vendor_id = $1", vendor_id)
+            await conn.execute("DELETE FROM spatial_memory WHERE vendor_id = $1", vendor_id)
+            await conn.execute("DELETE FROM qwen_layout_boxes WHERE vendor_id = $1", vendor_id)
             result = await conn.execute("DELETE FROM vendors WHERE id = $1", vendor_id)
             return result == "DELETE 1"
 
@@ -1060,7 +1173,7 @@ async def get_all_aliases_for_detection(
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT va.vendor_id, v.name AS vendor_name, va.pattern, va.weight
+            SELECT va.vendor_id, v.name AS vendor_name, va.pattern, va.weight, va.source
             FROM vendor_aliases va
             JOIN vendors v ON v.id = va.vendor_id
             WHERE va.vendor_id <> '_auto'
@@ -1622,21 +1735,6 @@ async def get_page_object_keys(pool: asyncpg.Pool, extraction_id: int) -> list[s
         return [r["object_key"] for r in rows if r.get("object_key")]
 
 
-async def list_delivery_object_keys(pool: asyncpg.Pool, extraction_id: int) -> list[str]:
-    """Return object keys created for integration deliveries/exports."""
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT object_key
-            FROM integration_deliveries
-            WHERE extraction_id = $1 AND object_key IS NOT NULL
-            ORDER BY created_at DESC
-            """,
-            extraction_id,
-        )
-        return [r["object_key"] for r in rows if r.get("object_key")]
-
-
 async def get_vendor_object_keys(pool: asyncpg.Pool, vendor_id: str) -> dict[str, list[str]]:
     """Collect object-store keys owned by a vendor for cleanup on delete."""
     async with pool.acquire() as conn:
@@ -1659,16 +1757,7 @@ async def get_vendor_object_keys(pool: asyncpg.Pool, vendor_id: str) -> dict[str
             """,
             vendor_id,
         )
-        delivery_rows = await conn.fetch(
-            """
-            SELECT d.object_key
-            FROM integration_deliveries d
-            JOIN extractions e ON e.id = d.extraction_id
-            WHERE e.vendor_id = $1 AND d.object_key IS NOT NULL
-            ORDER BY d.created_at ASC
-            """,
-            vendor_id,
-        )
+
         export_rows = await conn.fetch(
             """
             SELECT export_object_key
@@ -1788,28 +1877,17 @@ async def save_corrections(
         return result == "UPDATE 1"
 
 
-async def save_export_artifact(pool: asyncpg.Pool, extraction_id: int, object_key: str) -> None:
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE extractions
-            SET export_object_key = $2,
-                updated_at = NOW()
-            WHERE id = $1
-            """,
-            extraction_id,
-            object_key,
-        )
-
-
 async def delete_extraction(pool: asyncpg.Pool, extraction_id: int) -> bool:
     """Delete exactly one extraction record."""
     async with pool.acquire() as conn:
-        result = await conn.execute(
-            "DELETE FROM extractions WHERE id = $1",
-            extraction_id,
-        )
-        return result == "DELETE 1"
+        async with conn.transaction():
+            await conn.execute("DELETE FROM pages WHERE extraction_id = $1", extraction_id)
+            await conn.execute("DELETE FROM jobs WHERE extraction_id = $1", extraction_id)
+            result = await conn.execute(
+                "DELETE FROM extractions WHERE id = $1",
+                extraction_id,
+            )
+            return result == "DELETE 1"
 
 
 async def count_extractions_for_document(pool: asyncpg.Pool, document_id: int) -> int:
@@ -2377,80 +2455,6 @@ async def is_cancel_requested(pool: asyncpg.Pool, extraction_id: int) -> bool:
         )
         return bool(value)
 
-
-# -- Outbound deliveries ---------------------------------------------------
-
-async def upsert_delivery(
-    pool: asyncpg.Pool,
-    extraction_id: int,
-    contract_type: str,
-    target_type: str,
-    status: str,
-    payload: dict | None = None,
-    object_key: str | None = None,
-    error: str | None = None,
-) -> dict:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            UPDATE integration_deliveries
-            SET status = $4,
-                payload = $5::jsonb,
-                object_key = $6,
-                error = $7,
-                updated_at = NOW()
-            WHERE extraction_id = $1
-              AND contract_type = $2
-              AND target_type = $3
-            RETURNING id, extraction_id, contract_type, target_type, status, payload, object_key, error, created_at, updated_at
-            """,
-            extraction_id,
-            contract_type,
-            target_type,
-            status,
-            json.dumps(payload) if payload is not None else None,
-            object_key,
-            error,
-        )
-        if row:
-            return _record(row, "payload") or {}
-
-        row = await conn.fetchrow(
-            """
-            INSERT INTO integration_deliveries (extraction_id, contract_type, target_type, status, payload, object_key, error)
-            VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
-            RETURNING id, extraction_id, contract_type, target_type, status, payload, object_key, error, created_at, updated_at
-            """,
-            extraction_id,
-            contract_type,
-            target_type,
-            status,
-            json.dumps(payload) if payload is not None else None,
-            object_key,
-            error,
-        )
-        return _record(row, "payload") or {}
-
-
-async def list_deliveries(pool: asyncpg.Pool, extraction_id: int) -> list[dict]:
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT id, extraction_id, contract_type, target_type, status, payload, object_key, error, created_at, updated_at
-            FROM integration_deliveries
-            WHERE extraction_id = $1
-            ORDER BY updated_at DESC
-            """,
-            extraction_id,
-        )
-        results = []
-        for row in rows:
-            d = dict(row)
-            _parse_jsonb(d, "payload")
-            results.append(d)
-        return results
-
-
 # -- Subscription / page-limit queries ------------------------------------
 
 async def get_user_billable_pages(
@@ -2474,10 +2478,8 @@ async def get_user_billable_pages(
                 (
                     SELECT COUNT(DISTINCT (lu.extraction_id, lu.page_num))
                     FROM llm_usage lu
-                    JOIN vendors v ON v.id = lu.vendor_id
-                    WHERE v.user_id = $1
+                    WHERE lu.user_id = $1
                       AND lu.call_type = 'extraction'
-                      AND lu.extraction_id IS NOT NULL
                       AND lu.page_num IS NOT NULL
                 )::INT AS billable_pages
             FROM users u
@@ -2512,3 +2514,288 @@ async def update_user_subscription_limit(
             uid,
         )
         return result.endswith(" 1")
+
+
+# -- User config -----------------------------------------------------------
+
+async def get_user_config(pool: asyncpg.Pool, user_id: str) -> dict[str, str]:
+    """Return all config key-value pairs for a user."""
+    uid = _uuid_or_none(user_id)
+    if uid is None:
+        return {}
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT key, value FROM user_config WHERE user_id = $1 ORDER BY key",
+            uid,
+        )
+    return {r["key"]: r["value"] for r in rows}
+
+
+async def set_user_config(pool: asyncpg.Pool, user_id: str, updates: dict[str, str]) -> None:
+    """Upsert config key-value pairs for a user."""
+    uid = _uuid_or_none(user_id)
+    if uid is None:
+        return
+    async with pool.acquire() as conn:
+        for key, value in updates.items():
+            await conn.execute(
+                """
+                INSERT INTO user_config (user_id, key, value, updated_at)
+                VALUES ($1, $2, $3, NOW())
+                ON CONFLICT (user_id, key)
+                DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+                """,
+                uid,
+                key,
+                value,
+            )
+
+
+async def get_all_user_configs(pool: asyncpg.Pool) -> list[dict]:
+    """Admin: return config grouped by user (email + role + config dict)."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT u.id::TEXT AS user_id, u.email, u.role,
+                   uc.key, uc.value, uc.updated_at
+            FROM users u
+            LEFT JOIN user_config uc ON uc.user_id = u.id
+            ORDER BY u.email, uc.key
+            """
+        )
+    users: dict[str, dict] = {}
+    for r in rows:
+        uid = r["user_id"]
+        if uid not in users:
+            users[uid] = {
+                "user_id": uid,
+                "email": r["email"],
+                "role": r["role"],
+                "config": {},
+            }
+        if r["key"]:
+            users[uid]["config"][r["key"]] = r["value"]
+    return list(users.values())
+
+
+# -- Vendor dashboard stats ------------------------------------------------
+
+async def get_client_vendor_summary(pool: asyncpg.Pool) -> list[dict]:
+    """Admin: per-client row with vendor_count and extraction_count."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT u.id::TEXT AS user_id, u.email, u.role, u.is_active,
+                   COUNT(DISTINCT v.id)::INT         AS vendor_count,
+                   COUNT(DISTINCT e.id)::INT         AS extraction_count,
+                   SUM(CASE WHEN e.status = 'done'   THEN 1 ELSE 0 END)::INT AS completed_extractions
+            FROM users u
+            LEFT JOIN vendors    v ON v.user_id = u.id
+            LEFT JOIN extractions e ON e.vendor_id = v.id
+            WHERE u.role = 'client'
+            GROUP BY u.id, u.email, u.role, u.is_active
+            ORDER BY u.email
+            """
+        )
+    return [dict(r) for r in rows]
+
+
+async def get_client_vendors_with_stats(pool: asyncpg.Pool, user_id: str) -> list[dict]:
+    """Vendor list for one client with extraction count, page total, and last run."""
+    uid = _uuid_or_none(user_id)
+    if uid is None:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT v.id AS vendor_id, v.name AS vendor_name, v.status,
+                   COUNT(DISTINCT e.id)::INT              AS extraction_count,
+                   COALESCE(SUM(e.total_pages), 0)::INT  AS total_pages_processed,
+                   MAX(e.created_at)                      AS last_extraction_at,
+                   SUM(CASE WHEN e.status = 'done'   THEN 1 ELSE 0 END)::INT AS completed,
+                   SUM(CASE WHEN e.status = 'failed' THEN 1 ELSE 0 END)::INT AS failed
+            FROM vendors v
+            LEFT JOIN extractions e ON e.vendor_id = v.id
+            WHERE v.user_id = $1
+            GROUP BY v.id, v.name, v.status
+            ORDER BY v.name
+            """,
+            uid,
+        )
+    return [dict(r) for r in rows]
+
+
+async def get_vendor_extraction_daily(
+    pool: asyncpg.Pool,
+    vendor_id: str,
+    limit: int = 30,
+) -> list[dict]:
+    """Per-day extraction counts for one vendor (most recent N days)."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT date_trunc('day', e.created_at)::DATE::TEXT AS day,
+                   COUNT(*)::INT                               AS extractions,
+                   SUM(CASE WHEN e.status = 'done'   THEN 1 ELSE 0 END)::INT AS completed,
+                   SUM(CASE WHEN e.status = 'failed' THEN 1 ELSE 0 END)::INT AS failed,
+                   COALESCE(SUM(e.total_pages), 0)::INT        AS total_pages
+            FROM extractions e
+            WHERE e.vendor_id = $1
+              AND e.created_at >= NOW() - ($2 * INTERVAL '1 day')
+            GROUP BY 1
+            ORDER BY 1 DESC
+            """,
+            vendor_id,
+            limit,
+        )
+    return [dict(r) for r in rows]
+
+
+async def get_vendor_page_stats(pool: asyncpg.Pool, vendor_id: str) -> list[dict]:
+    """Per page_number aggregates across all done extractions for a vendor."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT p.page_number,
+                   COUNT(*)::INT                                   AS times_processed,
+                   AVG(NULLIF(lu.total_tokens,  0))::INT          AS avg_tokens,
+                   AVG(NULLIF(lu.duration_ms,   0))::INT          AS avg_latency_ms
+            FROM pages p
+            JOIN extractions e
+                 ON e.id = p.extraction_id
+                AND e.vendor_id = $1
+                AND e.status = 'done'
+            LEFT JOIN llm_usage lu
+                 ON lu.extraction_id = e.id
+                AND lu.page_num = p.page_number
+                AND lu.call_type = 'extraction'
+            GROUP BY p.page_number
+            ORDER BY p.page_number
+            """,
+            vendor_id,
+        )
+    return [dict(r) for r in rows]
+
+
+# -- Schedule queries -------------------------------------------------------
+
+async def create_user_schedule(
+    pool: asyncpg.Pool,
+    user_id: str,
+    cron_expr: str,
+    timezone: str = "UTC",
+    label: str = "",
+) -> dict:
+    uid = _uuid_or_none(user_id)
+    if uid is None:
+        raise ValueError(f"Invalid user_id: {user_id!r}")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO user_schedules (user_id, cron_expr, timezone, label)
+            VALUES ($1, $2, $3, $4)
+            RETURNING *
+            """,
+            uid, cron_expr, timezone or "UTC", label or "",
+        )
+    return dict(row) if row else {}
+
+
+async def get_user_schedules(pool: asyncpg.Pool, user_id: str) -> list[dict]:
+    uid = _uuid_or_none(user_id)
+    if uid is None:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM user_schedules WHERE user_id = $1 ORDER BY created_at DESC",
+            uid,
+        )
+    return [dict(r) for r in rows]
+
+
+async def get_schedule(pool: asyncpg.Pool, schedule_id: int) -> dict | None:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM user_schedules WHERE id = $1", schedule_id
+        )
+    return dict(row) if row else None
+
+
+async def update_user_schedule(
+    pool: asyncpg.Pool,
+    schedule_id: int,
+    **kwargs,
+) -> dict | None:
+    allowed = {"label", "cron_expr", "timezone", "enabled", "is_executing"}
+    updates = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
+    if not updates:
+        return await get_schedule(pool, schedule_id)
+    set_parts = [f"{k} = ${i + 2}" for i, k in enumerate(updates)]
+    set_clause = ", ".join(set_parts)
+    values = list(updates.values())
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"UPDATE user_schedules SET {set_clause}, updated_at = NOW() WHERE id = $1 RETURNING *",
+            schedule_id,
+            *values,
+        )
+    return dict(row) if row else None
+
+
+async def delete_user_schedule(pool: asyncpg.Pool, schedule_id: int) -> bool:
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM user_schedules WHERE id = $1", schedule_id
+        )
+    return result == "DELETE 1"
+
+
+async def get_all_schedules_enabled(pool: asyncpg.Pool) -> list[dict]:
+    """All enabled schedules — used at startup to reload APScheduler jobs."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM user_schedules WHERE enabled = TRUE ORDER BY id"
+        )
+    return [dict(r) for r in rows]
+
+
+async def get_all_schedules(pool: asyncpg.Pool) -> list[dict]:
+    """Admin: all schedules joined with user email."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT s.*, u.email
+            FROM user_schedules s
+            JOIN users u ON u.id = s.user_id
+            ORDER BY s.created_at DESC
+            """
+        )
+    return [dict(r) for r in rows]
+
+
+async def mark_schedule_ran(pool: asyncpg.Pool, schedule_id: int) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE user_schedules SET last_ran_at = NOW() WHERE id = $1",
+            schedule_id,
+        )
+
+
+async def set_schedule_executing(pool: asyncpg.Pool, schedule_id: int, executing: bool) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE user_schedules SET is_executing = $1, updated_at = NOW() WHERE id = $2",
+            executing, schedule_id,
+        )
+
+
+async def get_user_is_executing(pool: asyncpg.Pool, user_id: str) -> bool:
+    uid = _uuid_or_none(user_id)
+    if uid is None:
+        return False
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT EXISTS(SELECT 1 FROM user_schedules WHERE user_id = $1 AND is_executing = TRUE) AS running",
+            uid,
+        )
+    return bool(row["running"]) if row else False

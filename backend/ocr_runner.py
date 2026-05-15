@@ -32,12 +32,8 @@ logger = logging.getLogger("ocr_runner")
 # Ensure this logger has at least one handler that flushes immediately,
 # so log lines survive PaddleOCR/MKLDNN C++ stderr interleaving in Docker.
 if not logger.handlers:
-    _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
-    _h.setLevel(logging.DEBUG)
-    logger.addHandler(_h)
     logger.setLevel(logging.DEBUG)
-    logger.propagate = False #True before duplicate logs
+    logger.propagate = True
 
 
 _executor = ThreadPoolExecutor(max_workers=3)

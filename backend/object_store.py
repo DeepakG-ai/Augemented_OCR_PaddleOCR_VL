@@ -11,7 +11,6 @@ from functools import lru_cache
 from .config import (
     MINIO_DOCUMENTS_BUCKET as DOCUMENTS_BUCKET,
     MINIO_ARTIFACTS_BUCKET as ARTIFACTS_BUCKET,
-    MINIO_EXPORTS_BUCKET   as EXPORTS_BUCKET,
     MINIO_ENDPOINT,
     MINIO_ACCESS_KEY,
     MINIO_SECRET_KEY,
@@ -52,10 +51,10 @@ class ObjectStore:
 
     def ensure_buckets(self) -> None:
         if self.client is None:
-            for bucket in (DOCUMENTS_BUCKET, ARTIFACTS_BUCKET, EXPORTS_BUCKET):
+            for bucket in (DOCUMENTS_BUCKET, ARTIFACTS_BUCKET):
                 (self._local_root / bucket).mkdir(parents=True, exist_ok=True)
             return
-        for bucket in (DOCUMENTS_BUCKET, ARTIFACTS_BUCKET, EXPORTS_BUCKET):
+        for bucket in (DOCUMENTS_BUCKET, ARTIFACTS_BUCKET):
             if not self.client.bucket_exists(bucket):
                 self.client.make_bucket(bucket)
 

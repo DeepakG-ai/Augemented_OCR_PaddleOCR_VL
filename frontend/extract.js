@@ -72,10 +72,6 @@ async function renderExtractPage(app) {
                 <button class="small-btn" style="flex:1" onclick="copyResult()">Copy JSON</button>
                 <button class="small-btn" style="flex:1" onclick="downloadResult()">Download JSON</button>
             </div>
-            <div style="display:flex;gap:6px;margin-top:6px">
-                <button class="small-btn" style="flex:1;background:var(--blue-bg);border-color:var(--blue);color:var(--blue)" onclick="downloadCsv()">Export CSV</button>
-                <button class="small-btn" style="flex:1;background:var(--green);border-color:var(--green)" onclick="downloadExcel()">Export Excel</button>
-            </div>
         </div>
     </aside>
     <div class="bottom-bar">
@@ -162,6 +158,7 @@ function renderLineItemFields() {
 function renderBottomBar() {
     const btn = document.getElementById('extractBtn');
     if (!btn) return;
+    if (activeJobId) return;  // extraction in progress — don't override showStopButton()
     btn.style.display = '';
     btn.textContent = 'EXTRACT';
     btn.disabled = !loadedFile;
@@ -614,6 +611,8 @@ async function cancelExtract() {
     if (!activeExtractionId) return;
     const btn = document.getElementById(activeExtractButtonId);
     if (btn) { btn.textContent = 'Cancelling...'; btn.disabled = true; }
+    const badge = document.getElementById('rpBadge');
+    if (badge) { badge.className = 'rp-badge processing'; badge.textContent = 'CANCELLING...'; }
     try {
         await apiJSON(`/jobs/extractions/${activeExtractionId}/cancel`, { method: 'POST' });
     } catch (e) { showToast('Cancel failed: ' + e.message); }
@@ -733,7 +732,12 @@ async function streamJob(jobId) {
                             const message = extraction.error || (event.job && event.job.error) || 'Extraction failed';
                             const cs2 = document.getElementById('conflictSection'); if (cs2) cs2.style.display = 'block';
                             const cm = document.getElementById('conflictMsg'); if (cm) cm.textContent = 'Extraction failed: ' + message;
-                            const cc = document.getElementById('conflictCandidates'); if (cc) cc.innerHTML = '<button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">Retry Extraction</button>';
+                            const failedExtractionId = (event.extraction && event.extraction.id) || activeExtractionId;
+                            const cc = document.getElementById('conflictCandidates');
+                            if (cc) cc.innerHTML = failedExtractionId
+                                ? `<button class="small-btn" onclick="resumeExtract(${failedExtractionId})" style="margin-top:8px;margin-right:6px">▶ Resume Pipeline</button>
+                                   <button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">↻ Restart from Scratch</button>`
+                                : `<button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">↻ Restart from Scratch</button>`;
                             setStatus('optimal');
                             document.getElementById('rpBadge').className = 'rp-badge review';
                             document.getElementById('rpBadge').textContent = 'NEEDS REVIEW';
@@ -777,6 +781,7 @@ async function runExtract() {
         setDetectedVendorDisplay(null, 'Detecting vendor from page 1...');
     }
     showStopButton('extractBtn');
+    activeJobId = 'pending';  // sentinel: prevents renderBottomBar() from re-showing Extract button
     showPipelinePanel({ selectedVendorName: v ? v.name : null });
     const formData = new FormData();
     formData.append('file', loadedFile);
@@ -844,9 +849,17 @@ async function resumeExtract(extractionId) {
         activeExtractionId = payload.extraction_id;
         await streamJob(payload.job_id);
     } catch (err) {
+        if (err.message.includes('HTTP 409') && err.message.includes('draining')) {
+            const cs2 = document.getElementById('conflictSection'); if (cs2) cs2.style.display = 'block';
+            const cm = document.getElementById('conflictMsg'); if (cm) cm.textContent = 'Prior jobs still shutting down — retrying...';
+            const cc = document.getElementById('conflictCandidates');
+            if (cc) cc.innerHTML = `<button class="small-btn" disabled style="margin-top:8px;opacity:0.6">Shutting down prior jobs...</button>`;
+            setTimeout(() => resumeExtract(extractionId), 2000);
+            return;
+        }
         const cs2 = document.getElementById('conflictSection'); if (cs2) cs2.style.display = 'block';
         const cm = document.getElementById('conflictMsg'); if (cm) cm.textContent = 'Resume failed: ' + err.message;
-        const cc = document.getElementById('conflictCandidates'); if (cc) cc.innerHTML = `<button class="small-btn" onclick="resumeExtract(${extractionId})" style="margin-top:8px">Retry Resume</button>`;
+        const cc = document.getElementById('conflictCandidates'); if (cc) cc.innerHTML = `<button class="small-btn" onclick="resumeExtract(${extractionId})" style="margin-top:8px">▶ Retry Resume</button>`;
         setStatus('optimal');
         document.getElementById('rpBadge').className = 'rp-badge review';
         document.getElementById('rpBadge').textContent = 'NEEDS REVIEW';
@@ -884,73 +897,6 @@ function downloadResult() {
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([JSON.stringify(lastResult, null, 2)], { type: 'application/json' }));
     a.download = `extraction_${Date.now()}.json`; a.click();
-}
-
-async function _downloadAuthed(path, fallbackName) {
-    const res = await apiFetch(path);
-    const blob = await res.blob();
-    let filename = fallbackName;
-    const cd = res.headers.get('content-disposition') || '';
-    const m = cd.match(/filename="?([^"]+)"?/i);
-    if (m) filename = m[1];
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-}
-
-function downloadExcel() {
-    if (!activeExtractionId) {
-        showToast('No active extraction selected.');
-        return;
-    }
-    _downloadAuthed(`/extractions/${activeExtractionId}/export.xlsx`, `extraction_${activeExtractionId}.xlsx`)
-        .catch(err => showToast(`Download failed: ${err.message}`));
-}
-
-function downloadCsv() {
-    if (activeExtractionId) {
-        _downloadAuthed(`/extractions/${activeExtractionId}/export.csv`, `extraction_${activeExtractionId}.csv`)
-            .catch(err => showToast(`Download failed: ${err.message}`));
-        return;
-    }
-
-    if (!lastResult) {
-        showToast('No data to export.');
-        return;
-    }
-
-    const headerKeys = Object.keys(lastResult).filter(k => k !== 'line_items');
-    const items = Array.isArray(lastResult.line_items) ? lastResult.line_items : [];
-    const rows = items.length > 0 ? items : [{}];
-
-    const itemKeys = new Set();
-    items.forEach(it => {
-        if (it && typeof it === 'object') Object.keys(it).forEach(k => itemKeys.add(k));
-    });
-    const itemCols = Array.from(itemKeys);
-    const allCols = [...headerKeys, ...itemCols];
-
-    let csvStr = allCols.map(v => `"${(v || '').toString().replace(/"/g, '""')}"`).join(',') + '\n';
-
-    rows.forEach(item => {
-        const rowData = allCols.map(col => {
-            let val = headerKeys.includes(col) ? lastResult[col] : (item ? item[col] : '');
-            if (val === null || val === undefined) val = '';
-            if (typeof val === 'object') val = JSON.stringify(val);
-            return `"${val.toString().replace(/"/g, '""')}"`;
-        });
-        csvStr += rowData.join(',') + '\n';
-    });
-
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([csvStr], { type: 'text/csv' }));
-    a.download = `extraction_${activeExtractionId || Date.now()}.csv`;
-    a.click();
 }
 
 function setStatus(state) {

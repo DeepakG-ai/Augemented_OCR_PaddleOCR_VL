@@ -328,7 +328,7 @@ The buffer trick: each `value` chunk may not align with line boundaries. `split(
 | `login.js` | Login page, `getAuthToken/User/logout` helpers | 88 |
 | `core.js` | Shared state, `apiFetch`, `router`, header, theme | 280 |
 | `vendors.js` | Vendor list, vendor template editor, alias mgmt | ~320 |
-| `extract.js` | Upload, pipeline viz, SSE, exports | ~920 |
+| `extract.js` | Upload, pipeline viz, SSE, JSON result actions | ~920 |
 | `review.js` | Three-panel review, click/drag corrections, save | ~1500+ |
 | `history.js` | Past extractions table | small |
 | `dashboard.js` | Admin metrics view | small |

@@ -11,7 +11,6 @@ The review page is the **only place humans correct extraction output**. Every sa
 2. Writes a `review_events` audit row.
 3. Creates a `gold_examples` row if any header fields changed (used as few-shot examples in future Qwen prompts).
 4. Writes new `spatial_memory` rows for any user-drawn boxes (used to override fields in future extractions).
-5. Re-enqueues the `outbound` stage to regenerate Excel/CSV exports.
 
 ---
 
@@ -67,9 +66,7 @@ PUT /extractions/{id}/corrections
    │     spatial_memory.save_from_corrections()       ← geometry memory
    │       UPSERT spatial_memory (one row per manual box)
    │
-   └─ db.ensure_job(outbound)                         ← re-export xlsx/csv
-        triggers the outbound worker to rebuild exports
-        with the corrected values
+   └─ return save status to the UI
 ```
 
 ---
@@ -242,19 +239,6 @@ Walks through `field_locations`, filters to `strategy == "manual"` header fields
 
 This is the **most important side effect of saving** — it teaches the system *where* a field lives so future extractions don't need correction.
 
-### G) Re-trigger outbound (lines 1996–2005)
-
-```python
-outbound_payload = {"extraction_id": extraction_id, "trigger": "review"}
-await db_mod.ensure_job(pool, ext_id, doc_id, "outbound", outbound_payload)
-```
-
-Excel and CSV exports are rebuilt with the corrected values. The user's `Download Excel` button serves the new file (the outbound worker overwrites the existing `purchase_order.xlsx` MinIO key, and `upsert_delivery` updates the row).
-
-The `trigger: "review"` payload field is informational — visible in worker logs as the reason this outbound ran.
-
----
-
 ## Field-locations strategies (the values you'll see)
 
 | `strategy` | Source | Reusable? | Description |
@@ -288,7 +272,6 @@ This filtering happens in `_is_reusable_header_field` and the `if strategy != "m
 | `404 Extraction not found` | Stale tab; extraction was deleted | Reload, navigate elsewhere |
 | Save succeeds but next extraction still wrong | Gold example not yet picked up — system prompt rebuilt fresh on every extraction, so should take effect immediately. If not, check `gold_examples` table for the new row | Verify `save_gold_example` succeeded; check log for `gold_correction_saved` event |
 | Save succeeds but spatial memory not applied | The box was drawn with strategy ≠ "manual", or the saved region has no current text in the new doc (staleness guard in `apply_to_extraction`) | Confirm `strategy` was `manual` in payload; re-draw if not |
-| Outbound files not updated after save | Outbound worker not running, or the `outbound` job got stuck | `docker compose logs -f outbound-worker`; check `jobs` table for failed outbound rows |
 
 ---
 

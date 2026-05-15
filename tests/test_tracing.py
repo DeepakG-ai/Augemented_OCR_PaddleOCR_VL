@@ -2,7 +2,7 @@
 test_tracing.py — Verify full pipeline tracing works end-to-end.
 
 Simulates the complete document extraction workflow and sends
-hierarchical traces to Phoenix, just like a real extraction would:
+hierarchical traces to MLflow, just like a real extraction would:
 
   document_extraction (root)
   ├── file_upload
@@ -23,7 +23,7 @@ hierarchical traces to Phoenix, just like a real extraction would:
   └── db_persist (final result)
 
 Run:  python tests/test_tracing.py
-View: http://localhost:6006  →  project "augmented_ocr"
+View: http://localhost:5000  →  experiment "augmented_ocr"
 """
 import sys
 import os
@@ -32,11 +32,11 @@ import time
 # Add backend to sys.path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 
-os.environ["PHOENIX_ENABLED"] = "true"
-os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = "http://localhost:4317"
+os.environ["MLFLOW_ENABLED"] = "true"
+os.environ["MLFLOW_TRACKING_URI"] = "http://localhost:5000"
 
-from phoenix_tracing import (
-    setup_phoenix,
+from mlflow_tracing import (
+    setup_mlflow,
     trace_extraction_pipeline,
     trace_file_upload,
     trace_pdf_rendering,
@@ -56,10 +56,10 @@ def simulate_full_pipeline():
     """Simulate the full document extraction pipeline with tracing."""
 
     print("=" * 60)
-    print("  Phoenix Pipeline Tracing Test")
+    print("  MLflow Pipeline Tracing Test")
     print("=" * 60)
 
-    setup_phoenix("augmented_ocr")
+    setup_mlflow("augmented_ocr")
 
     extraction_id = 999
     vendor_id = "TEST_VENDOR"
@@ -195,9 +195,9 @@ def simulate_full_pipeline():
 
     print()
     print("=" * 60)
-    print("  ✅ SUCCESS — Full pipeline trace sent to Phoenix!")
-    print("  📊 Open http://localhost:6006 → project 'augmented_ocr'")
-    print("  👀 Click on 'document_extraction' to see the full tree")
+    print("  SUCCESS - Full pipeline trace sent to MLflow!")
+    print("  Open http://localhost:5000 -> experiment 'augmented_ocr'")
+    print("  Click the extraction run to see the full tree")
     print("=" * 60)
 
 

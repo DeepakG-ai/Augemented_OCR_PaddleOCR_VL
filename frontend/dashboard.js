@@ -568,14 +568,347 @@ async function renderDashboardPage(app) {
             <div style="overflow-x:auto">
                 ${_renderClientTable(_clientsData)}
             </div>
-        </div>` : ''}
+        </div>
+
+        <!-- Admin: per-client vendor counts -->
+        <div style="margin-top:24px;background:var(--bg1);border:1px solid var(--border);border-radius:4px;overflow:hidden">
+            <div style="padding:12px 16px;border-bottom:1px solid var(--border)">
+                <span style="font-size:9px;letter-spacing:0.14em;color:var(--text-dim)">VENDOR BREAKDOWN BY CLIENT</span>
+            </div>
+            <div id="vendorSummaryTable" style="overflow-x:auto">
+                <div style="color:var(--text-dim);padding:14px;font-size:11px">Loading vendor data…</div>
+            </div>
+        </div>` : `
+        <!-- Client: own vendor breakdown -->
+        <div style="margin-top:24px;background:var(--bg1);border:1px solid var(--border);border-radius:4px;overflow:hidden">
+            <div style="padding:12px 16px;border-bottom:1px solid var(--border)">
+                <span style="font-size:9px;letter-spacing:0.14em;color:var(--text-dim)">MY VENDOR BREAKDOWN</span>
+            </div>
+            <div id="vendorSummaryTable" style="overflow-x:auto">
+                <div style="color:var(--text-dim);padding:14px;font-size:11px">Loading vendor data…</div>
+            </div>
+        </div>`}
     </div>
     <div class="bottom-bar">
         <span style="font-size:10px;color:var(--text-dim);letter-spacing:0.1em">${isAdmin ? 'SYSTEM' : 'MY'} USAGE DASHBOARD</span>
         <button class="small-btn" onclick="renderDashboardPage(document.getElementById('appRoot'))"
                 style="margin-left:12px">REFRESH</button>
     </div>`;
+    // Load vendor breakdown asynchronously after paint
+    if (isAdmin) {
+        apiJSON('/admin/dashboard/vendors')
+            .then(rows => {
+                const el = document.getElementById('vendorSummaryTable');
+                if (el) el.innerHTML = _renderAdminVendorSummary(rows);
+            })
+            .catch(e => {
+                const el = document.getElementById('vendorSummaryTable');
+                if (el) el.innerHTML = `<div style="color:var(--red,#e06c75);padding:14px;font-size:11px">${escapeHtml(e.message)}</div>`;
+            });
+    } else {
+        apiJSON('/user/dashboard/vendors')
+            .then(rows => {
+                const el = document.getElementById('vendorSummaryTable');
+                if (el) el.innerHTML = _renderClientVendorList(rows, null);
+            })
+            .catch(e => {
+                const el = document.getElementById('vendorSummaryTable');
+                if (el) el.innerHTML = `<div style="color:var(--red,#e06c75);padding:14px;font-size:11px">${escapeHtml(e.message)}</div>`;
+            });
+    }
+
     updateNavActive();
+}
+
+// ── Vendor breakdown helpers ──────────────────────────────────────────
+
+function _renderAdminVendorSummary(rows) {
+    if (!rows || rows.length === 0) {
+        return `<div style="color:var(--text-dim);padding:14px;font-size:11px">No clients with vendors yet.</div>`;
+    }
+    return `
+    <table style="width:100%;border-collapse:collapse;font-size:11px">
+        <thead>
+            <tr style="border-bottom:1px solid var(--border);color:var(--text-dim);letter-spacing:0.08em">
+                <th style="text-align:left;padding:8px 12px;font-weight:500">CLIENT</th>
+                <th style="text-align:right;padding:8px 12px;font-weight:500">VENDORS</th>
+                <th style="text-align:right;padding:8px 12px;font-weight:500">EXTRACTIONS</th>
+                <th style="text-align:right;padding:8px 12px;font-weight:500">COMPLETED</th>
+                <th style="text-align:center;padding:8px 12px;font-weight:500">DETAILS</th>
+            </tr>
+        </thead>
+        <tbody>
+            ${rows.map(r => `
+            <tr style="border-bottom:1px solid var(--border)"
+                onmouseover="this.style.background='var(--bg2)'" onmouseout="this.style.background=''">
+                <td style="padding:8px 12px;font-weight:500">${escapeHtml(r.email)}</td>
+                <td style="padding:8px 12px;text-align:right;color:var(--blue)">${fmtNum(r.vendor_count)}</td>
+                <td style="padding:8px 12px;text-align:right;color:var(--text-mid)">${fmtNum(r.extraction_count)}</td>
+                <td style="padding:8px 12px;text-align:right;color:var(--green)">${fmtNum(r.completed_extractions)}</td>
+                <td style="padding:8px 12px;text-align:center">
+                    <button class="small-btn"
+                        onclick="navigate('#/vendor-breakdown/${encodeURIComponent(r.user_id)}')">
+                        Vendors
+                    </button>
+                </td>
+            </tr>`).join('')}
+        </tbody>
+    </table>`;
+}
+
+function _renderClientVendorList(vendors, selectedVendorId) {
+    if (!vendors || vendors.length === 0) {
+        return `<div style="color:var(--text-dim);padding:14px;font-size:11px">No vendors configured yet.</div>`;
+    }
+    return `
+    <table style="width:100%;border-collapse:collapse;font-size:11px">
+        <thead>
+            <tr style="border-bottom:1px solid var(--border);color:var(--text-dim);letter-spacing:0.08em">
+                <th style="text-align:left;padding:8px 12px;font-weight:500">VENDOR</th>
+                <th style="text-align:right;padding:8px 12px;font-weight:500">EXTRACTIONS</th>
+                <th style="text-align:right;padding:8px 12px;font-weight:500">PAGES</th>
+                <th style="text-align:right;padding:8px 12px;font-weight:500">DONE</th>
+                <th style="text-align:right;padding:8px 12px;font-weight:500">FAILED</th>
+                <th style="text-align:left;padding:8px 12px;font-weight:500">LAST RUN</th>
+                <th style="text-align:center;padding:8px 12px;font-weight:500">STATS</th>
+            </tr>
+        </thead>
+        <tbody>
+            ${vendors.map(v => `
+            <tr style="border-bottom:1px solid var(--border);${v.vendor_id === selectedVendorId ? 'background:var(--bg2)' : ''}"
+                onmouseover="this.style.background='var(--bg2)'" onmouseout="this.style.background='${v.vendor_id === selectedVendorId ? 'var(--bg2)' : ''}'">
+                <td style="padding:8px 12px;font-weight:500">${escapeHtml(v.vendor_name)}</td>
+                <td style="padding:8px 12px;text-align:right;color:var(--text-mid)">${fmtNum(v.extraction_count)}</td>
+                <td style="padding:8px 12px;text-align:right;color:var(--text-mid)">${fmtNum(v.total_pages_processed)}</td>
+                <td style="padding:8px 12px;text-align:right;color:var(--green)">${fmtNum(v.completed)}</td>
+                <td style="padding:8px 12px;text-align:right;color:${v.failed > 0 ? 'var(--red,#e06c75)' : 'var(--text-dim)'}">${fmtNum(v.failed)}</td>
+                <td style="padding:8px 12px;color:var(--text-dim)">${fmtDate(v.last_extraction_at)}</td>
+                <td style="padding:8px 12px;text-align:center">
+                    <button class="small-btn"
+                        onclick="navigate('#/vendor-stats/${encodeURIComponent(v.vendor_id)}')">
+                        Stats
+                    </button>
+                </td>
+            </tr>`).join('')}
+        </tbody>
+    </table>`;
+}
+
+function _renderVendorDailyChart(daily) {
+    if (!daily || daily.length === 0) {
+        return `<div style="color:var(--text-dim);text-align:center;padding:32px 0;font-size:10px">No extraction data yet.</div>`;
+    }
+    const sorted = [...daily].reverse();
+    const W = 560, H = 150;
+    const PAD = { top: 10, right: 16, bottom: 24, left: 40 };
+    const cW = W - PAD.left - PAD.right;
+    const cH = H - PAD.top - PAD.bottom;
+    const n = sorted.length;
+    const maxVal = Math.max(...sorted.map(d => Number(d.extractions || 0)), 1);
+    const baseY = PAD.top + cH;
+    const slotW = cW / Math.max(n, 1);
+    const barW = Math.max(2, slotW * 0.55);
+
+    function barX(i) { return PAD.left + i * slotW + (slotW - barW) / 2; }
+    function barH(v) { return Math.max(1, (Number(v || 0) / maxVal) * cH); }
+
+    const bars = sorted.map((d, i) => {
+        const h = barH(d.extractions);
+        return `<rect x="${barX(i)}" y="${baseY - h}" width="${barW}" height="${h}"
+                      rx="1.5" fill="var(--blue)" opacity="0.85">
+                    <title>${escapeHtml(d.day)}: ${d.extractions} extractions (${d.completed} done, ${d.failed} failed)</title>
+                </rect>`;
+    }).join('');
+
+    const step = Math.max(1, Math.floor(n / 7));
+    const xLabels = sorted.filter((_, i) => i % step === 0 || i === n - 1).map((d, idx, arr) => {
+        const realIdx = sorted.indexOf(d);
+        return `<text x="${barX(realIdx) + barW / 2}" y="${H - 4}" text-anchor="middle"
+                      fill="var(--text-dim)" font-size="8" font-family="JetBrains Mono,monospace">
+                    ${String(d.day || '').slice(5)}
+                </text>`;
+    }).join('');
+
+    const yLabels = [0.5, 1.0].map(f => {
+        const y = PAD.top + cH * (1 - f);
+        return `<text x="${PAD.left - 4}" y="${y + 3}" text-anchor="end"
+                      fill="var(--text-dim)" font-size="8" font-family="JetBrains Mono,monospace">
+                    ${Math.round(maxVal * f)}
+                </text>
+                <line x1="${PAD.left}" y1="${y}" x2="${W - PAD.right}" y2="${y}"
+                      stroke="var(--border)" stroke-width="1"/>`;
+    }).join('');
+
+    return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" style="display:block">
+        ${yLabels}
+        <line x1="${PAD.left}" y1="${baseY}" x2="${W - PAD.right}" y2="${baseY}"
+              stroke="var(--border)" stroke-width="1"/>
+        ${bars}
+        ${xLabels}
+    </svg>`;
+}
+
+function _renderVendorPageTable(pages) {
+    if (!pages || pages.length === 0) {
+        return `<div style="color:var(--text-dim);padding:14px;font-size:11px">No per-page data yet.</div>`;
+    }
+    return `
+    <table style="width:100%;border-collapse:collapse;font-size:11px">
+        <thead>
+            <tr style="border-bottom:1px solid var(--border);color:var(--text-dim);letter-spacing:0.08em">
+                <th style="text-align:right;padding:7px 14px;font-weight:500">PAGE</th>
+                <th style="text-align:right;padding:7px 14px;font-weight:500">TIMES PROCESSED</th>
+                <th style="text-align:right;padding:7px 14px;font-weight:500">AVG TOKENS</th>
+                <th style="text-align:right;padding:7px 14px;font-weight:500">AVG LATENCY</th>
+            </tr>
+        </thead>
+        <tbody>
+            ${pages.map((p, idx) => `
+            <tr style="border-bottom:1px solid var(--border);${idx % 2 === 1 ? 'background:var(--bg2)' : ''}">
+                <td style="padding:6px 14px;text-align:right;color:var(--blue);font-weight:500">${p.page_number}</td>
+                <td style="padding:6px 14px;text-align:right;color:var(--text-mid)">${fmtNum(p.times_processed)}</td>
+                <td style="padding:6px 14px;text-align:right">${p.avg_tokens ? fmtTokens(p.avg_tokens) : '—'}</td>
+                <td style="padding:6px 14px;text-align:right;color:var(--text-dim)">${p.avg_latency_ms ? fmtLatency(p.avg_latency_ms) : '—'}</td>
+            </tr>`).join('')}
+        </tbody>
+    </table>`;
+}
+
+// ── Vendor breakdown page (admin: per-client vendor list) ─────────────
+
+async function renderVendorBreakdownPage(app, userId) {
+    const authUser = (() => { try { return JSON.parse(localStorage.getItem('auth_user') || 'null'); } catch { return null; } })();
+    const isAdmin = authUser && authUser.role === 'admin';
+    const endpoint = isAdmin
+        ? `/admin/dashboard/clients/${encodeURIComponent(userId)}/vendors`
+        : `/user/dashboard/vendors`;
+
+    app.innerHTML = headerHTML() + `
+    <div class="page-content">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:18px">
+            <button class="small-btn" onclick="navigate('#/dashboard')">Back</button>
+            <div style="font-size:10px;color:var(--text-dim);letter-spacing:0.12em">DASHBOARD / VENDOR BREAKDOWN</div>
+        </div>
+        <div class="page-title">Vendor Breakdown</div>
+        <div style="color:var(--text-dim);font-size:11px;margin-top:12px">Loading…</div>
+    </div>`;
+    updateNavActive();
+
+    try {
+        const vendors = await apiJSON(endpoint);
+        app.innerHTML = headerHTML() + `
+        <div class="page-content">
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:18px">
+                <button class="small-btn" onclick="navigate('#/dashboard')">Back</button>
+                <div style="font-size:10px;color:var(--text-dim);letter-spacing:0.12em">DASHBOARD / VENDOR BREAKDOWN</div>
+            </div>
+            <div class="page-title">Vendor Breakdown</div>
+            <div style="margin-top:16px;background:var(--bg1);border:1px solid var(--border);border-radius:4px;overflow:hidden">
+                <div style="padding:12px 16px;border-bottom:1px solid var(--border)">
+                    <span style="font-size:9px;letter-spacing:0.14em;color:var(--text-dim)">${vendors.length} VENDOR${vendors.length !== 1 ? 'S' : ''}</span>
+                </div>
+                <div style="overflow-x:auto">${_renderClientVendorList(vendors, null)}</div>
+            </div>
+        </div>`;
+        updateNavActive();
+    } catch (e) {
+        app.innerHTML = headerHTML() + `
+        <div class="page-content">
+            <button class="small-btn" onclick="navigate('#/dashboard')" style="margin-bottom:18px">Back</button>
+            <div class="page-title">Error</div>
+            <div style="color:var(--red,#e06c75);font-size:12px;margin-top:12px">${escapeHtml(e.message)}</div>
+        </div>`;
+        updateNavActive();
+    }
+}
+
+// ── Vendor stats detail page ──────────────────────────────────────────
+
+async function renderVendorStatsPage(app, vendorId) {
+    const authUser = (() => { try { return JSON.parse(localStorage.getItem('auth_user') || 'null'); } catch { return null; } })();
+    const isAdmin = authUser && authUser.role === 'admin';
+    const endpoint = isAdmin
+        ? `/admin/dashboard/vendors/${encodeURIComponent(vendorId)}/stats`
+        : `/user/dashboard/vendors/${encodeURIComponent(vendorId)}/stats`;
+
+    app.innerHTML = headerHTML() + `
+    <div class="page-content">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:18px">
+            <button class="small-btn" onclick="history.back()">Back</button>
+            <div style="font-size:10px;color:var(--text-dim);letter-spacing:0.12em">DASHBOARD / VENDOR STATS</div>
+        </div>
+        <div class="page-title">Vendor Stats</div>
+        <div style="color:var(--text-dim);font-size:11px;margin-top:12px">Loading…</div>
+    </div>`;
+    updateNavActive();
+
+    try {
+        const data = await apiJSON(endpoint);
+        app.innerHTML = headerHTML() + `
+        <div class="page-content">
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:18px">
+                <button class="small-btn" onclick="history.back()">Back</button>
+                <div style="font-size:10px;color:var(--text-dim);letter-spacing:0.12em">VENDOR / ${escapeHtml(vendorId)}</div>
+            </div>
+            <div class="page-title">Vendor: ${escapeHtml(vendorId)}</div>
+
+            <!-- Daily extractions chart -->
+            <div style="background:var(--bg1);border:1px solid var(--border);border-radius:4px;padding:18px 20px;margin-top:20px">
+                <div style="font-size:9px;letter-spacing:0.14em;color:var(--text-dim);margin-bottom:12px">
+                    DAILY EXTRACTIONS — LAST 30 DAYS
+                </div>
+                ${_renderVendorDailyChart(data.daily || [])}
+            </div>
+
+            <!-- Daily table -->
+            ${(data.daily || []).length > 0 ? `
+            <div style="margin-top:16px;background:var(--bg1);border:1px solid var(--border);border-radius:4px;overflow:hidden">
+                <div style="padding:10px 16px;border-bottom:1px solid var(--border)">
+                    <span style="font-size:9px;letter-spacing:0.14em;color:var(--text-dim)">DAILY BREAKDOWN</span>
+                </div>
+                <div style="overflow-x:auto">
+                    <table style="width:100%;border-collapse:collapse;font-size:11px">
+                        <thead>
+                            <tr style="border-bottom:1px solid var(--border);color:var(--text-dim);letter-spacing:0.08em">
+                                <th style="text-align:left;padding:7px 14px;font-weight:500">DATE</th>
+                                <th style="text-align:right;padding:7px 14px;font-weight:500">EXTRACTIONS</th>
+                                <th style="text-align:right;padding:7px 14px;font-weight:500">DONE</th>
+                                <th style="text-align:right;padding:7px 14px;font-weight:500">FAILED</th>
+                                <th style="text-align:right;padding:7px 14px;font-weight:500">PAGES</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${(data.daily || []).map((d, idx) => `
+                            <tr style="border-bottom:1px solid var(--border);${idx % 2 === 1 ? 'background:var(--bg2)' : ''}">
+                                <td style="padding:6px 14px;color:var(--text-mid)">${escapeHtml(d.day || '')}</td>
+                                <td style="padding:6px 14px;text-align:right">${d.extractions}</td>
+                                <td style="padding:6px 14px;text-align:right;color:var(--green)">${d.completed}</td>
+                                <td style="padding:6px 14px;text-align:right;color:${d.failed > 0 ? 'var(--red,#e06c75)' : 'var(--text-dim)'}">${d.failed}</td>
+                                <td style="padding:6px 14px;text-align:right;color:var(--text-dim)">${d.total_pages}</td>
+                            </tr>`).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            </div>` : ''}
+
+            <!-- Per-page stats -->
+            <div style="margin-top:16px;background:var(--bg1);border:1px solid var(--border);border-radius:4px;overflow:hidden">
+                <div style="padding:10px 16px;border-bottom:1px solid var(--border)">
+                    <span style="font-size:9px;letter-spacing:0.14em;color:var(--text-dim)">PER-PAGE STATS</span>
+                </div>
+                <div style="overflow-x:auto">${_renderVendorPageTable(data.pages || [])}</div>
+            </div>
+        </div>`;
+        updateNavActive();
+    } catch (e) {
+        app.innerHTML = headerHTML() + `
+        <div class="page-content">
+            <button class="small-btn" onclick="history.back()" style="margin-bottom:18px">Back</button>
+            <div class="page-title">Error</div>
+            <div style="color:var(--red,#e06c75);font-size:12px;margin-top:12px">${escapeHtml(e.message)}</div>
+        </div>`;
+        updateNavActive();
+    }
 }
 
 function _clientDashboardFilter(userId) {

@@ -1,12 +1,11 @@
 """
 page_logger.py -- Append-only page usage log for billing and SLA tracking.
 
-One JSON line per extraction written to logs/page_usage/log.txt.
+One human-readable line per extraction written to logs/page_usage/log.txt.
 Never raises — billing log failures must not crash the pipeline.
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 import threading
@@ -19,6 +18,43 @@ _LOG_PATH = os.path.join(
     "logs", "page_usage", "log.txt",
 )
 _lock = threading.Lock()
+
+
+def _fmt_value(value) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, (list, tuple)):
+        return "[" + "; ".join(_fmt_value(v) for v in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{k}: {_fmt_value(v)}" for k, v in value.items()) + "}"
+    text = str(value).replace("\n", " ").strip()
+    return text if text else "-"
+
+
+def _format_record(record: dict, *, prefix: str) -> str:
+    ts = record.get("ts") or datetime.now(timezone.utc).isoformat()
+    ordered_keys = [
+        "status",
+        "extraction_id",
+        "filename",
+        "vendor_id",
+        "attempt_number",
+        "total_pages",
+        "billable_pages",
+        "digital_pages",
+        "scanned_pages",
+        "qwen_extracted_pages",
+        "qwen_failed_pages",
+        "qwen_skipped_pages",
+        "field_count",
+        "empty_result",
+        "duration_ms",
+        "errors",
+    ]
+    seen = set(ordered_keys) | {"ts"}
+    parts = [f"{key}={_fmt_value(record.get(key))}" for key in ordered_keys if key in record]
+    parts.extend(f"{key}={_fmt_value(value)}" for key, value in record.items() if key not in seen)
+    return f"{ts} | {prefix} | " + "  ".join(parts)
 
 
 def classify_error_type(error: str) -> str:
@@ -48,10 +84,10 @@ def count_result_fields(result) -> int:
 
 
 def append_log(record: dict) -> None:
-    """Append one JSON line to the page usage log. Best-effort — never raises."""
+    """Append one human-readable line to the page usage log. Best-effort; never raises."""
     try:
         record.setdefault("ts", datetime.now(timezone.utc).isoformat())
-        line = json.dumps(record, default=str) + "\n"
+        line = _format_record(record, prefix="PAGE_USAGE") + "\n"
         os.makedirs(os.path.dirname(_LOG_PATH), exist_ok=True)
         with _lock:
             with open(_LOG_PATH, "a", encoding="utf-8") as f:
@@ -79,7 +115,7 @@ def log_limit_alert(
     extraction_id: int | None = None,
     filename: str | None = None,
 ) -> None:
-    """Append one JSON line to the alerts log when a user hits or nears their limit.
+    """Append one human-readable line to the alerts log when a user hits or nears their limit.
 
     alert_type:
         - 'warning'  — user is above the warning threshold (e.g. 90%) but not yet blocked
@@ -105,7 +141,7 @@ def log_limit_alert(
         }
         if extraction_id is not None:
             record["extraction_id"] = extraction_id
-        line = json.dumps(record, default=str) + "\n"
+        line = _format_record(record, prefix="LIMIT_ALERT") + "\n"
         os.makedirs(os.path.dirname(_ALERTS_LOG_PATH), exist_ok=True)
         with _alerts_lock:
             with open(_ALERTS_LOG_PATH, "a", encoding="utf-8") as f:

@@ -13,7 +13,6 @@
 .venv/Scripts/python.exe -m backend.worker --stage ocr
 .venv/Scripts/python.exe -m backend.worker --stage llm
 .venv/Scripts/python.exe -m backend.worker --stage postprocess
-.venv/Scripts/python.exe -m backend.worker --stage outbound
 ```
 
 In Docker, each stage has its own service in `docker-compose.yml`. The `--name` flag (auto-generated as `worker-<8 hex>` if omitted) is recorded as `jobs.locked_by` for debugging "who claimed this job".
@@ -183,12 +182,10 @@ async def process_job(pool, stage, job):
                 await _process_llm(pool, job)
             elif stage == "postprocess":
                 await _process_postprocess(pool, job)
-            elif stage == "outbound":
-                await _process_outbound(pool, job)
             stage_trace["output"] = {"status": "completed", "stage": stage}
 ```
 
-The `trace_pipeline_stage` context manager opens a Phoenix span for the stage; child spans (LLM calls, OCR runs, etc.) inherit the trace context and show up nested in the Phoenix UI at `localhost:6006`.
+The `trace_pipeline_stage` context manager opens an MLflow span for the stage; child spans (LLM calls, OCR runs, etc.) inherit the trace context and show up nested in the MLflow UI at `localhost:5000`.
 
 ---
 
@@ -241,16 +238,11 @@ except Exception as exc:
         # ... write detailed failure log entry ...
     
     # Mark extraction failed
-    if job.get("extraction_id") and stage != "outbound":
+    if job.get("extraction_id"):
         await db_mod.set_extraction_status(pool, ext_id, "failed", error=str(exc))
-    elif job.get("extraction_id") and stage == "outbound":
-        # Outbound failures don't fail the extraction (result is already done)
-        await db_mod.upsert_delivery(pool, ext_id, ..., status="failed", error=str(exc))
     
     await db_mod.fail_job(pool, job["id"], str(exc), retryable=False)
 ```
-
-**Outbound asymmetry**: a failed outbound stage doesn't mark the extraction as failed because the user-facing result is correct — only the export delivery is broken. The `integration_deliveries` row records the error; the user can re-export.
 
 `retryable=False` means the job goes straight to `failed` — no automatic retry. Stale-job recovery doesn't reset failed jobs.
 
@@ -270,8 +262,6 @@ Document upload
                            ▼
                     [postprocess]    ←  rendezvous via _maybe_enqueue_postprocess
                            │
-                           ▼
-                      [outbound]     ←  fire-and-forget for the user
 ```
 
 Each box is a separate worker process. If you scale `--stage llm` to 2 workers, two extractions can run their LLM stages concurrently (each on its own GPU stream — though llama.cpp typically batches at the model level).
@@ -303,7 +293,7 @@ pending_pages = [p for p in pages if p["page_number"] >= start_from_page and p["
 - **Log line `Periodic recovery: reset N stale jobs`**: if you see this often, a worker is dying mid-job; investigate stack traces.
 - **`docker compose logs -f api`**: watch ingest + SSE traffic.
 - **`docker compose logs -f normalize-worker llm-worker`**: watch the slow stages.
-- **Phoenix at localhost:6006**: timeline of stages and LLM calls per extraction.
+- **MLflow at localhost:5000**: timeline of stages and LLM calls per extraction.
 - **`SELECT id, job_type, status, attempts, locked_by, locked_at, error FROM jobs ORDER BY id DESC LIMIT 20`**: quick health check on the queue.
 
 ---
@@ -314,4 +304,4 @@ pending_pages = [p for p in pages if p["page_number"] >= start_from_page and p["
 - **Job priorities for paying customers.** All priorities are 100 by default. The schema supports it but no code uses it.
 - **Worker scaling per tenant.** All clients share the same worker pool. No per-tenant queue.
 - **Dead-letter queue.** Failed jobs stay as `status='failed'` rows. No auto-archive or alerting.
-- **Job dependencies in the DB schema.** The chain (`normalize → ocr/llm → postprocess → outbound`) is encoded in the worker code, not as DB foreign keys between job rows.
+- **Job dependencies in the DB schema.** The chain (`normalize → ocr/llm → postprocess`) is encoded in the worker code, not as DB foreign keys between job rows.

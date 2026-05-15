@@ -33,7 +33,7 @@ docker compose up --build
 
 # App UI:    http://localhost:8000
 # MinIO UI:  http://localhost:9001  (minioadmin / minioadmin)
-# Phoenix:   http://localhost:6006
+# MLflow:    http://localhost:5000
 ```
 
 ### Without Docker (dev iteration)

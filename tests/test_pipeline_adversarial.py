@@ -114,8 +114,8 @@ class ExtractorAdversarialTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WorkerFailurePathTests(unittest.IsolatedAsyncioTestCase):
-    async def test_run_worker_marks_outbound_delivery_failed_when_stage_crashes(self) -> None:
-        job = {"id": 77, "extraction_id": 88, "document_id": 99, "job_type": "outbound"}
+    async def test_run_worker_marks_stage_failed_when_stage_crashes(self) -> None:
+        job = {"id": 77, "extraction_id": 88, "document_id": 99, "job_type": "maintenance"}
 
         async def stop_after_first_idle(_seconds: float) -> None:
             raise asyncio.CancelledError()
@@ -130,15 +130,14 @@ class WorkerFailurePathTests(unittest.IsolatedAsyncioTestCase):
              patch.object(worker.db_mod, "claim_job", new=AsyncMock(side_effect=[job, None])), \
              patch.object(worker, "process_job", new=AsyncMock(side_effect=RuntimeError("minio down"))), \
              patch.object(worker.db_mod, "complete_job", new=AsyncMock()), \
-             patch.object(worker.db_mod, "set_extraction_status", new=AsyncMock()), \
-             patch.object(worker.db_mod, "upsert_delivery", new=AsyncMock()) as mock_delivery, \
+             patch.object(worker.db_mod, "set_extraction_status", new=AsyncMock()) as mock_status, \
              patch.object(worker.db_mod, "fail_job", new=AsyncMock()) as mock_fail_job, \
              patch.object(worker.asyncio, "sleep", new=AsyncMock(side_effect=stop_after_first_idle)):
             with self.assertRaises(asyncio.CancelledError):
-                await worker.run_worker("outbound", "outbound-worker")
+                await worker.run_worker("maintenance", "maintenance-worker")
 
-        mock_delivery.assert_awaited_once()
-        self.assertEqual(mock_delivery.await_args.kwargs["status"], "failed")
+        mock_status.assert_awaited_once()
+        self.assertEqual(mock_status.await_args.args[2], "failed")
         mock_fail_job.assert_awaited_once_with(pool_obj, 77, "minio down", retryable=False)
 
 

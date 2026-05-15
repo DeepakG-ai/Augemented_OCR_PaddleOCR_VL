@@ -72,5 +72,49 @@ class LlmUsageRecordingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["llm_url"], "http://localhost:8001/v1/chat/completions")
 
 
+class LlmResponseGuardTests(unittest.IsolatedAsyncioTestCase):
+    """call_llm must not crash when the LLM returns a malformed response."""
+
+    def _mock_client(self, response_body: dict):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = response_body
+        return resp
+
+    async def _call(self, response_body: dict):
+        resp = self._mock_client(response_body)
+        with patch("backend.extractor.httpx.AsyncClient") as MockClient, \
+             patch.object(extractor.db_mod, "record_llm_usage", new=AsyncMock(return_value={"id": 1})):
+            MockClient.return_value.__aenter__ = AsyncMock(return_value=MockClient.return_value)
+            MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value.post = AsyncMock(return_value=resp)
+            return await extractor.call_llm(
+                _b64(), "sys", "usr",
+                "http://localhost:8001/v1/chat/completions", "qwen3vl",
+                page_num=1, total_pages=1, pool=None,
+            )
+
+    async def test_missing_choices_returns_empty_dict(self):
+        """LLM response with no 'choices' key must return {} without crashing."""
+        result = await self._call({"error": "model overloaded"})
+        self.assertEqual(result, {})
+
+    async def test_empty_choices_list_returns_empty_dict(self):
+        """LLM response with choices=[] must return {} without crashing."""
+        result = await self._call({"choices": []})
+        self.assertEqual(result, {})
+
+    async def test_choices_item_not_a_dict_returns_empty_dict(self):
+        """choices[0] being a non-dict (e.g. integer) must return {} without crashing."""
+        result = await self._call({"choices": [42]})
+        self.assertEqual(result, {})
+
+    async def test_choices_item_missing_message_returns_empty_dict(self):
+        """choices[0] present but lacking 'message' key must return {}."""
+        result = await self._call({"choices": [{"finish_reason": "stop"}]})
+        self.assertEqual(result, {})
+
+
 if __name__ == "__main__":
     unittest.main()

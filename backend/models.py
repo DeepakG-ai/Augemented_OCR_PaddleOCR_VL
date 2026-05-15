@@ -62,6 +62,7 @@ class VendorOut(BaseModel):
     name: str
     status: str
     created_at: datetime
+    user_id: str | None = None
 
 
 class VendorAliasCreate(BaseModel):

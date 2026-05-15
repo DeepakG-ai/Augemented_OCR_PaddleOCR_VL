@@ -18,12 +18,11 @@ If you're new to the codebase, follow this order. Each file builds on the previo
 4. **[login.md](login.md)** — Frontend login page + `/auth/login` endpoint, full request flow.
 5. **[frontend.md](frontend.md)** — SPA router, `apiFetch`, auth guard, state model.
 6. **[vendor_detection.md](vendor_detection.md)** — How a document becomes a vendor (alias + fuzzy matching), and how the user_id filter prevents leakage.
-7. **[extraction.md](extraction.md)** — The 5-stage pipeline (`/ingest/ui` → normalize → ocr → llm → postprocess → outbound).
+7. **[extraction.md](extraction.md)** — The 4-stage pipeline (`/ingest/ui` → normalize → ocr → llm → postprocess).
 8. **[workers.md](workers.md)** — Worker mechanics: claim, retry, stale recovery, SSE streaming.
 9. **[bbox_agent.md](bbox_agent.md)** — The two-agent split (BBox Agent + Fields Agent) and why it exists.
 10. **[spatial_memory.md](spatial_memory.md)** — How manual corrections become durable geometry memory.
 11. **[review.md](review.md)** — Review page, drag-box corrections, save flow.
-12. **[export.md](export.md)** — CSV/Excel building, `contracts.py`, MinIO storage.
 
 ---
 
@@ -45,7 +44,6 @@ If you're new to the codebase, follow this order. Each file builds on the previo
 | `backend/geometry.py` | [extraction.md](extraction.md) (digital vs scanned classification) |
 | `backend/ocr_runner.py` | [extraction.md](extraction.md) (PaddleOCR) |
 | `backend/processor.py` | [extraction.md](extraction.md) (PDF → images) |
-| `backend/exporter.py` + `contracts.py` | [export.md](export.md) |
 
 ### Frontend (vanilla JS SPA)
 

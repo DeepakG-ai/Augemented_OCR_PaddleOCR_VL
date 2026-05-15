@@ -1,0 +1,1044 @@
+Corrected Codex Audit Report
+Date: 2026-05-13
+Workspace: C:\Users\aigroup5\PycharmProjects\Augemented_OCR_PaddleOCR_VL
+Source reviewed: audit\audit report.txt
+Output file: audit\audit_codex.txt
+
+Scope
+-----
+This report validates the claims in the combined agent audit report against the
+current code. Some source findings were correct, some were outdated, and some
+were directionally right but overstated.
+
+No product code was changed for this audit. This file is the only artifact
+created by Codex.
+
+Validation lanes used
+---------------------
+1. Vendor, template, and ingest flow.
+2. PDF geometry, OCR, Qwen/LLM, and worker pipeline.
+3. Review UI, manual correction flow, gold examples, and spatial memory.
+4. Billing, history deletion, subscription limits, dashboard, and user/admin
+   isolation.
+
+Verdict legend
+--------------
+VERIFIED
+  The finding is supported by current code.
+
+PARTIAL
+  The finding has a real issue, but the source report wording was incomplete
+  or overstated.
+
+WRONG
+  The finding is contradicted by current code or is no longer true.
+
+NEEDS CONTEXT
+  The risk is plausible, but cannot be proven from the repository alone.
+
+
+Executive Summary
+=================
+
+The current code already contains large parts of the requested hybrid pipeline:
+
+- Page-level pypdfium2/PaddleOCR geometry routing exists.
+- Upload-first vendor detection exists when no vendor is preselected.
+- Unknown auto-detected vendors hard-stop with a "create vendor and vendor id"
+  hint.
+- Admin-only four-prompt previews are enforced by the backend.
+- Spatial memory exists and reuses geometry, not old answer values.
+- Admin/client dashboard isolation is mostly enforced through backend filters
+  and admin-only endpoints.
+
+The highest-priority real gaps are:
+
+1. Vendor creation still allows blank vendor id in the UI by generating a
+   random id, and admin vendor creation fails because the UI does not provide
+   owner user_id.
+
+2. Vendor detection is not exact-only. It exact-matches first, then falls back
+   to fuzzy matching, and the exact matcher is substring-based. Vendor id is
+   not automatically a detection candidate.
+
+3. If a vendor_id is preselected, the backend skips current-document page-1
+   vendor detection and only checks access to that vendor.
+
+4. Template save does not require both header fields and line-item fields.
+   It allows empty lists; extraction only blocks a template with zero total
+   fields.
+
+5. Client template save can auto-create a missing vendor, bypassing the desired
+   explicit vendor-page creation workflow.
+
+6. A digital PDF page can be classified as pypdfium if it has enough printable
+   characters even when word extraction returns zero words. That page will not
+   fall back to PaddleOCR during the main geometry pipeline.
+
+7. PaddleOCR is initialized with return_word_box=True, but current code reads
+   rec_texts/rec_boxes, so the returned "words" are text regions or lines, not
+   reliable true word-level boxes.
+
+8. Qwen response parsing assumes choices[0].message.content exists before
+   guarding response shape.
+
+9. Templates marked single_page do not hard-stop on multi-page uploads. They
+   silently fall back into multipage merge behavior.
+
+10. Review drag-selection is not restricted to header values. Line-item cells
+    can be selected in the UI, key-vs-value selection is not validated, and
+    confirm-before-overwrite only runs for gold/spatial-memory conflicts.
+
+11. Spatial memory layout_key is only vendor_id:template_id. It does not yet
+    include anchor/header-position fingerprinting, so different layouts for the
+    same vendor/template can share memory incorrectly.
+
+12. History delete keeps raw llm_usage rows but nulls extraction_id. Because
+    billable-page counting excludes null extraction_id, deleting history can
+    reduce billable page counts while token totals may still remain.
+
+13. Quota checks fail open on DB errors and use read-before-submit with no page
+    reservation, so concurrent uploads can overshoot limits.
+
+Major source-report claims that were wrong:
+
+- "main.py indentation crash" is wrong. The inspected indentation is ugly but
+  syntactically valid.
+- "Digital-only PDFs are stuck forever because ocr_data is never populated" is
+  wrong. The OCR stage saves unified ocr_data for all-digital PDFs.
+- "Duplicate postprocess active jobs are created" is wrong in the active-job
+  case. ensure_job has a precheck race, but enqueue_job is backed by an
+  ON CONFLICT partial unique index for queued/running jobs.
+- "Cancelled normalize still spawns OCR/LLM orphan jobs" is wrong for the
+  inspected flow; normalize checks cancellation before enqueueing OCR/LLM.
+- "Spatial memory reuses old corrected answer values" is wrong. The reusable
+  spatial_memory table stores normalized boxes, and apply reads current
+  document words inside those boxes.
+- "Line-item bounding boxes are not persisted at all" is wrong. They are saved
+  per extraction in field_locations, but not reused as spatial memory.
+- "Billable pages survive history deletion" is wrong. Raw usage survives, but
+  billable pages do not because extraction_id is nulled and excluded.
+- "No client-facing stats endpoint" is wrong. /user/stats exists and is used.
+- "Dashboard state never clears on logout" is wrong. logout reloads the page.
+
+
+1. Vendor, Template, and Ingest
+==============================
+
+V-01. Vendor page can create a vendor without user-entered vendor id
+Verdict: VERIFIED
+Evidence:
+- frontend/vendors.js:80-85
+- backend/models.py:17-23
+Details:
+The modal has a Vendor ID field, but saveNewVendor() silently generates a
+random uppercase id when the input is blank. This violates the requirement that
+the user must explicitly create the vendor with vendor id.
+
+V-02. Admin cannot create a new vendor from the vendor page
+Verdict: VERIFIED
+Evidence:
+- backend/main.py:604-610
+- frontend/vendors.js:80-85
+Details:
+The backend requires admin-created vendors to include user_id. The vendor modal
+sends only {id, name}. New admin vendor creation will fail unless some other
+path supplies user_id.
+
+V-03. Template save can auto-create client vendors
+Verdict: VERIFIED
+Evidence:
+- backend/main.py:868-885
+Details:
+If a vendor is missing and the caller is a client, save_template() auto-upserts
+the vendor. Admins are blocked from that path, but clients can still bypass the
+intended "create vendor first" flow.
+
+V-04. Vendor detector is not exact-match-only
+Verdict: VERIFIED
+Evidence:
+- backend/vendor_detector.py:258-263
+Details:
+detect_vendor() tries _detect_exact() first, then falls back to _detect_fuzzy()
+using RapidFuzz. This conflicts with a strict exact-match requirement.
+
+V-05. Exact matching is substring matching, not boundary-safe equality
+Verdict: VERIFIED
+Evidence:
+- backend/vendor_detector.py:124-147
+Details:
+_detect_exact() checks whether normalized pattern text is contained in the
+full normalized page text. It does not require token-boundary equality and it
+does not report ambiguity for overlapping exact patterns.
+
+V-06. Vendor id is not automatically a detection candidate
+Verdict: VERIFIED
+Evidence:
+- backend/vendor_detector.py:104-121
+Details:
+The detector loads manual aliases and appends vendor names. It does not append
+the vendor id as a pattern, despite the module docstring mentioning names/ids.
+Vendor ids only match if manually added as aliases.
+
+V-07. First-page vendor detection exists but is not enforced globally
+Verdict: PARTIAL
+Evidence:
+- backend/main.py:705-737
+- backend/main.py:1299-1357
+- backend/main.py:1417-1418
+- backend/vendor_detector.py:234-263
+Details:
+/detect-vendor and auto-ingest without vendor_id render page 1 only. However,
+vendor_detector.detect_vendor() itself accepts any word list, and ingest skips
+current-file detection entirely when vendor_id is preselected.
+
+V-08. Unknown vendor hard-stop works only in auto-detect mode
+Verdict: PARTIAL
+Evidence:
+- backend/main.py:1363-1398
+- backend/main.py:1417-1418
+Details:
+When no vendor_id is supplied and no match is found, the route raises 409 with
+the expected "Create the vendor and vendor id first" hint. If vendor_id is
+supplied, the PDF is not re-detected and may be extracted under the selected
+vendor if access passes.
+
+V-09. Header fields and line-item fields are not mandatory at save time
+Verdict: VERIFIED
+Evidence:
+- backend/models.py:93-106
+- backend/main.py:289-298
+- frontend/vendors.js:289-300
+Details:
+TemplateCreate defaults both field lists to empty. The UI saves without local
+validation. Extraction blocks only when the saved template has zero total
+fields, not when one of the two required categories is missing.
+
+V-10. Admin prompt previews are correctly hidden from clients by the backend
+Verdict: VERIFIED
+Evidence:
+- backend/main.py:769-816
+- frontend/vendors.js:113-150
+Details:
+The frontend condition uses local role, but the important enforcement is in the
+API: prompt fields are nulled by default and the four prompt previews are only
+built for admin. Changing localStorage role alone should not reveal backend
+prompt content.
+
+V-11. Format type is only partially implemented
+Verdict: VERIFIED
+Evidence:
+- backend/models.py:83-88
+- frontend/vendors.js:158-163
+- backend/extractor.py:225-292
+- backend/extractor.py:702-720
+Details:
+single_po_multipage, po_per_page, and single_page are saved and merge behavior
+branches on them. But the user message is broadly the same per page and still
+asks for header fields and all visible line item rows. There are no strong
+format-specific prompt instructions.
+
+V-12. REST ingest can override template field lists
+Verdict: VERIFIED
+Evidence:
+- backend/main.py:1196-1197
+- backend/main.py:1427-1428
+- backend/main.py:321-331
+- backend/worker.py:547-548
+Details:
+Request-provided header_fields/line_item_fields are stored on the extraction.
+The worker prefers extraction-row fields when non-empty. A non-frontend caller
+can therefore extract fields that differ from the saved template.
+
+V-13. Useful endpoints that already exist
+Verdict: VERIFIED
+Evidence:
+- backend/main.py:676-760 for /detect-vendor
+- backend/main.py:1883-1907 for /upload-preview
+Details:
+The repo has a vendor detection endpoint and an upload preview endpoint. These
+are useful for validating page-1 detection and previewing pages without running
+LLM extraction.
+
+
+2. Geometry, OCR, Qwen, and Worker Pipeline
+==========================================
+
+G-01. Page-level pypdfium2/PaddleOCR routing exists
+Verdict: VERIFIED
+Evidence:
+- backend/geometry.py:74-116
+- backend/worker.py:228-318
+- backend/worker.py:395-517
+Details:
+The normalize stage computes page-level geometry. Digital pages get pypdfium
+word_geometry; scanned pages are listed for PaddleOCR. The OCR stage only
+loads scanned page images and merges OCR words into unified geometry.
+
+G-02. Mixed digital/scanned PDF support is implemented with one caveat
+Verdict: PARTIAL
+Evidence:
+- backend/worker.py:469-517
+- backend/geometry.py:119-144
+Details:
+The merge path preserves digital geometry and fills scanned pages from OCR.
+The caveat is G-03: a page with enough embedded chars but zero extracted words
+can still be labeled pypdfium and never OCR-fallback during the main pipeline.
+
+G-03. Zero-word pypdfium fallback is missing in the main geometry classifier
+Verdict: VERIFIED
+Evidence:
+- backend/pdf_extractor.py:29-44
+- backend/geometry.py:56-71
+Details:
+page_is_digital() classifies from printable char count. _digital_words_for_page()
+returns is_digital=True if that threshold passes, even if extract_words() returns
+an empty list.
+
+G-04. PaddleOCR output is not true word-level geometry
+Verdict: VERIFIED
+Evidence:
+- backend/ocr_runner.py:57-67
+- backend/ocr_runner.py:97-113
+Details:
+PaddleOCR is created with return_word_box=True, but current code consumes
+rec_texts, rec_scores, and rec_boxes. The resulting list is text-region/line
+level in practice, not guaranteed word-level boxes.
+
+G-05. Qwen page-1 schema is vendor_confirmed/fields/boxes
+Verdict: VERIFIED
+Evidence:
+- backend/extractor.py:171-184
+- backend/extractor.py:250-258
+- backend/worker.py:620-624
+Details:
+Claims expecting vendor_detected or bbox do not match current code. The current
+page-1 prompt asks for vendor_confirmed, fields, and boxes.
+
+G-06. Qwen bbox alignment fix is implemented
+Verdict: VERIFIED
+Evidence:
+- backend/worker.py:706-728
+- backend/qwen_layout_apply.py
+Details:
+The worker maps Qwen 0-1000 boxes through 32-pixel aligned dimensions and saves
+normalized boxes. qwen_layout_apply later denormalizes and maps them to fields.
+
+G-07. backend/qwen_bbox_parser.py is absent
+Verdict: VERIFIED
+Evidence:
+- repository file listing
+- backend/worker.py:692-743
+- backend/qwen_layout_apply.py
+Details:
+The active bbox logic is inline in worker.py plus qwen_layout_apply.py. A report
+that references backend/qwen_bbox_parser.py is stale for this checkout.
+
+G-08. llama.cpp context size 8192 is not enforced by backend code
+Verdict: VERIFIED
+Evidence:
+- backend/extractor.py:419-426
+- backend/config.py
+Details:
+The backend sends max_tokens from config, but does not set or verify llama.cpp
+ctx-size. Context overflow risk is NEEDS CONTEXT because it depends on the
+external llama-server launch arguments and actual prompt/image tokenization.
+
+G-09. single_page multi-page uploads silently fall back to multipage merge
+Verdict: VERIFIED
+Evidence:
+- backend/extractor.py:703-720
+Details:
+The single_page branch only applies when len(page_results) == 1. A template set
+to single_page with a multi-page PDF is merged through merge_results().
+
+G-10. po_per_page returns one record per successful page
+Verdict: VERIFIED
+Evidence:
+- backend/extractor.py:703-708
+Details:
+po_per_page builds a list from each non-error page's fields.
+
+G-11. Digital-only PDFs are not stuck forever
+Verdict: WRONG source claim
+Evidence:
+- backend/worker.py:409-431
+- backend/db.py:1728-1743
+Details:
+All-digital OCR stage skips PaddleOCR but still saves unified ocr_data from
+page word_geometry, satisfying postprocess readiness.
+
+G-12. Duplicate active postprocess jobs are blocked
+Verdict: WRONG source claim, with nuance
+Evidence:
+- backend/db.py:258-260
+- backend/db.py:2041-2045
+- backend/db.py:2077-2088
+Details:
+ensure_job() has a read-before-insert precheck, but enqueue_job() uses
+ON CONFLICT backed by a partial unique index on active jobs. Duplicate
+queued/running postprocess jobs should be blocked. The precheck is redundant,
+not the cause of duplicate active jobs.
+
+G-13. Normalize cancellation does not enqueue OCR/LLM after the cancel check
+Verdict: WRONG source claim, with a separate partial issue
+Evidence:
+- backend/worker.py:368-384
+- backend/db.py:2210-2238
+Details:
+Normalize checks _stop_if_cancelled() before enqueueing OCR/LLM. However,
+cancelled running jobs can enter status "cancelling", and recover_stale_jobs()
+only recovers "running" jobs. That is a real cancellation recovery gap.
+
+G-14. main.py indentation crash claim is wrong
+Verdict: WRONG source claim
+Evidence:
+- backend/main.py around the SSE generator and legacy /extract path
+Details:
+The source audit claimed an IndentationError. The inspected code path is
+syntactically valid. It may be stylistically uneven, but not a runtime syntax
+crash.
+
+G-15. LLM response shape is not guarded before indexing
+Verdict: VERIFIED
+Evidence:
+- backend/extractor.py:455-500
+Details:
+call_llm() indexes resp_json["choices"][0]["message"]["content"] before
+validating that choices exists and has that shape. Error payloads or empty
+choices can raise KeyError or IndexError.
+
+G-16. Rendering can upscale images during 32-pixel alignment
+Verdict: VERIFIED
+Evidence:
+- backend/processor.py:41-69
+Details:
+_resize_to_vlm_budget() rounds dimensions to the nearest multiple of 32. This
+can increase dimensions after scaling or even when no downscale was needed.
+
+G-17. Corrupt/unrenderable pages are skipped without placeholders
+Verdict: VERIFIED
+Evidence:
+- backend/processor.py:89-163
+- backend/worker.py:346-357
+Details:
+If rendering a page fails, the page is skipped. Downstream total_pages is based
+on saved rendered rows, not original PDF page count, so a corrupt page can
+change page numbering/count semantics.
+
+G-18. _strip_newlines destroys multiline address formatting
+Verdict: VERIFIED
+Evidence:
+- backend/extractor.py:60-68
+Details:
+All parsed LLM string values have \n and \r replaced with spaces recursively.
+That can flatten multi-line addresses such as ship_to/bill_to.
+
+G-19. Header value normalization deduplicates case-insensitively
+Verdict: VERIFIED, but severity depends on data
+Evidence:
+- backend/extractor.py:762-788
+Details:
+_combine_header_value() deduplicates lines by casefold(). This is usually okay
+for repeated labels/addresses, but it can drop distinct values that differ only
+by case.
+
+G-20. No line item deduplication across pages
+Verdict: VERIFIED
+Evidence:
+- backend/extractor.py:828-843
+- backend/extractor.py:857-870
+Details:
+merge_results() appends line items from each valid page. It does not dedupe
+duplicate continuation-page rows.
+
+G-21. LLM usage recording is best-effort only
+Verdict: VERIFIED
+Evidence:
+- backend/extractor.py:478-498
+Details:
+record_llm_usage() failures are logged as warnings and extraction continues.
+This avoids failing user work, but token/billing data can be lost with no retry.
+
+G-22. page_logger non-dict list crash claim is wrong
+Verdict: WRONG source claim
+Evidence:
+- backend/page_logger.py:35-47
+Details:
+The current count_result_fields() explicitly filters list entries with
+isinstance(r, dict) before calling r.items().
+
+G-23. Processor ThreadPoolExecutor and ocr_runner ThreadPoolExecutor live for
+process lifetime
+Verdict: PARTIAL
+Evidence:
+- backend/processor.py:36
+- backend/ocr_runner.py:43
+Details:
+They are module-level executors without explicit shutdown. In a long-running
+worker this is normal. For graceful shutdown hygiene it is a real cleanup gap,
+but not a per-document thread leak.
+
+
+3. Review UI, Corrections, Gold Examples, and Spatial Memory
+============================================================
+
+R-01. Review UI still calls /ocr, not /geometry
+Verdict: VERIFIED
+Evidence:
+- frontend/review.js:233
+- backend/main.py:1912-1923
+- backend/main.py:1926-1985
+Details:
+This is not currently breaking because ocr_data is overloaded with unified
+geometry for new extractions. Still, the endpoint name is misleading and the
+new /geometry endpoint is not the review UI path.
+
+R-02. Drag-select is not header-only in the UI
+Verdict: VERIFIED
+Evidence:
+- frontend/review.js line-item selection code around line_item_* keys
+- backend/spatial_memory.py:74-82
+Details:
+Line-item cells can start selection in the frontend. Backend spatial memory
+then rejects reusable line-item memory, but the UI does not make that limitation
+clear during selection.
+
+R-03. Line-item field_locations are persisted per extraction
+Verdict: WRONG source claim
+Evidence:
+- frontend/review.js sends field_locations during save
+- backend/main.py:2110-2116
+- backend/db.py:1761-1788
+Details:
+The backend saves field_locations wholesale with corrections. The correct
+statement is: line-item locations can be saved for this extraction, but reusable
+spatial_memory skips line-item keys.
+
+R-04. Typed-edit warning exists but has gaps
+Verdict: PARTIAL
+Evidence:
+- frontend/review.js typed-only confirmation logic
+Details:
+The review UI has a final warning for typed-only changed fields. However, if a
+field already has manual location strategy, a later typed edit can keep that
+manual location and skip typed-only treatment. That can re-save stale geometry.
+
+R-05. Confirm-before-overwrite is incomplete
+Verdict: VERIFIED
+Evidence:
+- frontend/review.js rvAcceptSelection confirmation logic
+Details:
+The UI asks for confirmation when replacing existing gold/spatial-memory
+corrections. It does not ask before replacing a normal Qwen result/location.
+
+R-06. No key-vs-value selection validation
+Verdict: VERIFIED
+Evidence:
+- frontend/review.js selection apply logic
+- backend/spatial_memory.py save/apply logic
+Details:
+The frontend accepts whatever words fall inside the drawn rectangle. The backend
+does not validate that the selected region is a value instead of a label. If a
+user selects "ship_to" label text, future spatial memory can read the label.
+
+R-07. Spatial memory stores geometry, not reusable answer text
+Verdict: VERIFIED
+Evidence:
+- backend/db.py:318-330
+- backend/spatial_memory.py:160-302
+Details:
+The reusable table stores vendor_id, layout_key, field_key, page_number,
+normalized_box, source_engine, extraction id, verification timestamp, and active
+flag. It does not store old matched_text as the future answer.
+
+R-08. Spatial memory apply reads current document words
+Verdict: VERIFIED
+Evidence:
+- backend/spatial_memory.py:132-145
+- backend/spatial_memory.py apply path around current words/result override
+- backend/worker.py:922-958
+Details:
+On postprocess, spatial memory looks up saved regions, denormalizes them for
+the current page, reads current words in the box, and writes that current text
+into the result. This matches the requested "geometry memory, not answer
+memory" rule.
+
+R-09. Spatial memory does not reuse old corrected values
+Verdict: WRONG source claim
+Evidence:
+- backend/db.py:318-330
+- backend/spatial_memory.py
+Details:
+Old values exist in review_events/gold_examples for audit/hints. They are not
+used as future spatial-memory answers.
+
+R-10. Typed edits over existing manual boxes can re-save old geometry
+Verdict: PARTIAL
+Evidence:
+- backend/main.py:2165-2175
+- backend/spatial_memory.py save path
+Details:
+This is a stale-geometry risk, not stale-answer reuse. A user may type a value
+while keeping a previous manual field_location; the backend may save that box
+again as spatial memory.
+
+R-11. Reusable line-item spatial memory is blocked backend-side
+Verdict: VERIFIED
+Evidence:
+- backend/spatial_memory.py:74-82
+Details:
+_is_reusable_header_field() rejects line_items and line_item_* keys.
+
+R-12. Spatial memory field restriction fallback is too permissive
+Verdict: PARTIAL
+Evidence:
+- backend/spatial_memory.py:59-82
+Details:
+If configured header fields cannot be loaded, _is_reusable_header_field()
+allows any non-line-item top-level key. The source report overstated this as
+allowing line items; line-item prefixes are still blocked.
+
+R-13. layout_key is too broad for multi-layout vendors
+Verdict: VERIFIED
+Evidence:
+- backend/layout_key.py
+- backend/main.py:847-853
+Details:
+layout_key is effectively vendor_id:template_id. It does not include anchor
+hashes or stable header/position fingerprints. Different layouts for the same
+vendor/template can share memory incorrectly.
+
+R-14. Qwen layout boxes do not overwrite spatial memory when memory succeeds
+Verdict: PARTIAL source claim
+Evidence:
+- backend/worker.py:879-897
+- backend/worker.py:922-958
+Details:
+Postprocess builds field_locations from Qwen boxes first, then applies spatial
+memory after. Spatial memory wins when it finds current text. Qwen remains only
+as fallback when spatial lookup fails.
+
+R-15. Gold prompt hints are value-redacted
+Verdict: VERIFIED
+Evidence:
+- backend/extractor.py:100-121
+- backend/extractor.py:157-169
+Details:
+Gold examples are converted to field-level warning categories and the prompt
+explicitly says to extract current visible document values, not reuse prior
+corrections. This differs from the user's original example idea of sending
+"original: X, corrected: Y"; current code intentionally avoids value leakage.
+
+R-16. Gold examples are prompt-header-only but audit rows store full result JSON
+Verdict: PARTIAL
+Evidence:
+- backend/main.py:2134-2149
+- backend/db.py:1900-1917
+Details:
+correction_diff is filtered to exclude line-items before prompt use. However,
+save_gold_example() stores full original_result and corrected_result for audit.
+The prompt path uses redacted diffs, not full values.
+
+
+4. Billing, History, Dashboard, Subscription, and Users
+=======================================================
+
+B-01. llm_usage rows survive extraction history deletion
+Verdict: VERIFIED
+Evidence:
+- backend/db.py:181-197
+- backend/db.py:1805-1812
+- backend/main.py:1785-1792
+Details:
+llm_usage.extraction_id has ON DELETE SET NULL. delete_extraction() deletes
+only the extraction row, so usage rows remain with null extraction_id.
+
+B-02. Billable pages do not survive history deletion
+Verdict: WRONG source claim
+Evidence:
+- backend/db.py:2456-2496
+Details:
+get_user_billable_pages() counts DISTINCT (lu.extraction_id, lu.page_num) and
+requires lu.extraction_id IS NOT NULL. After deletion, raw usage rows remain,
+but those pages are no longer counted as billable pages.
+
+B-03. Token dashboard totals may survive history deletion
+Verdict: PARTIAL
+Evidence:
+- backend/db.py:814-835
+Details:
+Dashboard token totals sum llm_usage by vendor_id, not by live extraction row.
+Deleting history can reduce billable-page counts while token totals remain in
+usage dashboards. This mismatch should be decided intentionally.
+
+B-04. Subscription soft-overage semantics are partially implemented
+Verdict: PARTIAL
+Evidence:
+- backend/main.py:1199-1237
+- backend/db.py:2492-2496
+- tests/test_page_limits.py:206-239
+Details:
+If used < limit, the next upload is allowed and can push remaining negative.
+If used >= limit, upload/resume is blocked. This supports "one upload can push
+over", but blocks exactly at limit. The current tests expect used == limit to
+block.
+
+B-05. Quota check fails open
+Verdict: VERIFIED
+Evidence:
+- backend/main.py:1259-1262
+- backend/main.py:1672-1675
+- tests/test_page_limits.py:394-407
+Details:
+If get_user_billable_pages() raises a non-HTTP exception, ingest/resume logs a
+warning and proceeds. That is user-friendly during DB issues but unsafe for
+quota enforcement.
+
+B-06. Quota enforcement has a concurrency race
+Verdict: VERIFIED
+Evidence:
+- backend/main.py:1206-1211
+Details:
+The route reads current usage before submitting work. There is no page
+reservation, lock, or transaction that prevents multiple concurrent uploads
+from all passing on the same stale usage count.
+
+B-07. Overage variable sign is intentionally remaining-style, not true overage
+Verdict: VERIFIED naming issue
+Evidence:
+- backend/main.py:1221-1236
+- backend/page_logger.py:88-105
+Details:
+The code names the value "overage" but stores limit - used. Negative values
+mean over limit. The UI takes Math.abs() for display. This is consistent with
+the user's desired negative remaining number, but the field name is confusing.
+
+B-08. Client/admin dashboard backend isolation is present
+Verdict: VERIFIED
+Evidence:
+- backend/main.py:2318-2343
+- backend/main.py:2379-2459
+- backend/db.py:789-842
+- backend/auth.py admin/user access helpers
+Details:
+/user/stats scopes non-admin users by user id. /admin/stats and admin client
+dashboards require admin. DB stats filter through vendor ownership.
+
+B-09. "No dedicated client stats endpoint" is wrong
+Verdict: WRONG source claim
+Evidence:
+- backend/main.py:2318-2333
+- frontend/dashboard.js:480-501
+Details:
+/user/stats exists and the dashboard uses it for clients.
+
+B-10. Dashboard date filtering is partial
+Verdict: PARTIAL
+Evidence:
+- frontend/dashboard.js:480-501
+- frontend/dashboard.js:589-647
+- backend/main.py:2379-2459
+- backend/main.py:2473-2494
+Details:
+Top-level /user/stats and /admin/stats do not take date filters from the
+frontend. Per-client admin dashboard and user document tables do send
+date_from/date_to/range.
+
+B-11. Client dashboard lacks remaining/negative balance KPI
+Verdict: VERIFIED
+Evidence:
+- backend/main.py:2327-2331
+- frontend/dashboard.js:512-520
+Details:
+The backend includes subscription data in /user/stats for clients, but the KPI
+strip renders pages/extractions/tokens/calls and does not display remaining or
+negative balance.
+
+B-12. History list and delete behavior exist
+Verdict: VERIFIED
+Evidence:
+- frontend/history.js:6-67
+- backend/main.py:1744-1823
+Details:
+History shows filename, vendor, status, total pages, created date, latency,
+review link, and delete. Delete blocks active extractions, deletes the row, and
+deletes page/export/document objects where applicable.
+
+B-13. History tenant isolation is present
+Verdict: VERIFIED
+Evidence:
+- backend/main.py:1869-1878
+- backend/db.py:1490-1525
+Details:
+Non-admin history is filtered by vendor owner. Individual read/delete routes
+also call assert_extraction_access().
+
+B-14. History list returns heavy JSONB payloads
+Verdict: VERIFIED performance concern
+Evidence:
+- backend/db.py:1490-1513
+- backend/models.py:137-153
+Details:
+list_all_extractions() selects _EXTRACTION_COLS including result, page_results,
+field_locations, ocr_data, and corrected_result, then the history endpoint
+serializes ExtractionOut. For large OCR payloads this is expensive.
+
+B-15. Admin can create users and edit client page limits
+Verdict: VERIFIED
+Evidence:
+- backend/main.py admin user endpoints around 467-581
+- frontend/admin.js:71-73
+- frontend/admin.js:269-290
+- backend/db.py:2499-2514
+Details:
+Admin user management exists. Page limit edit is exposed for client users and
+the backend requires admin plus non-negative integer limit.
+
+B-16. Dashboard state clears on logout
+Verdict: WRONG source claim
+Evidence:
+- frontend/login.js:81-87
+Details:
+logout() removes auth token/user and reloads the page. Module-level frontend
+state is cleared by the reload.
+
+
+5. Frontend Workflow and UX Risks
+=================================
+
+F-01. Extract page can intentionally skip auto-detection when vendor is selected
+Verdict: VERIFIED
+Evidence:
+- frontend/extract.js:774-795
+- backend/main.py:1190-1192
+- backend/main.py:1417-1418
+Details:
+The UI says "Manual vendor selected. Auto-detection skipped" and sends
+vendor_id. Backend then asserts access and skips page-1 detection.
+
+F-02. SSE concurrent extraction race is plausible
+Verdict: PARTIAL
+Evidence:
+- frontend/core.js activeJobId/_activeStreamAbort globals
+- frontend/extract.js:690-754
+Details:
+The frontend tracks a single active stream/job. Starting a second extraction in
+the same tab can replace the active stream state. Whether this can happen in
+normal UI depends on button disabling, but the global design supports only one
+active stream.
+
+F-03. Pipeline stage display is hardcoded
+Verdict: VERIFIED low/medium UX risk
+Evidence:
+- frontend/extract.js pipeline stage code
+Details:
+The visual stage progression is based on expected stage names/order. Backend
+retry/out-of-order events can make the UI look cleaner than the actual state.
+
+F-04. Unsaved review changes warning is missing or incomplete
+Verdict: VERIFIED/NEEDS CONTEXT
+Evidence:
+- frontend/review.js dirty tracking and navigation behavior
+Details:
+The source report says _rvDirty is tracked but not used before navigation. This
+should be treated as a real UX risk unless a global router guard exists
+elsewhere. I did not find a robust before-navigation confirmation during this
+audit.
+
+
+6. Lower-Priority Code Robustness Notes
+=======================================
+
+L-01. Exporter non-dict line-items produce short rows
+Verdict: VERIFIED low severity
+Evidence:
+- backend/exporter.py:54-77
+Details:
+If any line_items entry is not a dict, _line_items_table() appends a one-cell
+row while headers may contain multiple columns. CSV writers tolerate uneven
+rows, but Excel/table consumers may see awkward alignment.
+
+L-02. CSV formula escaping exists
+Verdict: VERIFIED behavior, source severity overstated
+Evidence:
+- backend/exporter.py:28-44
+Details:
+_stringify() prefixes dangerous leading characters with a single quote. This is
+standard spreadsheet safety behavior. Whether it is sufficient depends on the
+target spreadsheet app, but it is not "no protection".
+
+L-03. recover_stale_jobs ignores cancelling status
+Verdict: VERIFIED
+Evidence:
+- backend/db.py:2177-2207
+- backend/db.py:2210-2238
+Details:
+Stale recovery only targets status='running'. Jobs moved to cancelling after a
+cancel request are not reclaimed by that recovery query.
+
+L-04. Fragile asyncpg result parsing exists in a few cleanup helpers
+Verdict: VERIFIED low severity
+Evidence:
+- backend/db.py:2207
+- backend/db.py:2012
+Details:
+Some helpers parse asyncpg command strings with result.split()[-1]. This is a
+common pattern but is less robust than checking exact command output or using
+RETURNING rows.
+
+L-05. page_logger billable_pages can count failed/skipped pages in logs
+Verdict: VERIFIED logging concern
+Evidence:
+- backend/worker.py:774-790
+Details:
+The page usage log records billable_pages=len(pages) in the LLM stage even when
+some page_results contain _error. This is separate from DB billable pages.
+
+L-06. worker digital/scanned page log can miss source=None
+Verdict: VERIFIED logging concern
+Evidence:
+- backend/worker.py:781-782
+Details:
+The LLM page_logger counts pypdfium and paddleocr only. Old rows with source
+None are counted as neither.
+
+
+7. Corrected Priority List
+==========================
+
+P0 / Blockers for the requested vendor-aware workflow
+-----------------------------------------------------
+1. Require explicit vendor id in the vendor UI; remove random id generation.
+2. Fix admin vendor creation by adding owner/client selection or another
+   explicit user_id path.
+3. Stop client template save from auto-creating missing vendors, or make this
+   behavior admin-approved and explicit.
+4. Decide exact-only detection policy, then remove/disable fuzzy fallback if
+   exact-only is required.
+5. Add vendor id as an automatic detection candidate, or require it as an alias
+   and make the UI obvious.
+6. Re-run page-1 detection even when vendor_id is preselected, or require a
+   deliberate admin/client override with audit trail.
+
+P1 / Extraction correctness
+---------------------------
+1. In geometry.py, if pypdfium classification says digital but word extraction
+   returns zero usable words, route that page to PaddleOCR.
+2. Consume PaddleOCR true word boxes if available, not only rec_texts/rec_boxes
+   text-region boxes.
+3. Add LLM response-shape guards before indexing choices[0].
+4. Enforce single_page templates by hard-stopping or warning on multi-page
+   uploads.
+5. Add prompt wording that reflects format_type differences.
+
+P1 / Review and spatial memory correctness
+------------------------------------------
+1. Restrict drag-select reusable memory to header fields in the UI, or warn
+   clearly that line-item selections are per-extraction only.
+2. Add a key-vs-value validation/warning for manual selections.
+3. Confirm before replacing any existing non-empty extracted value, not only
+   gold/spatial-memory values.
+4. Prevent typed edits from silently re-saving stale manual geometry.
+5. Strengthen layout_key with stable anchor/header-position fingerprinting.
+
+P1 / Billing and subscription correctness
+-----------------------------------------
+1. Decide the intended history-delete accounting rule. Current behavior keeps
+   token rows but removes pages from billable counts.
+2. Add quota reservation/locking to prevent concurrent overage bypass.
+3. Decide whether used == limit should block. Current code and tests block at
+   equality.
+4. Decide whether quota check failures should fail open or fail closed.
+5. Show remaining/negative page balance in the client dashboard.
+
+P2 / Performance, cleanup, and UX
+---------------------------------
+1. Make history list use a slim response that excludes OCR/result JSONB.
+2. Use /geometry in review UI or rename /ocr to clarify it returns unified
+   geometry.
+3. Add stale recovery for cancelling jobs.
+4. Add robust unsaved review-change navigation guard.
+5. Consider executor shutdown hooks for graceful process stop.
+
+
+8. Non-Obvious Functions Worth Knowing
+======================================
+
+vendor_detector._text_windows()
+  Builds sliding text windows near alias length for fuzzy matching.
+
+vendor_detector._effective_fuzzy_score()
+  Adds small bonuses for multi-word aliases and penalizes non-exact single-word
+  matches.
+
+geometry.compute_pdf_geometry()
+  Main pypdfium page classifier and digital word geometry builder.
+
+geometry.merge_scanned_into_geometry()
+  Fills scanned-page placeholder entries with PaddleOCR results while keeping
+  digital pypdfium words.
+
+pdf_extractor.page_is_digital()
+  Uses printable character threshold, not word count, to classify digital pages.
+
+ocr_runner.run_ocr_on_pages()
+  Runs PaddleOCR in a thread pool and returns review-compatible word/box-like
+  records.
+
+extractor._safe_gold_correction_hints()
+  Converts prior gold corrections into value-redacted prompt hints.
+
+extractor.extract_document()
+  Processes pages sequentially with PARALLEL_BATCH=1 and merges results based
+  on format_type.
+
+qwen_layout_apply.build_field_locations_from_layout()
+  Uses learned Qwen label/header boxes plus current page words to produce
+  field_locations.
+
+spatial_memory.save_from_corrections()
+  Saves manual header-field boxes as reusable normalized geometry.
+
+spatial_memory.apply_to_extraction()
+  Reads current document text inside stored boxes and overrides extracted
+  header fields.
+
+db.get_user_billable_pages()
+  Counts distinct extraction/page pairs from llm_usage where extraction_id is
+  not null. This is why history deletion can reduce billable page counts.
+
+db.get_client_document_usage()
+  Per-document token/page/latency drilldown used by client/admin dashboard
+  document tables.
+
+main._usage_date_range()
+  Converts date_from/date_to into UTC half-open ranges for usage dashboards.
+
+main.get_extraction_geometry()
+  New unified geometry endpoint that review UI does not yet use.
+
+frontend/history.js deleteExtractionSafe()
+  Deletes one extraction history row through DELETE /extractions/{id}.
+
+frontend/admin.js submitPageLimit()
+  Admin UI path for editing a client's subscription page limit.
+
+
+Final Note
+==========
+
+The source audit report had valuable coverage, but several "critical" findings
+were false positives. The most important corrections are:
+
+- Spatial memory is correctly geometry-based.
+- Digital-only PDFs are not stuck after the current OCR-stage unified geometry
+  save path.
+- Duplicate active postprocess jobs are protected by the DB unique index.
+- History deletion does not preserve billable-page counts, even though raw
+  llm_usage/token rows remain.
+
+The real work should focus on strict vendor creation/detection semantics,
+mandatory template configuration, pypdfium zero-word fallback, true word-level
+OCR geometry, review selection guardrails, stronger layout identity, and a
+clear billing rule for deleted history.

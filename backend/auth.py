@@ -17,10 +17,7 @@ from fastapi import Depends, HTTPException, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 
-try:
-    from . import db as db_mod
-except ImportError:  # running as flat module
-    import db as db_mod  # type: ignore[no-redef]
+from . import db as db_mod
 
 
 # -- Config ----------------------------------------------------------------

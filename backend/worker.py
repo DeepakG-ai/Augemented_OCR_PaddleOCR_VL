@@ -12,56 +12,31 @@ import os
 import time
 from uuid import uuid4
 
-if __package__:
-    from . import db as db_mod
-    from . import extractor
-    from . import geometry
-    from . import ocr_runner
-    from . import logging_config as plog
-    from . import processor
-    from . import qwen_layout_apply
-    from . import page_logger
-    from .contracts import build_purchase_order_contract
-    from .exporter import build_csv_bytes, build_excel_bytes
-    from .logging_config import configure_logging, get_logger
-    from .object_store import ARTIFACTS_BUCKET, DOCUMENTS_BUCKET, EXPORTS_BUCKET, get_store
-    from .config import LLM_URL, LLM_MODEL, WORKER_POLL_SECONDS as POLL_INTERVAL_SECONDS, DEBUG_DUMP_BBOX
-    from .phoenix_tracing import (
-        current_trace_context,
-        setup_phoenix,
-        trace_named_step,
-        trace_pipeline_stage,
-        trace_span,
-        use_trace_context,
-    )
-else:
-    import db as db_mod
-    import extractor
-    import geometry
-    import ocr_runner
-    import logging_config as plog
-    import processor
-    import qwen_layout_apply  # type: ignore[no-redef]
-    import page_logger  # type: ignore[no-redef]
-    from contracts import build_purchase_order_contract
-    from exporter import build_csv_bytes, build_excel_bytes
-    from logging_config import configure_logging, get_logger
-    from object_store import ARTIFACTS_BUCKET, DOCUMENTS_BUCKET, EXPORTS_BUCKET, get_store
-    from config import LLM_URL, LLM_MODEL, WORKER_POLL_SECONDS as POLL_INTERVAL_SECONDS, DEBUG_DUMP_BBOX  # type: ignore[no-redef]
-    from phoenix_tracing import (  # type: ignore[no-redef]
-        current_trace_context,
-        setup_phoenix,
-        trace_named_step,
-        trace_pipeline_stage,
-        trace_span,
-        use_trace_context,
-    )
+from . import db as db_mod
+from . import extractor
+from . import geometry
+from . import ocr_runner
+from . import logging_config as plog
+from . import processor
+from . import qwen_layout_apply
+from . import page_logger
+from .logging_config import configure_logging, current_extraction_id, current_extraction_filename, get_logger
+from .object_store import ARTIFACTS_BUCKET, DOCUMENTS_BUCKET, get_store
+from .config import LLM_URL, LLM_MODEL, WORKER_POLL_SECONDS as POLL_INTERVAL_SECONDS, DEBUG_DUMP_BBOX
+from .mlflow_tracing import (
+    current_trace_context,
+    setup_mlflow,
+    trace_named_step,
+    trace_pipeline_stage,
+    trace_span,
+    use_trace_context,
+)
 
 
 configure_logging()
 logger = logging.getLogger(__name__)
 
-setup_phoenix()
+setup_mlflow()
 
 
 def _pipeline_base(
@@ -181,7 +156,7 @@ async def _process_normalize(pool, job: dict) -> None:
     if not document:
         raise ValueError("Document not found for normalize job")
     base = _pipeline_base(document=document, job=job, extraction_id=extraction_id)
-    plog.event("stage_started", stage="normalize", **base)
+    logger.info("── NORMALIZE started ── ext=%s file=%s", extraction_id, document["filename"])
 
     await db_mod.update_document_status(pool, document["id"], "processing")
     await db_mod.set_extraction_status(
@@ -196,26 +171,25 @@ async def _process_normalize(pool, job: dict) -> None:
         {"stage": "normalize", "message": "Downloading original document"},
     )
 
-    with plog.timed("document_downloaded", stage="normalize", **base) as log_ctx:
+    with plog.timed("download") as t:
         raw = store.get_bytes(DOCUMENTS_BUCKET, document["object_key"])
-        log_ctx["size_bytes"] = len(raw)
+    logger.info("Downloaded %s (%d bytes, %.0fms)", document["filename"], len(raw), t["ms"])
     filename = document["filename"].lower()
     is_pdf = filename.endswith(".pdf")
 
-    # ── PDF rendering with Phoenix tracing ──
+    # PDF rendering with MLflow tracing
     with trace_span(
         "pdf_rendering",
         kind="TOOL",
         input_data={"filename": document["filename"], "size_bytes": len(raw), "is_pdf": is_pdf},
         attributes=base,
     ) as render_trace:
-        with plog.timed("document_rendered", stage="normalize", **base) as log_ctx:
+        with plog.timed("render") as t:
             if is_pdf:
                 rendered_pages = await processor.pdf_to_images(raw)
             else:
                 rendered_pages = await processor.image_file_to_b64(raw)
-            log_ctx["page_count"] = len(rendered_pages)
-            log_ctx["document_type"] = "pdf" if is_pdf else "image"
+        logger.info("Rendered %d %s page(s) (%.0fms)", len(rendered_pages), "PDF" if is_pdf else "image", t["ms"])
         render_trace["output"] = {
             "pages_rendered": len(rendered_pages),
             "document_type": "pdf" if is_pdf else "image",
@@ -238,17 +212,11 @@ async def _process_normalize(pool, job: dict) -> None:
                 for p in rendered_pages
             ]
             try:
-                with plog.timed("pdf_geometry_computed", stage="normalize", **base) as log_ctx:
+                with plog.timed("geometry") as t:
                     page_geometry = geometry.compute_pdf_geometry(raw, page_sizes)
-                    log_ctx["pages"] = [
-                        {
-                            "page_number": g.get("page_number"),
-                            "source": g.get("source"),
-                            "char_count": g.get("char_count", 0),
-                            "word_count": len(g.get("words") or []),
-                        }
-                        for g in page_geometry
-                    ]
+                sources = {g.get("source") for g in page_geometry}
+                logger.info("PDF geometry computed: %d pages, sources=%s (%.0fms)",
+                            len(page_geometry), sources, t["ms"])
             except Exception as exc:
                 logger.warning(
                     "PDF text geometry failed for extraction %s: %s; treating pages as scanned",
@@ -256,14 +224,7 @@ async def _process_normalize(pool, job: dict) -> None:
                     exc,
                     exc_info=True,
                 )
-                plog.event(
-                    "pdf_geometry_failed",
-                    stage="normalize",
-                    status="error",
-                    error=str(exc),
-                    fallback="paddleocr_all_pages",
-                    **base,
-                )
+
                 page_geometry = [geometry.image_page_geometry(p["page_number"]) for p in rendered_pages]
             geo_by_page = {g["page_number"]: g for g in page_geometry}
         else:
@@ -273,7 +234,7 @@ async def _process_normalize(pool, job: dict) -> None:
                 g = geometry.image_page_geometry(p["page_number"])
                 geo_by_page[p["page_number"]] = g
 
-        # Build per-page classification summary for Phoenix
+        # Build per-page classification summary for MLflow
         classification_pages = []
         for pn, g in sorted(geo_by_page.items()):
             classification_pages.append({
@@ -318,11 +279,10 @@ async def _process_normalize(pool, job: dict) -> None:
             }
         )
 
-    with plog.timed("page_artifacts_saved", stage="normalize", **base) as log_ctx:
+    with plog.timed("save_pages") as t:
         await db_mod.save_pages(pool, extraction_id, page_rows)
-        log_ctx["page_count"] = len(page_rows)
-        log_ctx["digital_pages"] = len(page_rows) - len(scanned_page_numbers)
-        log_ctx["scanned_pages"] = len(scanned_page_numbers)
+    logger.info("Saved %d page artifacts (%d digital, %d scanned, %.0fms)",
+                len(page_rows), len(page_rows) - len(scanned_page_numbers), len(scanned_page_numbers), t["ms"])
     with trace_named_step(
         "page_routing",
         kind="TOOL",
@@ -357,14 +317,9 @@ async def _process_normalize(pool, job: dict) -> None:
         status="processing",
     )
     await db_mod.update_document_status(pool, document["id"], "normalized")
-    plog.event(
-        "stage_completed",
-        stage="normalize",
-        **base,
-        page_count=len(page_rows),
-        digital_pages=len(page_rows) - len(scanned_page_numbers),
-        scanned_pages=len(scanned_page_numbers),
-    )
+    logger.info("── NORMALIZE completed ── ext=%s (%d pages: %d digital, %d scanned)",
+                extraction_id, len(page_rows),
+                len(page_rows) - len(scanned_page_numbers), len(scanned_page_numbers))
     if await _stop_if_cancelled(pool, extraction_id, "normalize", "Cancelled during page rendering"):
         return
     # Run OCR (scanned pages only) and LLM in parallel
@@ -390,7 +345,7 @@ async def _process_ocr(pool, job: dict) -> None:
     if not extraction_row:
         raise ValueError("Extraction not found for OCR job")
     base = _pipeline_base(extraction=extraction_row, job=job)
-    plog.event("stage_started", stage="ocr", **base)
+    logger.info("── OCR started ── ext=%s", extraction_id)
 
     # Determine which pages need OCR (scanned pages only)
     payload = job.get("payload") or {}
@@ -409,13 +364,7 @@ async def _process_ocr(pool, job: dict) -> None:
     if not scanned_page_numbers:
         # All pages are digital — skip PaddleOCR entirely
         logger.info("All %d page(s) are digital — skipping PaddleOCR", len(all_page_rows))
-        plog.event(
-            "paddleocr_skipped",
-            stage="ocr",
-            **base,
-            reason="all_pages_digital",
-            page_count=len(all_page_rows),
-        )
+
         # Build unified ocr_data from digital word_geometry already stored in pages
         unified = []
         for p in all_page_rows:
@@ -426,10 +375,10 @@ async def _process_ocr(pool, job: dict) -> None:
                 "word_count": len(p.get("word_geometry") or []),
                 "words": p.get("word_geometry") or [],
             })
-        with plog.timed("unified_geometry_saved", stage="ocr", **base) as log_ctx:
+        with plog.timed("save_geometry") as t:
             await db_mod.save_ocr_data(pool, extraction_id, unified)
-            log_ctx["page_count"] = len(unified)
-            log_ctx["total_words"] = sum(len(p.get("words") or []) for p in unified)
+        total_w = sum(len(p.get("words") or []) for p in unified)
+        logger.info("Unified geometry saved: %d pages, %d words (%.0fms)", len(unified), total_w, t["ms"])
         with trace_named_step(
             "ocr_unified_geometry",
             kind="TOOL",
@@ -477,18 +426,11 @@ async def _process_ocr(pool, job: dict) -> None:
             input_data={"scanned_page_numbers": scanned_page_numbers},
             attributes=base,
         ) as ocr_trace:
-            with plog.timed("paddleocr_completed", stage="ocr", **base) as log_ctx:
+            with plog.timed("paddleocr") as t:
                 ocr_pages = await ocr_runner.run_ocr_on_pages(scanned_pages)
-                log_ctx["scanned_pages"] = len(scanned_page_numbers)
-                log_ctx["total_words"] = sum(len(p.get("words") or []) for p in ocr_pages)
-                log_ctx["pages"] = [
-                    {
-                        "page_number": p.get("page_number"),
-                        "word_count": len(p.get("words") or []),
-                        "sample_words": [w.get("text") for w in (p.get("words") or [])[:10]],
-                    }
-                    for p in ocr_pages
-                ]
+            total_w = sum(len(p.get("words") or []) for p in ocr_pages)
+            logger.info("PaddleOCR completed: %d scanned pages, %d words (%.0fms)",
+                        len(scanned_page_numbers), total_w, t["ms"])
             ocr_trace["output"] = {
                 "scanned_pages": len(scanned_page_numbers),
                 "total_words": sum(len(p.get("words") or []) for p in ocr_pages),
@@ -515,10 +457,10 @@ async def _process_ocr(pool, job: dict) -> None:
 
         # Merge scanned OCR results into the base geometry
         unified = geometry.merge_scanned_into_geometry(base_geometry, ocr_pages)
-        with plog.timed("unified_geometry_saved", stage="ocr", **base) as log_ctx:
+        with plog.timed("save_geometry") as t:
             await db_mod.save_ocr_data(pool, extraction_id, unified)
-            log_ctx["page_count"] = len(unified)
-            log_ctx["total_words"] = sum(len(p.get("words") or []) for p in unified)
+        total_w = sum(len(p.get("words") or []) for p in unified)
+        logger.info("Unified geometry saved: %d pages, %d words (%.0fms)", len(unified), total_w, t["ms"])
 
         await db_mod.update_job_progress(
             pool,
@@ -528,7 +470,7 @@ async def _process_ocr(pool, job: dict) -> None:
 
     if await _stop_if_cancelled(pool, extraction_id, "ocr", "Cancelled during OCR"):
         return
-    plog.event("stage_completed", stage="ocr", **base)
+    logger.info("── OCR completed ── ext=%s", extraction_id)
     await _maybe_enqueue_postprocess(pool, extraction_id, job["document_id"], _job_trace_context(job))
 
 
@@ -538,25 +480,17 @@ async def _process_llm(pool, job: dict) -> None:
     if not extraction_row:
         raise ValueError("Extraction not found for LLM job")
     base = _pipeline_base(extraction=extraction_row, job=job)
-    plog.event("stage_started", stage="llm", **base)
+    logger.info("── LLM started ── ext=%s vendor=%s", extraction_id, extraction_row.get("vendor_id"))
 
-    with plog.timed("template_loaded", stage="llm", **base) as log_ctx:
+    with plog.timed("template") as t:
         tmpl = await db_mod.get_template(pool, extraction_row["vendor_id"])
-        log_ctx["template_id"] = (tmpl or {}).get("id")
-        log_ctx["has_system_prompt"] = bool((tmpl or {}).get("system_prompt"))
+    logger.info("Template loaded: id=%s (%.0fms)", (tmpl or {}).get("id"), t["ms"])
     req_header = extraction_row.get("header_fields") or ((tmpl.get("header_fields") or []) if tmpl else [])
     req_items = extraction_row.get("line_item_fields") or ((tmpl.get("line_item_fields") or []) if tmpl else [])
     # Template is source of truth; stale extraction record is fallback only
     req_format = (tmpl.get("format_type") if tmpl else None) or extraction_row.get("format_type") or "single_po_multipage"
-    plog.event(
-        "llm_request_configured",
-        stage="llm",
-        **base,
-        format_type=req_format,
-        header_fields=req_header,
-        line_item_fields=req_items,
-        model=LLM_MODEL,
-    )
+    logger.info("LLM config: model=%s format=%s headers=%s line_items=%s",
+                LLM_MODEL, req_format, req_header, req_items)
 
     # Always build fresh from current DB fields — no cached system_prompt column read.
     with trace_span(
@@ -656,7 +590,7 @@ async def _process_llm(pool, job: dict) -> None:
         },
         attributes=base,
     ) as field_trace:
-        with plog.timed("qwen_document_extracted", stage="llm", **base) as log_ctx:
+        with plog.timed("extraction") as t:
             output = await extractor.extract_document(
                 pages=pages,
                 header_fields=req_header,
@@ -674,14 +608,10 @@ async def _process_llm(pool, job: dict) -> None:
                 system_prompt_page1=system_prompt_page1,
             )
             _result = output.get("result")
-            log_ctx["page_results"] = len(output.get("page_results") or [])
-            log_ctx["cancelled"] = bool(output.get("cancelled"))
-            log_ctx["last_completed_page"] = output.get("last_completed_page", 0)
-            if isinstance(_result, dict):
-                log_ctx["result_fields"] = [k for k in _result.keys() if k != "line_items"]
-                log_ctx["line_item_count"] = len(_result.get("line_items") or [])
-            elif isinstance(_result, list):
-                log_ctx["result_records"] = len(_result)
+        _npr = len(output.get("page_results") or [])
+        _nli = len((_result or {}).get("line_items", [])) if isinstance(_result, dict) else 0
+        logger.info("Document extracted: %d page results, %d line items, cancelled=%s (%.0fms)",
+                    _npr, _nli, output.get("cancelled", False), t["ms"])
         field_trace["output"] = {
             "page_results_count": len(output.get("page_results") or []),
             "cancelled": bool(output.get("cancelled")),
@@ -734,13 +664,7 @@ async def _process_llm(pool, job: dict) -> None:
                     "Page 1 boxes: saved %d field(s) for vendor=%s template=%s",
                     len(learned_boxes), vendor_id_llm, template_id_llm,
                 )
-                plog.event(
-                    "page1_boxes_saved",
-                    stage="llm",
-                    **base,
-                    fields_learned=list(learned_boxes.keys()),
-                    count=len(learned_boxes),
-                )
+
 
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     _pr = output.get("page_results") or []
@@ -822,13 +746,7 @@ async def _process_llm(pool, job: dict) -> None:
             "elapsed_ms": elapsed_ms,
             "result_summary": _result_summary(output.get("result")),
         }
-    plog.event(
-        "qwen_json_persisted",
-        stage="llm",
-        **base,
-        duration_ms=elapsed_ms,
-        status=status,
-    )
+    logger.info("LLM result persisted: status=%s elapsed=%dms", status, elapsed_ms)
 
     if status == "processing":
         await _maybe_enqueue_postprocess(pool, extraction_id, job["document_id"], _job_trace_context(job))
@@ -840,7 +758,7 @@ async def _process_postprocess(pool, job: dict) -> None:
     if not extraction_row:
         raise ValueError("Extraction not found for postprocess job")
     base = _pipeline_base(extraction=extraction_row, job=job)
-    plog.event("stage_started", stage="postprocess", **base)
+    logger.info("── POSTPROCESS started ── ext=%s", extraction_id)
 
     result = extraction_row.get("result")
     if not result:
@@ -889,18 +807,17 @@ async def _process_postprocess(pool, job: dict) -> None:
             }
             for p in pages_db
         ]
-        with plog.timed("field_locations_built", stage="postprocess", **base) as log_ctx:
+        with plog.timed("field_locations") as t:
             field_locations = qwen_layout_apply.build_field_locations_from_layout(
                 qwen_boxes, pages_with_words, result,
                 page_results=page_results,
             )
             mapping_engine = "qwen_layout"
-            log_ctx["mapping_engine"] = "qwen_layout"
-            log_ctx["field_location_count"] = _field_location_count(field_locations)
+        logger.info("Field locations built (qwen_layout): %d mappings (%.0fms)",
+                    _field_location_count(field_locations), t["ms"])
     else:
         logger.warning("Postprocess: no layout boxes - empty field_locations")
         field_locations = {}
-        plog.event("field_locations_empty", stage="postprocess", status="warning", **base)
 
     with trace_named_step(
         "field_mapping",
@@ -923,10 +840,7 @@ async def _process_postprocess(pool, job: dict) -> None:
     # After field_locations are built, apply saved regions from prior corrections.
     # This reads current document text inside saved geometry regions (never old values).
     try:
-        if __package__:
-            from . import spatial_memory as _sm
-        else:
-            import spatial_memory as _sm  # type: ignore[no-redef]
+        from . import spatial_memory as _sm
 
         with trace_named_step(
             "spatial_memory.apply",
@@ -934,13 +848,13 @@ async def _process_postprocess(pool, job: dict) -> None:
             input_data={"field_location_count": _field_location_count(field_locations)},
             attributes=base,
         ) as sm_trace:
-            with plog.timed("spatial_memory_apply_completed", stage="postprocess", **base) as log_ctx:
+            with plog.timed("spatial_memory") as t:
                 result, field_locations, sm_applied = await _sm.apply_to_extraction(
                     pool, extraction_id, result,
                     field_locations,
                     page_geometry=ocr_data,
                 )
-                log_ctx["applied_count"] = sm_applied
+            logger.info("Spatial memory: %d region(s) applied (%.0fms)", sm_applied, t["ms"])
             sm_trace["output"] = {
                 "applied_count": sm_applied,
                 "result_after_spatial_memory": _result_summary(result),
@@ -960,21 +874,12 @@ async def _process_postprocess(pool, job: dict) -> None:
             "Spatial memory apply failed for extraction %d: %s",
             extraction_id, exc,
         )
-        plog.event(
-            "spatial_memory_apply_failed",
-            stage="postprocess",
-            status="error",
-            error=str(exc),
-            **base,
-        )
 
-    with plog.timed("field_locations_saved", stage="postprocess", **base) as log_ctx:
+
+    with plog.timed("save_field_locs") as t:
         await db_mod.save_field_locations(pool, extraction_id, field_locations)
-        log_ctx["field_location_count"] = (
-            sum(len(v) for v in field_locations if isinstance(v, dict))
-            if isinstance(field_locations, list)
-            else len(field_locations or {})
-        )
+    logger.info("Field locations saved: %d mappings (%.0fms)",
+                _field_location_count(field_locations), t["ms"])
     with trace_named_step(
         "final_result",
         kind="CHAIN",
@@ -986,7 +891,7 @@ async def _process_postprocess(pool, job: dict) -> None:
             "field_location_count": _field_location_count(field_locations),
             "status": "done",
         }
-    if await _stop_if_cancelled(pool, extraction_id, "postprocess", "Cancelled before outbound delivery"):
+    if await _stop_if_cancelled(pool, extraction_id, "postprocess", "Cancelled before completion"):
         return
     await db_mod.set_extraction_status(
         pool,
@@ -994,137 +899,61 @@ async def _process_postprocess(pool, job: dict) -> None:
         "done",
         progress={"stage": "postprocess", "message": "Field mapping complete"},
     )
-    plog.event("stage_completed", stage="postprocess", **base)
-    await db_mod.ensure_job(
-        pool,
-        extraction_id,
-        job["document_id"],
-        "outbound",
-        _payload_with_trace(job, {"extraction_id": extraction_id}),
-    )
-
-
-async def _process_outbound(pool, job: dict) -> None:
-    extraction_id = job["extraction_id"]
-    extraction_row = await db_mod.get_extraction(pool, extraction_id)
-    if not extraction_row:
-        raise ValueError("Extraction not found for outbound job")
-    base = _pipeline_base(extraction=extraction_row, job=job)
-    plog.event("stage_started", stage="outbound", **base)
-    if await _stop_if_cancelled(pool, extraction_id, "outbound", "Cancelled before export delivery"):
-        return
-
-    with plog.timed("contract_built", stage="outbound", **base) as log_ctx:
-        contract = build_purchase_order_contract(extraction_row)
-        log_ctx["canonical_source"] = (contract.get("review") or {}).get("canonical_source")
-    store = get_store()
-
-    # Excel export
-    with trace_span(
-        "excel_export",
-        kind="TOOL",
-        input_data={"extraction_id": extraction_id},
-        attributes=base,
-    ) as excel_trace:
-        with plog.timed("excel_export_built", stage="outbound", **base) as log_ctx:
-            excel_bytes = build_excel_bytes(contract)
-            log_ctx["size_bytes"] = len(excel_bytes)
-        xlsx_key = f"exports/extractions/{extraction_id}/purchase_order.xlsx"
-        store.put_bytes(
-            EXPORTS_BUCKET,
-            xlsx_key,
-            excel_bytes,
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    try:
+        tok = await db_mod.get_extraction_token_totals(pool, extraction_id)
+        logger.info(
+            "── EXTRACTION COMPLETE ── ext=%s prompt_tokens=%d completion_tokens=%d total_tokens=%d llm_calls=%d",
+            extraction_id,
+            tok["prompt_tokens"],
+            tok["completion_tokens"],
+            tok["total_tokens"],
+            tok["llm_calls"],
         )
-        line_items = (contract.get("data") or {}).get("line_items") or []
-        excel_trace["output"] = {
-            "size_bytes": len(excel_bytes),
-            "object_key": xlsx_key,
-            "line_item_rows": len(line_items) if isinstance(line_items, list) else 0,
-        }
-
-    # CSV export
-    with trace_span(
-        "csv_export",
-        kind="TOOL",
-        input_data={"extraction_id": extraction_id},
-        attributes=base,
-    ) as csv_trace:
-        with plog.timed("csv_export_built", stage="outbound", **base) as log_ctx:
-            csv_bytes = build_csv_bytes(contract)
-            log_ctx["size_bytes"] = len(csv_bytes)
-        csv_key = f"exports/extractions/{extraction_id}/purchase_order.csv"
-        store.put_bytes(
-            EXPORTS_BUCKET,
-            csv_key,
-            csv_bytes,
-            "text/csv",
-        )
-        csv_trace["output"] = {
-            "size_bytes": len(csv_bytes),
-            "object_key": csv_key,
-        }
-
-    await db_mod.save_export_artifact(pool, extraction_id, xlsx_key)
-    await db_mod.upsert_delivery(
-        pool,
-        extraction_id,
-        contract_type=contract["contract_version"],
-        target_type="excel",
-        status="delivered",
-        payload=contract,
-        object_key=xlsx_key,
-    )
-    await db_mod.upsert_delivery(
-        pool,
-        extraction_id,
-        contract_type=contract["contract_version"],
-        target_type="csv",
-        status="delivered",
-        payload=contract,
-        object_key=csv_key,
-    )
-    plog.event(
-        "stage_completed",
-        stage="outbound",
-        **base,
-        xlsx_key=xlsx_key,
-        csv_key=csv_key,
-        log_paths=plog.log_paths(extraction_id),
-    )
+    except Exception:
+        pass
+    logger.info("── POSTPROCESS completed ── ext=%s", extraction_id)
 
 
 async def process_job(pool, stage: str, job: dict) -> None:
     trace_context = _job_trace_context(job)
-    with use_trace_context(trace_context):
-        extraction = await db_mod.get_extraction(pool, job["extraction_id"]) if job.get("extraction_id") else None
-        document = await db_mod.get_document(pool, job["document_id"]) if job.get("document_id") else None
-        base = _pipeline_base(extraction=extraction, document=document, job=job)
-        with trace_pipeline_stage(
-            stage,
-            extraction_id=base.get("extraction_id"),
-            document_id=base.get("document_id"),
-            job_id=base.get("job_id"),
-            vendor_id=base.get("vendor_id"),
-            filename=base.get("filename"),
-            input_data={
-                "job_type": stage,
-                "payload_keys": sorted((job.get("payload") or {}).keys()),
-            },
-        ) as stage_trace:
-            if stage == "normalize":
-                await _process_normalize(pool, job)
-            elif stage == "ocr":
-                await _process_ocr(pool, job)
-            elif stage == "llm":
-                await _process_llm(pool, job)
-            elif stage == "postprocess":
-                await _process_postprocess(pool, job)
-            elif stage == "outbound":
-                await _process_outbound(pool, job)
-            else:
-                raise ValueError(f"Unknown worker stage: {stage}")
-            stage_trace["output"] = {"status": "completed", "stage": stage}
+    ext_id = job.get("extraction_id")
+    id_token = current_extraction_id.set(ext_id) if ext_id is not None else None
+    # Set filename context for per-extraction log file naming
+    extraction = await db_mod.get_extraction(pool, job["extraction_id"]) if job.get("extraction_id") else None
+    document = await db_mod.get_document(pool, job["document_id"]) if job.get("document_id") else None
+    fname = (document or {}).get("filename") or (extraction or {}).get("filename")
+    fn_token = current_extraction_filename.set(fname) if fname else None
+    try:
+        with use_trace_context(trace_context):
+            base = _pipeline_base(extraction=extraction, document=document, job=job)
+            with trace_pipeline_stage(
+                stage,
+                extraction_id=base.get("extraction_id"),
+                document_id=base.get("document_id"),
+                job_id=base.get("job_id"),
+                vendor_id=base.get("vendor_id"),
+                filename=base.get("filename"),
+                input_data={
+                    "job_type": stage,
+                    "payload_keys": sorted((job.get("payload") or {}).keys()),
+                },
+            ) as stage_trace:
+                if stage == "normalize":
+                    await _process_normalize(pool, job)
+                elif stage == "ocr":
+                    await _process_ocr(pool, job)
+                elif stage == "llm":
+                    await _process_llm(pool, job)
+                elif stage == "postprocess":
+                    await _process_postprocess(pool, job)
+                else:
+                    raise ValueError(f"Unknown worker stage: {stage}")
+                stage_trace["output"] = {"status": "completed", "stage": stage}
+    finally:
+        if id_token is not None:
+            current_extraction_id.reset(id_token)
+        if fn_token is not None:
+            current_extraction_filename.reset(fn_token)
 
 
 async def run_worker(stage: str, worker_name: str) -> None:
@@ -1155,37 +984,13 @@ async def run_worker(stage: str, worker_name: str) -> None:
             logger.info("Claimed job id=%s stage=%s extraction=%s", job["id"], stage, job.get("extraction_id"))
             try:
                 job_start = time.perf_counter()
-                plog.event(
-                    "job_claimed",
-                    stage=stage,
-                    extraction_id=job.get("extraction_id"),
-                    document_id=job.get("document_id"),
-                    job_id=job.get("id"),
-                    worker_name=worker_name,
-                )
                 await process_job(pool, stage, job)
                 await db_mod.complete_job(pool, job["id"], {"stage": stage, "message": "done"})
-                plog.event(
-                    "job_completed",
-                    stage=stage,
-                    extraction_id=job.get("extraction_id"),
-                    document_id=job.get("document_id"),
-                    job_id=job.get("id"),
-                    worker_name=worker_name,
-                    duration_ms=(time.perf_counter() - job_start) * 1000,
-                )
+                elapsed = (time.perf_counter() - job_start) * 1000
+                logger.info("Job completed: id=%s stage=%s ext=%s (%.0fms)",
+                            job["id"], stage, job.get("extraction_id"), elapsed)
             except Exception as exc:
                 logger.exception("Job failed id=%s stage=%s", job["id"], stage)
-                plog.event(
-                    "job_failed",
-                    stage=stage,
-                    extraction_id=job.get("extraction_id"),
-                    document_id=job.get("document_id"),
-                    job_id=job.get("id"),
-                    worker_name=worker_name,
-                    status="error",
-                    error=str(exc),
-                )
                 if stage in ("normalize", "ocr", "llm", "postprocess") and job.get("extraction_id"):
                     try:
                         _exc_row = await db_mod.get_extraction(pool, job["extraction_id"])
@@ -1264,21 +1069,12 @@ async def run_worker(stage: str, worker_name: str) -> None:
                             })
                     except Exception:
                         pass
-                if job.get("extraction_id") and stage != "outbound":
+                if job.get("extraction_id"):
                     await db_mod.set_extraction_status(
                         pool,
                         job["extraction_id"],
                         "failed",
                         progress={"stage": stage, "message": str(exc)},
-                        error=str(exc),
-                    )
-                elif job.get("extraction_id") and stage == "outbound":
-                    await db_mod.upsert_delivery(
-                        pool,
-                        extraction_id=job["extraction_id"],
-                        contract_type="purchase_order.v1",
-                        target_type="excel",
-                        status="failed",
                         error=str(exc),
                     )
                 await db_mod.fail_job(pool, job["id"], str(exc), retryable=False)
@@ -1288,7 +1084,7 @@ async def run_worker(stage: str, worker_name: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stage", required=True, choices=["normalize", "ocr", "llm", "postprocess", "outbound"])
+    parser.add_argument("--stage", required=True, choices=["normalize", "ocr", "llm", "postprocess"])
     parser.add_argument("--name", default=f"worker-{uuid4().hex[:8]}")
     args = parser.parse_args()
     asyncio.run(run_worker(args.stage, args.name))

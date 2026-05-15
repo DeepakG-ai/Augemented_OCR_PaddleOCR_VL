@@ -79,8 +79,7 @@ class InfrastructureSafetyTests(unittest.TestCase):
             "ocr-worker:",
             "llm-worker:",
             "postprocess-worker:",
-            "outbound-worker:",
-            "phoenix:",
+            "mlflow:",
         ]:
             self.assertIn(service, compose)
 
@@ -89,7 +88,6 @@ class InfrastructureSafetyTests(unittest.TestCase):
         self.assertIn('--stage", "ocr"', compose)
         self.assertIn('--stage", "llm"', compose)
         self.assertIn('--stage", "postprocess"', compose)
-        self.assertIn('--stage", "outbound"', compose)
 
     def test_db_module_contains_schema_and_locking_guards_for_workers(self) -> None:
         db_text = (ROOT / "backend" / "db.py").read_text(encoding="utf-8")
@@ -101,7 +99,6 @@ class InfrastructureSafetyTests(unittest.TestCase):
         self.assertIn("CREATE TABLE IF NOT EXISTS pages", db_text)
         self.assertIn("CREATE TABLE IF NOT EXISTS jobs", db_text)
         self.assertIn("CREATE TABLE IF NOT EXISTS review_events", db_text)
-        self.assertIn("CREATE TABLE IF NOT EXISTS integration_deliveries", db_text)
         self.assertIn("FOR UPDATE SKIP LOCKED", db_text)
         self.assertIn("status IN ('queued', 'running')", db_text)
 
