@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Augmented OCR — Architecture</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --border:#30363d; --fg:#e6edf3;
+    --muted:#8b949e; --accent:#58a6ff; --accent2:#3fb950; --warn:#d29922;
+    --crit:#f85149; --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font-family:var(--mono);font-size:14px;line-height:1.65;display:flex}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  nav{position:sticky;top:0;height:100vh;width:250px;flex:0 0 250px;
+    background:var(--panel);border-right:1px solid var(--border);
+    overflow-y:auto;padding:24px 18px}
+  nav h1{font-size:15px;letter-spacing:.5px;margin:0 0 4px;color:var(--fg)}
+  nav .sub{color:var(--muted);font-size:11px;margin-bottom:20px}
+  nav a{display:block;color:var(--muted);padding:6px 8px;border-radius:6px;
+    font-size:12.5px;border-left:2px solid transparent}
+  nav a:hover{background:#1f2630;color:var(--fg);text-decoration:none}
+  nav a.sec{margin-top:14px;color:var(--accent);font-weight:600;letter-spacing:.4px}
+  main{flex:1;max-width:1100px;padding:42px 56px 120px;overflow-x:hidden}
+  h2{font-size:22px;border-bottom:1px solid var(--border);padding-bottom:10px;
+    margin:54px 0 18px;scroll-margin-top:24px}
+  h2:first-of-type{margin-top:0}
+  h3{font-size:16px;color:var(--accent);margin:30px 0 10px}
+  p{color:#c9d1d9}
+  code{background:#1f2630;padding:2px 6px;border-radius:4px;font-size:12.5px;color:#ffa657}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;
+    padding:20px 24px;margin:18px 0}
+  .mermaid{background:#0b0f14;border:1px solid var(--border);border-radius:10px;
+    padding:24px;margin:18px 0;text-align:center;overflow-x:auto}
+  table{width:100%;border-collapse:collapse;margin:16px 0;font-size:12.5px}
+  th,td{border:1px solid var(--border);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:#1f2630;color:var(--fg)}
+  td{color:#c9d1d9}
+  .pill{display:inline-block;padding:1px 9px;border-radius:999px;font-size:11px;
+    font-weight:600}
+  .ok{background:rgba(63,185,80,.15);color:var(--accent2)}
+  .warn{background:rgba(210,153,34,.15);color:var(--warn)}
+  .crit{background:rgba(248,81,73,.15);color:var(--crit)}
+  .lead{font-size:15px;color:var(--muted);border-left:3px solid var(--accent);
+    padding:10px 0 10px 18px;margin:18px 0;background:#11161d}
+  .kbd{font-size:11px;color:var(--muted)}
+  blockquote{border-left:3px solid var(--warn);margin:18px 0;padding:8px 18px;
+    background:#1a1710;color:#d0c6a8}
+  footer{color:var(--muted);font-size:11px;margin-top:60px;border-top:1px solid var(--border);
+    padding-top:18px}
+</style>
+</head>
+<body>
+<nav>
+  <h1>Augmented OCR</h1>
+  <div class="sub">Architecture &amp; System Design<br>v2026-05-15</div>
+  <a class="sec" href="#overview">1 · System Context</a>
+  <a href="#containers">2 · Container View</a>
+  <a class="sec" href="#tenancy">3 · Tenant Isolation</a>
+  <a href="#ingest">4 · Ingest Flow</a>
+  <a href="#pipeline">5 · Pipeline State Machine</a>
+  <a href="#data">6 · Data Model</a>
+  <a class="sec" href="#metering">7 · Metering &amp; Billing</a>
+  <a href="#scheduler">8 · Scheduler Concurrency</a>
+  <a class="sec" href="#edge">9 · Edge Cases</a>
+  <a href="#scaling">10 · Scaling</a>
+  <a href="#guardrails">11 · Guardrails</a>
+  <a href="ARCHITECTURE.md">↗ Full written reference (MD)</a>
+</nav>
+<main>
+
+<h2 id="overview">1 · System Context</h2>
+<p class="lead">Augmented OCR turns vendor PDFs into structured, reviewed,
+billable JSON. One admin provisions isolated clients; each client owns N vendors
+(one vendor = one PDF format); every page, token, and millisecond is metered.</p>
+<div class="mermaid">
+flowchart LR
+  admin([Admin]):::act
+  client([Client A · B · N]):::act
+  subgraph SYS["Augmented OCR Platform"]
+    api["FastAPI API + SPA"]
+    pipe["4-stage durable pipeline"]
+    db[("PostgreSQL")]
+  end
+  gpu["llama.cpp · Qwen3-VL GGUF<br/>(external GPU host)"]:::ext
+  store["MinIO / local FS"]:::ext
+  admin -->|provision users, quotas| api
+  client -->|upload PDF · review · dashboard| api
+  api --> pipe --> db
+  pipe -->|page images| gpu
+  gpu -->|JSON + boxes + token usage| pipe
+  pipe <-->|originals · page images · exports| store
+  classDef act fill:#1f6feb,stroke:#58a6ff,color:#fff
+  classDef ext fill:#21262d,stroke:#8b949e,color:#e6edf3
+</div>
+<div class="card">
+<b>The product in one line:</b> upload → detect vendor from page 1 → render &amp;
+classify pages → Qwen3-VL extraction → map every value to a bounding box →
+human review → spatial memory remembers <i>where</i> fields are for next time.
+</div>
+
+<h2 id="containers">2 · Container View</h2>
+<p>Six processes. Workers never call each other — they coordinate only through
+the Postgres <code>jobs</code> table with <code>FOR UPDATE SKIP LOCKED</code>.
+That single decision makes every stage independently scalable and
+crash-recoverable with no distributed-systems code.</p>
+<div class="mermaid">
+flowchart TB
+  subgraph edge["Stateless / horizontal"]
+    api["api · uvicorn<br/>REST + SSE + static SPA"]
+  end
+  subgraph workers["Workers — coordinate ONLY via jobs table"]
+    nz["normalize-worker<br/>CPU · PDFium"]
+    ocr["ocr-worker<br/>CPU · PaddleOCR"]
+    llm["llm-worker<br/>GPU · SERIAL (the wall)"]
+    pp["postprocess-worker<br/>CPU/DB"]
+  end
+  db[("PostgreSQL<br/>jobs · extractions · llm_usage · …")]
+  rds[("Redis · result cache")]
+  obj[("MinIO · originals/pages/exports")]
+  ml[("MLflow · traces")]
+  qwen["llama-server<br/>Qwen3-VL GGUF"]
+  api --> db
+  api -. SSE .-> api
+  nz <--> db
+  ocr <--> db
+  llm <--> db
+  pp <--> db
+  nz --> obj
+  llm --> qwen
+  llm --> ml
+  api --> rds
+</div>
+<table>
+<tr><th>Process</th><th>Bound by</th><th>Replicas</th><th>Scale by</th></tr>
+<tr><td>api</td><td>CPU/IO</td><td>1</td><td>horizontal, stateless</td></tr>
+<tr><td>normalize-worker</td><td>CPU (PDFium)</td><td>1</td><td><span class="pill ok">add replicas</span></td></tr>
+<tr><td>ocr-worker</td><td>CPU (PaddleOCR)</td><td>1</td><td><span class="pill ok">add replicas</span></td></tr>
+<tr><td>llm-worker</td><td><b>GPU, serial</b></td><td>1</td><td><span class="pill crit">NOT replicas — GPU is the wall</span></td></tr>
+<tr><td>postprocess-worker</td><td>CPU/DB</td><td>1</td><td>rarely needed</td></tr>
+</table>
+
+<h2 id="tenancy">3 · Tenant Isolation <span class="pill ok">Invariant #1</span></h2>
+<p>There is <b>no <code>user_id</code> on extractions, jobs, or llm_usage</b>.
+Ownership is always resolved by walking back to a vendor. Admin role
+short-circuits every assert.</p>
+<div class="mermaid">
+flowchart TD
+  u["users.id"] -->|owns| v["vendors.user_id"]
+  v --> t["templates"]
+  v --> al["vendor_aliases"]
+  v --> sm["spatial_memory"]
+  v --> qb["qwen_layout_boxes"]
+  v --> ge["gold_examples"]
+  v --> e["extractions"]
+  e --> d["documents"]
+  e --> pg["pages"]
+  e --> j["jobs"]
+  e --> lu["llm_usage"]
+  e --> rv["review_events"]
+  style u fill:#1f6feb,stroke:#58a6ff,color:#fff
+  style v fill:#238636,stroke:#3fb950,color:#fff
+</div>
+<table>
+<tr><th>Route class</th><th>Enforcement</th><th>Examples</th></tr>
+<tr><td>List</td><td><code>WHERE vendor.user_id = me</code></td><td>/vendors /extractions /templates</td></tr>
+<tr><td>Item</td><td><code>assert_*_access()</code> ownership walk</td><td>/extractions/{id} /jobs/{id}</td></tr>
+<tr><td>Admin</td><td><code>require_admin</code> (role bypass)</td><td>/admin/users /admin/usage</td></tr>
+<tr><td>Public</td><td>none</td><td>/health</td></tr>
+</table>
+<div class="card">Client A can never see, block, or corrupt Client B's data.
+Every cross-tenant path is gated by the four asserts in <code>auth.py</code>.
+This is the entire isolation contract — it has no exceptions.</div>
+
+<h2 id="ingest">4 · Ingest Flow (manual &amp; scheduled converge)</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant C as Client / Scheduler
+  participant API as FastAPI
+  participant VD as vendor_detector
+  participant DB as Postgres
+  participant W as Workers
+  C->>API: POST /ingest/ui (PDF) — or scheduler ingest_cb
+  API->>DB: quota check (billable_pages vs subscription_limit)
+  alt over quota
+    API-->>C: 402 Payment Required
+  end
+  API->>API: store original → object store
+  API->>DB: INSERT documents
+  API->>VD: read page-1 text → match vendor
+  alt no vendor match
+    API-->>C: 409 — create vendor + template first
+  end
+  API->>DB: INSERT extractions + enqueue normalize job
+  API-->>C: { job_id, extraction_id, detected_vendor }
+  C->>API: GET /jobs/{id}/stream  (SSE, reconnectable)
+  W-->>API: stage progress events
+  API-->>C: live pipeline updates → done
+</div>
+
+<h2 id="pipeline">5 · Pipeline State Machine <span class="pill ok">Invariant #2: page 1 is sequential</span></h2>
+<p><code>normalize</code> fans out to <b>both</b> <code>ocr</code> and
+<code>llm</code> (PaddleOCR on CPU while Qwen runs on GPU). Whichever finishes
+last triggers <code>postprocess</code> via an idempotent readiness guard. The
+LLM stage never sets <code>done</code> — postprocess owns that transition.</p>
+<div class="mermaid">
+stateDiagram-v2
+  [*] --> normalize
+  normalize --> ocr: scanned pages
+  normalize --> llm: page images
+  ocr --> postprocess: geometry ready
+  llm --> postprocess: result + layout boxes ready
+  postprocess --> done
+  llm --> unverified: page-1 vendor_confirmed=false
+  normalize --> cancelled: cancel requested
+  ocr --> cancelled
+  llm --> partial: cancelled w/ partial results
+  postprocess --> done
+  done --> [*]
+  note right of llm
+    PARALLEL_BATCH = 1
+    page 1 → header + boxes + vendor verify
+    pages 2+ → line items only
+    per-page token + latency → llm_usage
+  end note
+</div>
+<table>
+<tr><th>Stage</th><th>Work</th><th>Key output</th></tr>
+<tr><td>normalize</td><td>render 32px-aligned page images; classify digital vs scanned by pypdfium2 char count</td><td>pages + per-page word geometry</td></tr>
+<tr><td>ocr</td><td>PaddleOCR on <i>scanned only</i>; digital reuses pypdfium2</td><td>unified <code>ocr_data</code></td></tr>
+<tr><td>llm</td><td>page-by-page Qwen3-VL; <b>fresh</b> page-1 box+value every run (no reuse)</td><td><code>result</code>, <code>qwen_layout_boxes</code> (per-run handoff)</td></tr>
+<tr><td>postprocess</td><td>map values→boxes, apply spatial memory (current text in saved region)</td><td><code>field_locations</code>, status=done</td></tr>
+</table>
+<div class="card"><b>Model strategy.</b> Backend is <b>Qwen3-VL only</b>
+(llama.cpp, GGUF). <b>Gemini 3 Flash</b> is an optional alternative in the
+standalone <code>gemini/</code> folder — same JSON shape, a <i>deployment</i>
+choice, not runtime-pluggable. Prefer Qwen3-VL while we have GPU; fall back to
+Gemini 3 Flash only if the customer can't supply adequate GPU (hosted, per-call
+cost, near-zero infra, scales instantly). Wiring Gemini into the
+<code>llm</code> stage is a future task, not current behavior.</div>
+<div class="card"><b>Box lifecycle (corrected).</b> Every PDF's page 1 goes to
+the model <b>fresh every run</b> and returns box + value.
+<code>qwen_layout_boxes</code> is upserted last-write-wins and read back
+<i>within the same extraction</i> — a per-run LLM→postprocess handoff, <b>not</b>
+a long-lived cache. No "learned once, reused forever" path exists, so a bad
+page-1 box cannot be inherited by future documents. The only cross-document
+reuse is <b>spatial memory</b> (human-corrected regions, never values).</div>
+
+<h2 id="data">6 · Data Model (core tables)</h2>
+<div class="mermaid">
+erDiagram
+  users ||--o{ vendors : owns
+  vendors ||--|| templates : has
+  vendors ||--o{ vendor_aliases : detect
+  vendors ||--o{ spatial_memory : geometry
+  vendors ||--o{ qwen_layout_boxes : learned
+  vendors ||--o{ extractions : produces
+  documents ||--o{ extractions : source
+  extractions ||--o{ pages : renders
+  extractions ||--o{ jobs : pipeline
+  extractions ||--o{ llm_usage : meters
+  extractions ||--o{ review_events : corrections
+  users { uuid id PK "role, is_active, subscription_limit" }
+  vendors { text id PK "user_id FK" }
+  jobs { int id PK "job_type,status,priority,locked_by" }
+  llm_usage { int id PK "page_num,prompt_tokens,completion_tokens,duration_ms" }
+  spatial_memory { int id PK "layout_key,field_key,normalized_box" }
+</div>
+
+<h2 id="metering">7 · Metering &amp; Billing</h2>
+<p>Billing is <b>derived, never a stored running total</b>. Source of truth:
+<code>llm_usage</code> — one row per LLM call (≈ per page) written by the LLM
+stage as each page completes.</p>
+<table>
+<tr><th>Metric</th><th>Derivation</th></tr>
+<tr><td>Per-page tokens / latency</td><td><code>llm_usage.prompt_tokens · completion_tokens · duration_ms</code> from the model server usage block</td></tr>
+<tr><td>Per-PDF totals</td><td><code>get_extraction_token_totals</code> — aggregate by <code>extraction_id</code></td></tr>
+<tr><td>Per-client billable pages</td><td><code>COUNT(DISTINCT (extraction_id, page_num))</code> where extraction_id NOT NULL</td></tr>
+<tr><td>Quota gate</td><td>ingest rejects with <b>402</b> if <code>billable ≥ subscription_limit</code> (soft limit; 0 = blocked)</td></tr>
+</table>
+<blockquote><b>Known billing leak:</b> <code>llm_usage.extraction_id</code> is
+<code>ON DELETE SET NULL</code> — deleting an extraction removes its pages from
+the billable count. Fix = freeze billable pages into an append-only ledger at
+completion. <span class="pill crit">Tracked, not fixed</span></blockquote>
+
+<h2 id="scheduler">8 · Scheduler Concurrency — "Client A &amp; B both at 22:00"</h2>
+<p class="lead">Simultaneous schedules are <b>safe and isolated by design</b>.
+The only thing that degrades under simultaneous large batches is <i>latency
+fairness</i>, and that has a designed, tested, gated fix. No client can ever
+see, block, or corrupt another's data through the scheduler.</p>
+<div class="mermaid">
+sequenceDiagram
+  participant SchedA as user_sched_A (22:00)
+  participant SchedB as user_sched_B (22:00)
+  participant Loop as AsyncIO event loop
+  participant Q as Postgres jobs queue
+  participant GPU as llm-worker (1 GPU, serial)
+  Note over SchedA,SchedB: distinct APScheduler jobs · max_instances=1 is PER-schedule
+  SchedA->>Loop: fire (coroutine)
+  SchedB->>Loop: fire (coroutine) — concurrent, neither blocks
+  SchedA->>Q: enqueue A's PDFs (is_executing=A only)
+  SchedB->>Q: enqueue B's PDFs (is_executing=B only)
+  Q->>GPU: SKIP LOCKED — A & B interleave fairly
+  Note over Q,GPU: risk = head-of-line latency if A enqueues 500 first<br/>fix = per-customer fair queue (scaling.md Step 2, gated)
+</div>
+<table>
+<tr><th>Mechanism</th><th>Scope</th><th>Effect across clients</th></tr>
+<tr><td><code>max_instances=1, coalesce=True</code></td><td>per schedule</td><td>none — only stops a schedule overlapping itself</td></tr>
+<tr><td><code>user_schedules.is_executing</code></td><td>per schedule</td><td>none — only blocks the <i>same</i> client's UI upload</td></tr>
+<tr><td><code>FOR UPDATE SKIP LOCKED</code> + <code>jobs_active_idx</code></td><td>global queue</td><td>fair interleave; no double-processing</td></tr>
+<tr><td>Per-customer fair queueing <span class="pill warn">PLANNED</span></td><td>global queue</td><td>removes head-of-line latency under big batches</td></tr>
+</table>
+
+<h2 id="edge">9 · Edge Cases</h2>
+<table>
+<tr><th>Case</th><th>Behavior</th><th>Status</th></tr>
+<tr><td>Unknown vendor</td><td>409, no auto-create, no pipeline</td><td><span class="pill ok">by design</span></td></tr>
+<tr><td>Ambiguous shared alias</td><td>substring match → wrong vendor possible</td><td><span class="pill warn">aliases must be unique</span></td></tr>
+<tr><td>Digital page, &gt;50 chars, 0 words</td><td>OCR skipped → no review boxes</td><td><span class="pill crit">HIGH</span></td></tr>
+<tr><td>Malformed LLM response (no <code>choices</code>)</td><td>KeyError can crash page</td><td><span class="pill crit">CRITICAL</span></td></tr>
+<tr><td>Quota check DB error</td><td>fails <b>open</b></td><td><span class="pill crit">HIGH — should fail closed</span></td></tr>
+<tr><td>Delete extraction</td><td>llm_usage→NULL, jobs/pages not cascaded</td><td><span class="pill crit">billing leak</span></td></tr>
+<tr><td>Worker crash mid-job</td><td>stale-job recovery resets (5m/10m)</td><td><span class="pill ok">handled</span></td></tr>
+<tr><td>Duplicate stage enqueue</td><td><code>jobs_active_idx</code> blocks it</td><td><span class="pill ok">handled</span></td></tr>
+<tr><td>Same client schedule vs UI race</td><td><code>is_executing</code> blocks UI</td><td><span class="pill ok">handled</span></td></tr>
+<tr><td>Two clients fire together</td><td>independent, isolated</td><td><span class="pill ok">safe</span></td></tr>
+<tr><td>Cancel mid-pipeline</td><td>→ cancelled / partial</td><td><span class="pill ok">handled</span></td></tr>
+<tr><td>page-1 vendor unverified</td><td>status <code>unverified</code>, stops</td><td><span class="pill warn">SSE not terminal → spinner hang</span></td></tr>
+<tr><td>PDF text-geometry throws</td><td>whole doc → scanned fallback</td><td><span class="pill ok">graceful</span></td></tr>
+<tr><td>Empty template</td><td>weak prompt → poor output</td><td><span class="pill warn">no save validation</span></td></tr>
+<tr><td>SSE client disconnects</td><td>pipeline continues; reattach</td><td><span class="pill ok">durable</span></td></tr>
+</table>
+
+<h2 id="scaling">10 · Scaling (10 → 100 customers)</h2>
+<div class="card"><b>The one decision that matters:</b> the model is GGUF →
+stay on llama.cpp, raise <code>--parallel 1 → 8–16</code> on a 24–48 GB AWS GPU.
+Zero Python changes, 5–10× throughput. vLLM is <b>not</b> an option (no GGUF
+vision support).</div>
+<div class="mermaid">
+flowchart LR
+  s1["1 · CPU-stage replicas<br/>free · low risk · GPU never starves"]
+  s2["2 · Per-customer fair queue<br/>medium · tested · NOT demo week"]
+  s3["3 · DB conn ceiling<br/>shrink pools → pgbouncer"]
+  s4["4 · 2nd GPU / bigger card<br/>the ONLY true ceiling lift"]
+  s5["5 · Shorter LLM output<br/>~15-25% · code only"]
+  s1 --> s3 --> s2 --> s5 -.same-hour SLA.-> s4
+  classDef a fill:#161b22,stroke:#30363d,color:#e6edf3
+  class s1,s2,s3,s4,s5 a
+</div>
+<p>Single RTX 4060 ≈ 240 pages/hr (serial — the hard wall). Overnight batch
+acceptable → steps 1, 3a, 5 on one GPU. Same-hour turnaround → step 4 is
+mandatory; the queue already load-balances two llm-workers with zero code
+change. Full detail: <a href="../scaling.md">docs/scaling.md</a>.</p>
+
+<h2 id="guardrails">11 · Guardrails — what must never change</h2>
+<div class="card">
+<ol>
+<li>Sequential page processing within a document (<code>PARALLEL_BATCH = 1</code>).</li>
+<li><code>FOR UPDATE SKIP LOCKED</code> + <code>jobs_active_idx</code> queue design.</li>
+<li>Tenant isolation via <code>vendors.user_id</code> walk — never add a bypass <code>user_id</code>.</li>
+<li>Spatial memory stores <b>geometry, not values</b>.</li>
+<li>Postprocess — not LLM — owns the final <code>done</code> transition.</li>
+<li>Vendor detection never auto-creates a vendor.</li>
+<li>Reuse the finalized llama-server flags exactly on any new GPU.</li>
+</ol>
+</div>
+
+<footer>
+Augmented OCR — Architecture &amp; System Design · generated 2026-05-15 ·
+branch <code>feat/qwen-two-agent-bbox-fields</code><br>
+Companion: <a href="ARCHITECTURE.md">ARCHITECTURE.md</a> ·
+<a href="../workflow.md">workflow.md</a> ·
+<a href="../scaling.md">scaling.md</a> · <a href="README.md">study-guide index</a>
+</footer>
+</main>
+<script>
+  mermaid.initialize({startOnLoad:true, theme:'dark',
+    themeVariables:{fontFamily:'JetBrains Mono, monospace', fontSize:'13px',
+      primaryColor:'#161b22', primaryBorderColor:'#30363d', lineColor:'#8b949e',
+      primaryTextColor:'#e6edf3'},
+    securityLevel:'loose', flowchart:{curve:'basis'}});
+</script>
+</body>
+</html>

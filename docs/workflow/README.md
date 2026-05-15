@@ -8,6 +8,21 @@ This folder is a line-by-line study guide for every major workflow in the Augmen
 
 ---
 
+## Start here (production architecture)
+
+- **[architecture.html](architecture.html)** — visual architect deliverable.
+  Open in a browser; live Mermaid: system context, container view, ingest
+  sequence, pipeline state machine, ER model, tenancy, scheduler concurrency,
+  scaling.
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — the single written reference: repo
+  structure, invariants, end-to-end workflow, metering/billing, scheduler
+  concurrency ("two clients at 10 PM"), edge cases, test map, scaling roadmap,
+  guardrails.
+
+The files below are the deeper per-workflow study guides.
+
+---
+
 ## Reading order
 
 If you're new to the codebase, follow this order. Each file builds on the previous.
