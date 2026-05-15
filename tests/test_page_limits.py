@@ -191,6 +191,15 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
 
     def setUp(self) -> None:
         main.limiter.reset()
+        # The /ingest/ui endpoint runs a scheduler guard
+        # (db_mod.get_user_is_executing) before the quota check. These tests
+        # use a non-DB fake pool, so stub the guard to "not executing" — the
+        # quota path under test stays exercised.
+        _sched = patch.object(
+            main.db_mod, "get_user_is_executing", new=AsyncMock(return_value=False)
+        )
+        _sched.start()
+        self.addCleanup(_sched.stop)
 
     def _use_client(self, uid: str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"):
         main.app.dependency_overrides[get_current_user] = lambda: _client_user(uid)
@@ -540,6 +549,13 @@ class MultiClientIsolationTests(unittest.TestCase):
 
     def setUp(self):
         main.limiter.reset()
+        # See note in SubscriptionQuotaEnforcementTests.setUp — stub the
+        # scheduler guard so the quota path is what gets exercised.
+        _sched = patch.object(
+            main.db_mod, "get_user_is_executing", new=AsyncMock(return_value=False)
+        )
+        _sched.start()
+        self.addCleanup(_sched.stop)
 
     def tearDown(self):
         main.app.dependency_overrides[get_current_user] = _admin_user
