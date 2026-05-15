@@ -109,7 +109,9 @@ class UserMessageDualModeTests(unittest.TestCase):
         self.assertIn("vendor_confirmed", parsed_template)
         self.assertIn("fields", parsed_template)
         self.assertIn("boxes", parsed_template)
-        self.assertIs(parsed_template["vendor_confirmed"], True)
+        # vendor_confirmed is an unfilled slot the model populates — the
+        # template ships it as null, not a pre-set True.
+        self.assertIsNone(parsed_template["vendor_confirmed"])
 
     def test_page2_message_no_boxes(self):
         msg = extractor.build_user_message(HEADER, ITEMS, 2, 3, include_boxes=False)
@@ -126,7 +128,7 @@ class UserMessageDualModeTests(unittest.TestCase):
 
     def test_page1_message_uses_json_shape_for_boxes(self):
         msg = extractor.build_user_message(HEADER, ITEMS, 1, 3, include_boxes=True)
-        self.assertIn('"vendor_confirmed": true', msg)
+        self.assertIn('"vendor_confirmed": null', msg)
         self.assertIn('"boxes"', msg)
 
     def test_page2_message_no_bbox_instructions(self):
