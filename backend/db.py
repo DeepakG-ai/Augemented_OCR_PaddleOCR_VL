@@ -741,6 +741,7 @@ async def get_llm_usage_daily_summary(
     date_to: Any = None,
 ) -> list[dict]:
     """Return token totals grouped by day, optionally scoped to one vendor or user."""
+    uid = _uuid_or_none(user_id)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -753,9 +754,8 @@ async def get_llm_usage_daily_summary(
                 COUNT(*)::INT AS llm_calls,
                 ROUND(AVG(lu.duration_ms))::INT AS avg_call_ms
             FROM llm_usage lu
-            LEFT JOIN vendors v ON v.id = lu.vendor_id
             WHERE ($1::TEXT IS NULL OR lu.vendor_id = $1)
-              AND ($2::UUID IS NULL OR v.user_id = $2)
+              AND ($2::UUID IS NULL OR lu.user_id = $2)
               AND ($4::TIMESTAMPTZ IS NULL OR lu.ts >= $4)
               AND ($5::TIMESTAMPTZ IS NULL OR lu.ts < $5)
             GROUP BY DATE(lu.ts)
@@ -763,7 +763,7 @@ async def get_llm_usage_daily_summary(
             LIMIT $3
             """,
             vendor_id,
-            user_id,
+            uid,
             max(1, min(limit, 366)),
             date_from,
             date_to,
@@ -796,23 +796,23 @@ async def get_usage_by_client(pool: asyncpg.Pool) -> list[dict]:
             """
             WITH extraction_totals AS (
                 SELECT
-                    v.user_id,
+                    COALESCE((d.metadata->>'billing_user_id')::UUID, v.user_id) AS user_id,
                     COUNT(e.id) FILTER (WHERE e.status = 'done')::INT AS total_extractions,
                     COALESCE(SUM(e.total_pages) FILTER (WHERE e.status = 'done'), 0)::BIGINT AS total_pages
                 FROM vendors v
                 LEFT JOIN extractions e ON e.vendor_id = v.id
-                GROUP BY v.user_id
+                LEFT JOIN documents d ON d.id = e.document_id
+                GROUP BY COALESCE((d.metadata->>'billing_user_id')::UUID, v.user_id)
             ),
             usage_totals AS (
                 SELECT
-                    v.user_id,
+                    lu.user_id,
                     COALESCE(SUM(lu.prompt_tokens), 0)::BIGINT AS total_input_tokens,
                     COALESCE(SUM(lu.completion_tokens), 0)::BIGINT AS total_output_tokens,
                     COALESCE(SUM(lu.total_tokens), 0)::BIGINT AS grand_total,
                     COUNT(lu.id)::INT AS total_llm_calls
-                FROM vendors v
-                LEFT JOIN llm_usage lu ON lu.vendor_id = v.id
-                GROUP BY v.user_id
+                FROM llm_usage lu
+                GROUP BY lu.user_id
             )
             SELECT
                 u.id::TEXT AS user_id,
@@ -865,9 +865,11 @@ async def get_client_document_usage(
                 )::INT AS billable_pages,
                 COALESCE(SUM(lu.duration_ms), 0)::REAL AS total_latency_ms
             FROM extractions e
-            JOIN vendors v ON v.id = e.vendor_id AND v.user_id = $1::UUID
+            JOIN vendors v ON v.id = e.vendor_id
+            JOIN documents d ON d.id = e.document_id
             LEFT JOIN llm_usage lu ON lu.extraction_id = e.id
-            WHERE ($3::TIMESTAMPTZ IS NULL OR e.created_at >= $3)
+            WHERE COALESCE((d.metadata->>'billing_user_id')::UUID, v.user_id) = $1::UUID
+              AND ($3::TIMESTAMPTZ IS NULL OR e.created_at >= $3)
               AND ($4::TIMESTAMPTZ IS NULL OR e.created_at < $4)
             GROUP BY e.id, e.filename, v.id, v.name, e.total_pages, e.status, e.created_at
             ORDER BY e.created_at DESC
@@ -937,6 +939,7 @@ async def get_usage_stats(
     date_to: Any = None,
 ) -> dict:
     """Return aggregate usage counters for the dashboard, optionally scoped to one user."""
+    uid = _uuid_or_none(user_id)
     async with pool.acquire() as conn:
         ext_row = await conn.fetchrow(
             """
@@ -947,11 +950,12 @@ async def get_usage_stats(
                 COALESCE(SUM(e.total_pages) FILTER (WHERE e.status = 'done'), 0)::BIGINT AS total_pages
             FROM extractions e
             LEFT JOIN vendors v ON v.id = e.vendor_id
-            WHERE ($1::UUID IS NULL OR v.user_id = $1)
+            LEFT JOIN documents d ON d.id = e.document_id
+            WHERE ($1::UUID IS NULL OR COALESCE((d.metadata->>'billing_user_id')::UUID, v.user_id) = $1)
               AND ($2::TIMESTAMPTZ IS NULL OR e.created_at >= $2)
               AND ($3::TIMESTAMPTZ IS NULL OR e.created_at < $3)
             """,
-            user_id,
+            uid,
             date_from,
             date_to,
         )
@@ -968,12 +972,11 @@ async def get_usage_stats(
                       AND lu.page_num IS NOT NULL
                 )::INT AS billable_pages
             FROM llm_usage lu
-            LEFT JOIN vendors v ON v.id = lu.vendor_id
-            WHERE ($1::UUID IS NULL OR v.user_id = $1)
+            WHERE ($1::UUID IS NULL OR lu.user_id = $1)
               AND ($2::TIMESTAMPTZ IS NULL OR lu.ts >= $2)
               AND ($3::TIMESTAMPTZ IS NULL OR lu.ts < $3)
             """,
-            user_id,
+            uid,
             date_from,
             date_to,
         )
@@ -1715,17 +1718,25 @@ async def update_extraction_result(
             )
 
 
-async def list_extractions(pool: asyncpg.Pool, vendor_id: str, limit: int = 20) -> list[dict]:
+async def list_extractions(
+    pool: asyncpg.Pool,
+    vendor_id: str,
+    limit: int = 20,
+    user_id: str | None = None,
+) -> list[dict]:
+    uid = _uuid_or_none(user_id)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""
             SELECT {_EXTRACTION_COLS}
             FROM extractions e
             LEFT JOIN vendors v ON v.id = e.vendor_id
+            LEFT JOIN documents d ON d.id = e.document_id
             WHERE e.vendor_id = $1
+              AND ($3::UUID IS NULL OR COALESCE((d.metadata->>'billing_user_id')::UUID, v.user_id) = $3)
             ORDER BY e.created_at DESC LIMIT $2
             """,
-            vendor_id, limit,
+            vendor_id, limit, uid,
         )
         results = []
         for r in rows:
@@ -1742,16 +1753,18 @@ async def list_all_extractions(
     user_id: str | None = None,
 ) -> list[dict]:
     """Global extraction history with vendor_name joined."""
+    uid = _uuid_or_none(user_id)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""
             SELECT {_EXTRACTION_COLS}
             FROM extractions e
             LEFT JOIN vendors v ON v.id = e.vendor_id
-            WHERE ($2::UUID IS NULL OR v.user_id = $2)
+            LEFT JOIN documents d ON d.id = e.document_id
+            WHERE ($2::UUID IS NULL OR COALESCE((d.metadata->>'billing_user_id')::UUID, v.user_id) = $2)
             ORDER BY e.created_at DESC LIMIT $1
             """,
-            limit, user_id,
+            limit, uid,
         )
         results = []
         for r in rows:
@@ -1763,14 +1776,16 @@ async def list_all_extractions(
 
 
 async def count_all_extractions(pool: asyncpg.Pool, user_id: str | None = None) -> int:
+    uid = _uuid_or_none(user_id)
     async with pool.acquire() as conn:
         return await conn.fetchval(
             """
             SELECT COUNT(*) FROM extractions e
             LEFT JOIN vendors v ON v.id = e.vendor_id
-            WHERE ($1::UUID IS NULL OR v.user_id = $1)
+            LEFT JOIN documents d ON d.id = e.document_id
+            WHERE ($1::UUID IS NULL OR COALESCE((d.metadata->>'billing_user_id')::UUID, v.user_id) = $1)
             """,
-            user_id,
+            uid,
         )
 
 

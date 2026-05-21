@@ -1,205 +1,99 @@
 """
-test_tracing.py — Verify full pipeline tracing works end-to-end.
+test_tracing.py — contract tests for MLflow tracing.
 
-Simulates the complete document extraction workflow and sends
-hierarchical traces to MLflow, just like a real extraction would:
+We do NOT test MLflow itself and we never need a live tracking server.
+We lock the two properties that actually matter in production:
 
-  document_extraction (root)
-  ├── file_upload
-  ├── pdf_to_images
-  ├── prompt_building
-  ├── page_1_extraction
-  │   ├── build_user_message
-  │   └── llm.chat page_1/2
-  ├── page_2_extraction
-  │   ├── build_user_message
-  │   └── llm.chat page_2/2
-  ├── merge_results
-  ├── paddle_ocr
-  │   ├── ocr_page_1
-  │   └── ocr_page_2
-  ├── text_matching
-  ├── db_persist (OCR data)
-  └── db_persist (final result)
-
-Run:  python tests/test_tracing.py
-View: http://localhost:5000  →  experiment "augmented_ocr"
+  1. Tracing is NON-FATAL: disabled, or if mlflow raises, span() degrades
+     to a clean no-op and the caller's code (and its exceptions) are
+     unaffected.
+  2. The import surface is stable: every legacy trace_* name stays
+     importable and usable as a context manager (this exact thing broke
+     once with trace_file_upload).
 """
-import sys
-import os
-import time
+from __future__ import annotations
 
-# Add backend to sys.path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
+import unittest
+from unittest import mock
 
-os.environ["MLFLOW_ENABLED"] = "true"
-os.environ["MLFLOW_TRACKING_URI"] = "http://localhost:5000"
-
-from mlflow_tracing import (
-    setup_mlflow,
-    trace_extraction_pipeline,
-    trace_file_upload,
-    trace_pdf_rendering,
-    trace_prompt_building,
-    trace_page_extraction,
-    trace_build_user_message,
-    trace_llm_call,
-    trace_merge_results,
-    trace_paddle_ocr,
-    trace_ocr_page,
-    trace_text_matching,
-    trace_db_persist,
-)
+from backend import mlflow_tracing as mlf
 
 
-def simulate_full_pipeline():
-    """Simulate the full document extraction pipeline with tracing."""
+LEGACY_CTX_NAMES = [
+    "trace_span", "trace_named_step", "trace_pipeline_stage",
+    "trace_extraction_root", "trace_extraction_pipeline", "trace_llm_call",
+    "trace_page_extraction", "trace_build_user_message", "trace_merge_results",
+    "trace_file_upload", "trace_pdf_rendering", "trace_text_matching",
+    "trace_db_persist", "trace_paddle_ocr", "trace_prompt_building",
+    "trace_ocr_page", "use_trace_context", "start_span",
+]
 
-    print("=" * 60)
-    print("  MLflow Pipeline Tracing Test")
-    print("=" * 60)
 
-    setup_mlflow("augmented_ocr")
+class TracingNonFatalTests(unittest.TestCase):
+    def test_span_is_noop_when_disabled(self):
+        with mock.patch("backend.config.MLFLOW_ENABLED", False):
+            with mlf.span("llm.chat", mlf.LLM, inputs={"x": 1}) as ctx:
+                ctx["outputs"] = "ok"
+                ctx["token_usage"] = {"input_tokens": 1, "output_tokens": 2,
+                                      "total_tokens": 3}
+        self.assertIsInstance(ctx, dict)
 
-    extraction_id = 999
-    vendor_id = "TEST_VENDOR"
-    filename = "test_invoice_2pages.pdf"
-    total_pages = 2
-    format_type = "single_po_multipage"
-    header_fields = ["po_number", "order_date", "vendor_name", "bill_to"]
-    line_item_fields = ["item", "qty", "unit_price", "amount"]
+    def test_span_never_breaks_caller_when_mlflow_raises(self):
+        with mock.patch("backend.config.MLFLOW_ENABLED", True), \
+             mock.patch.object(mlf.mlflow, "start_span",
+                               side_effect=RuntimeError("tracking server down")):
+            ran = False
+            with mlf.span("field_extraction", mlf.AGENT) as ctx:
+                ran = True
+                ctx["outputs"] = {"pages": 2}
+            self.assertTrue(ran)
+            self.assertIsInstance(ctx, dict)
 
-    # ── ROOT SPAN: document_extraction ──
-    with trace_extraction_pipeline(
-        extraction_id, vendor_id, filename, total_pages,
-        format_type, header_fields, line_item_fields,
-    ) as pipeline:
+    def test_caller_exception_propagates_through_span(self):
+        with mock.patch("backend.config.MLFLOW_ENABLED", False):
+            with self.assertRaises(ValueError):
+                with mlf.span("page 1", mlf.CHAIN):
+                    raise ValueError("page failed")
 
-        # ── Step 1: File upload ──
-        with trace_file_upload(filename, 1_500_000, "pdf"):
-            time.sleep(0.01)  # Simulate IO
-            print("  ✓ file_upload")
+    def test_trace_tags_never_raises(self):
+        with mock.patch("backend.config.MLFLOW_ENABLED", True), \
+             mock.patch.object(mlf.mlflow, "update_current_trace",
+                               side_effect=RuntimeError("no active trace")):
+            mlf.trace_tags(extraction_id=1, vendor="V1", model="qwen3vl")
 
-        # ── Step 2: PDF to images ──
-        with trace_pdf_rendering(filename) as render_ctx:
-            time.sleep(0.05)  # Simulate PDF rendering
-            render_ctx["pages_rendered"] = 2
-            print("  ✓ pdf_to_images (2 pages)")
 
-        # ── Step 3: Prompt building ──
-        system_prompt = (
-            "You are a highly accurate document data extraction assistant.\n"
-            "Extract ONLY what is explicitly visible in the document image.\n"
-            "Never guess or fabricate data. If a field is not visible, set it to null."
-        )
-        with trace_prompt_building(vendor_id) as prompt_ctx:
-            prompt_ctx["cache_hit"] = "template_db"
-            prompt_ctx["prompt_hash"] = "abc123def456"
-            prompt_ctx["system_prompt"] = system_prompt
-            print("  ✓ prompt_building (cache: template_db)")
+class CleanChatMessagesTests(unittest.TestCase):
+    def test_base64_image_is_stripped(self):
+        messages = [
+            {"role": "system", "content": "you are an assistant"},
+            {"role": "user", "content": [
+                {"type": "image_url",
+                 "image_url": {"url": "data:image/jpeg;base64,/9j/HUGE"}},
+                {"type": "text", "text": "extract fields"},
+            ]},
+        ]
+        cleaned = mlf.clean_chat_messages(messages)
+        blob = str(cleaned)
+        self.assertNotIn("base64", blob)
+        self.assertNotIn("/9j/HUGE", blob)
+        self.assertIn("extract fields", blob)
+        self.assertEqual(cleaned[0]["content"], "you are an assistant")
 
-        # ── Step 4: Page extractions ──
-        page_results = []
 
-        for page_num in range(1, total_pages + 1):
-            with trace_page_extraction(page_num, total_pages) as page_ctx:
+class ImportSurfaceTests(unittest.TestCase):
+    def test_legacy_names_importable_and_usable_as_context_managers(self):
+        for name in LEGACY_CTX_NAMES:
+            self.assertTrue(hasattr(mlf, name), f"missing legacy name: {name}")
+            factory = getattr(mlf, name)
+            with factory("x", kind="TOOL", page_num=1) as ctx:  # arbitrary args
+                # legacy shims must accept anything and yield safely
+                if isinstance(ctx, dict):
+                    ctx["output"] = "ignored"
 
-                # Build user message
-                user_msg = (
-                    f"Extract the header fields AND all visible line item rows "
-                    f"from this purchase order page (page {page_num} of {total_pages})."
-                )
-                with trace_build_user_message(page_num, total_pages) as msg_ctx:
-                    msg_ctx["user_message"] = user_msg
-                    print(f"    ✓ build_user_message (page {page_num})")
-
-                # LLM call
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": [
-                        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/SIMULATED"}},
-                        {"type": "text", "text": user_msg},
-                    ]},
-                ]
-
-                with trace_llm_call("qwen3vl", messages, temperature=0.7,
-                                    page_num=page_num, total_pages=total_pages) as llm_ctx:
-                    time.sleep(0.02)  # Simulate LLM latency
-
-                    if page_num == 1:
-                        response = '{"po_number": "P1416576", "order_date": "03/12/2026", "vendor_name": "FRESH PRODUCTS, INC.", "bill_to": "SYSCO FOOD SERVICES", "line_items": [{"item": "Lettuce Iceberg", "qty": 10, "unit_price": 12.50, "amount": 125.00}, {"item": "Tomato Roma", "qty": 5, "unit_price": 8.99, "amount": 44.95}]}'
-                        usage = {"prompt_tokens": 1200, "completion_tokens": 350, "total_tokens": 1550}
-                    else:
-                        response = '{"line_items": [{"item": "Cucumber English", "qty": 8, "unit_price": 6.75, "amount": 54.00}, {"item": "Pepper Bell Red", "qty": 12, "unit_price": 4.50, "amount": 54.00}]}'
-                        usage = {"prompt_tokens": 1100, "completion_tokens": 200, "total_tokens": 1300}
-
-                    llm_ctx["response"] = response
-                    llm_ctx["usage"] = usage
-                    print(f"    ✓ llm.chat page_{page_num}/{total_pages} ({usage['total_tokens']} tokens)")
-
-                page_ctx["result"] = {"_page": page_num, "line_items": [{"item": "test"}]}
-                page_results.append(page_ctx["result"])
-
-        # ── Step 5: Merge results ──
-        with trace_merge_results(total_pages, format_type) as merge_ctx:
-            time.sleep(0.005)
-            merge_ctx["merged_line_items"] = 4
-            merge_ctx["merged_fields"] = 4
-            print("  ✓ merge_results (4 header fields, 4 line items)")
-
-        # ── Step 6: PaddleOCR ──
-        with trace_paddle_ocr(total_pages) as ocr_ctx:
-            for page_num in range(1, total_pages + 1):
-                with trace_ocr_page(page_num) as ocr_page_ctx:
-                    time.sleep(0.03)
-                    words = 45 + page_num * 10
-                    ocr_page_ctx["words_detected"] = words
-                    print(f"    ✓ ocr_page_{page_num} ({words} words)")
-
-            ocr_ctx["pages_processed"] = total_pages
-            ocr_ctx["total_words"] = 110
-            print("  ✓ paddle_ocr (110 total words)")
-
-        # ── Step 7: Text matching ──
-        with trace_text_matching(4) as match_ctx:
-            time.sleep(0.01)
-            match_ctx["matched"] = 3
-            match_ctx["missed"] = 1
-            match_ctx["strategies"] = {"exact": 2, "contains": 1}
-            print("  ✓ text_matching (3/4 matched)")
-
-        # ── Step 8: DB persist (OCR) ──
-        with trace_db_persist(extraction_id, "done"):
-            time.sleep(0.005)
-            print("  ✓ db_persist (OCR data)")
-
-        # ── Step 9: DB persist (final result) ──
-        with trace_db_persist(extraction_id, "done"):
-            time.sleep(0.005)
-            print("  ✓ db_persist (final result + cache)")
-
-        # Set pipeline outcome
-        pipeline["status"] = "done"
-        pipeline["result"] = {
-            "po_number": "P1416576",
-            "order_date": "03/12/2026",
-            "vendor_name": "FRESH PRODUCTS, INC.",
-            "bill_to": "SYSCO FOOD SERVICES",
-            "line_items": [
-                {"item": "Lettuce Iceberg", "qty": 10, "unit_price": 12.50, "amount": 125.00},
-                {"item": "Tomato Roma", "qty": 5, "unit_price": 8.99, "amount": 44.95},
-                {"item": "Cucumber English", "qty": 8, "unit_price": 6.75, "amount": 54.00},
-                {"item": "Pepper Bell Red", "qty": 12, "unit_price": 4.50, "amount": 54.00},
-            ],
-        }
-
-    print()
-    print("=" * 60)
-    print("  SUCCESS - Full pipeline trace sent to MLflow!")
-    print("  Open http://localhost:5000 -> experiment 'augmented_ocr'")
-    print("  Click the extraction run to see the full tree")
-    print("=" * 60)
+    def test_real_span_types_exposed(self):
+        for t in (mlf.AGENT, mlf.CHAIN, mlf.LLM, mlf.TOOL, mlf.PARSER):
+            self.assertIsInstance(t, str)
 
 
 if __name__ == "__main__":
-    simulate_full_pipeline()
+    unittest.main()

@@ -31,6 +31,7 @@ from .mlflow_tracing import (
     trace_span,
     use_trace_context,
 )
+from . import mlflow_tracing as mlf
 
 
 configure_logging()
@@ -484,6 +485,17 @@ async def _process_llm(pool, job: dict) -> None:
     base = _pipeline_base(extraction=extraction_row, document=document_row, job=job)
     logger.info("── LLM started ── ext=%s vendor=%s", extraction_id, extraction_row.get("vendor_id"))
 
+    # Resolve the human who owns this extraction for MLflow trace tagging:
+    # the explicit uploader (admin acting-as-client) first, else the vendor owner.
+    uploader_email: str | None = None
+    _owner_uid = base.get("billing_user_id")
+    if not _owner_uid and extraction_row.get("vendor_id"):
+        _vendor = await db_mod.get_vendor(pool, extraction_row["vendor_id"])
+        _owner_uid = (_vendor or {}).get("user_id")
+    if _owner_uid:
+        _owner = await db_mod.get_user_by_id(pool, str(_owner_uid))
+        uploader_email = (_owner or {}).get("email")
+
     with plog.timed("template") as t:
         tmpl = await db_mod.get_template(pool, extraction_row["vendor_id"])
     logger.info("Template loaded: id=%s (%.0fms)", (tmpl or {}).get("id"), t["ms"])
@@ -521,11 +533,10 @@ async def _process_llm(pool, job: dict) -> None:
         )
         # Page 2+ system prompt: fields only (current behaviour)
         system_prompt = extractor.build_system_prompt(**_prompt_args, include_boxes=False)
-        # Page 1 system prompt: fields + bounding boxes + vendor verification
+        # Page 1 system prompt: fields + bounding boxes
         system_prompt_page1 = extractor.build_system_prompt(
             **_prompt_args,
             include_boxes=True,
-            vendor_name=extraction_row.get("vendor_name"),
         )
         prompt_trace["output"] = {
             "prompt_version": getattr(extractor, "PROMPT_VERSION", "unknown"),
@@ -554,10 +565,6 @@ async def _process_llm(pool, job: dict) -> None:
     )
 
     async def on_page_done(page_num: int, total_pages: int, page_result: dict | None) -> None:
-        if page_num == 1 and page_result and page_result.get("vendor_confirmed") is False:
-            logger.warning("Vendor verification failed on page 1 for extraction %s", extraction_id)
-            page_result["_error"] = "vendor_unverified"
-            cancel_event.set()
         progress = {
             "stage": "llm",
             "message": f"Extracting page {page_num}/{total_pages}",
@@ -580,18 +587,30 @@ async def _process_llm(pool, job: dict) -> None:
         if await db_mod.is_cancel_requested(pool, extraction_id):
             cancel_event.set()
 
-    with trace_named_step(
-        "field_agent.extract_document",
-        kind="AGENT",
-        input_data={
+    # Trace name = the PDF filename so the MLflow Traces list is human-readable.
+    # `trace_kind` is the stable marker for trace classification/cleanup
+    # (don't key off the trace name now that it varies per document).
+    _trace_name = extraction_row.get("filename") or f"extraction {extraction_id}"
+    with mlf.span(
+        _trace_name,
+        mlf.AGENT,
+        inputs={
             "page_count": len(pages),
             "header_fields": req_header,
             "line_item_fields": req_items,
             "format_type": req_format,
             "model": LLM_MODEL,
         },
-        attributes=base,
     ) as field_trace:
+        mlf.trace_tags(
+            trace_kind="field_extraction",
+            extraction_id=extraction_id,
+            filename=extraction_row.get("filename"),
+            user=uploader_email,
+            vendor=extraction_row.get("vendor_id"),
+            model=LLM_MODEL,
+            format_type=req_format,
+        )
         with plog.timed("extraction") as t:
             output = await extractor.extract_document(
                 pages=pages,
@@ -614,7 +633,7 @@ async def _process_llm(pool, job: dict) -> None:
         _nli = len((_result or {}).get("line_items", [])) if isinstance(_result, dict) else 0
         logger.info("Document extracted: %d page results, %d line items, cancelled=%s (%.0fms)",
                     _npr, _nli, output.get("cancelled", False), t["ms"])
-        field_trace["output"] = {
+        field_trace["outputs"] = {
             "page_results_count": len(output.get("page_results") or []),
             "cancelled": bool(output.get("cancelled")),
             "last_completed_page": output.get("last_completed_page", 0),
@@ -661,12 +680,7 @@ async def _process_llm(pool, job: dict) -> None:
 
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     _pr = output.get("page_results") or []
-    _unverified = any(pr.get("_error") == "vendor_unverified" for pr in _pr)
-
-    if _unverified:
-        status = "unverified"
-        logger.error("Extraction %s failed: Vendor unverified", extraction_id)
-    elif output.get("cancelled"):
+    if output.get("cancelled"):
         status = "partial" if _pr else "cancelled"
     else:
         # Don't set "done" here — postprocess worker sets the final status
@@ -894,17 +908,36 @@ async def _process_postprocess(pool, job: dict) -> None:
     )
     try:
         tok = await db_mod.get_extraction_token_totals(pool, extraction_id)
-        logger.info(
-            "── EXTRACTION COMPLETE ── ext=%s prompt_tokens=%d completion_tokens=%d total_tokens=%d llm_calls=%d",
+        _final = await db_mod.get_extraction(pool, extraction_id) or extraction_row
+        _pages = _final.get("total_pages")
+        _fields = page_logger.count_result_fields(result)
+        _dur = _final.get("duration_ms")
+        _stage_tok = plog.current_stage.set("DONE")
+        try:
+            plog.info(
+                "── EXTRACTION COMPLETE ──",
+                status="done", pages=_pages,
+                tok_in=tok["prompt_tokens"], tok_out=tok["completion_tokens"],
+                calls=tok["llm_calls"],
+                ms=float(_dur) if _dur else None,
+            )
+        finally:
+            plog.current_stage.reset(_stage_tok)
+        plog.result_block(
             extraction_id,
-            tok["prompt_tokens"],
-            tok["completion_tokens"],
-            tok["total_tokens"],
-            tok["llm_calls"],
+            status="done",
+            filename=_final.get("filename"),
+            vendor=_final.get("vendor_name") or _final.get("vendor_id"),
+            pages=_pages,
+            fields=_fields,
+            tok_in=tok["prompt_tokens"],
+            tok_out=tok["completion_tokens"],
+            llm_calls=tok["llm_calls"],
+            latency_total_s=(float(_dur) / 1000.0) if _dur else None,
+            errors=None,
         )
     except Exception:
-        pass
-    logger.info("── POSTPROCESS completed ── ext=%s", extraction_id)
+        logger.exception("post: result summary failed ext=%s", extraction_id)
 
 
 async def process_job(pool, stage: str, job: dict) -> None:
@@ -931,16 +964,17 @@ async def process_job(pool, stage: str, job: dict) -> None:
                     "payload_keys": sorted((job.get("payload") or {}).keys()),
                 },
             ) as stage_trace:
-                if stage == "normalize":
-                    await _process_normalize(pool, job)
-                elif stage == "ocr":
-                    await _process_ocr(pool, job)
-                elif stage == "llm":
-                    await _process_llm(pool, job)
-                elif stage == "postprocess":
-                    await _process_postprocess(pool, job)
-                else:
-                    raise ValueError(f"Unknown worker stage: {stage}")
+                with plog.stage_span(stage, worker=plog.current_worker.get() or "worker"):
+                    if stage == "normalize":
+                        await _process_normalize(pool, job)
+                    elif stage == "ocr":
+                        await _process_ocr(pool, job)
+                    elif stage == "llm":
+                        await _process_llm(pool, job)
+                    elif stage == "postprocess":
+                        await _process_postprocess(pool, job)
+                    else:
+                        raise ValueError(f"Unknown worker stage: {stage}")
                 stage_trace["output"] = {"status": "completed", "stage": stage}
     finally:
         if id_token is not None:
@@ -952,6 +986,7 @@ async def process_job(pool, stage: str, job: dict) -> None:
 async def run_worker(stage: str, worker_name: str) -> None:
     pool = await db_mod.create_pool()
     await db_mod.init(pool)
+    plog.current_worker.set(worker_name)
     logger.info("Worker started stage=%s name=%s", stage, worker_name)
     # Recover orphaned running jobs left by a previous crashed worker
     recovered = await db_mod.recover_stale_jobs(pool, stage, stale_minutes=5)
@@ -1070,6 +1105,28 @@ async def run_worker(stage: str, worker_name: str) -> None:
                         progress={"stage": stage, "message": str(exc)},
                         error=str(exc),
                     )
+                    try:
+                        _fr = await db_mod.get_extraction(pool, job["extraction_id"])
+                        _st = plog.current_stage.set("DONE")
+                        try:
+                            plog.error(
+                                "── EXTRACTION FAILED ──",
+                                failed_stage=stage,
+                                pages=(_fr or {}).get("total_pages"),
+                            )
+                        finally:
+                            plog.current_stage.reset(_st)
+                        plog.result_block(
+                            job["extraction_id"],
+                            status="failed",
+                            filename=(_fr or {}).get("filename"),
+                            vendor=(_fr or {}).get("vendor_name") or (_fr or {}).get("vendor_id"),
+                            pages=(_fr or {}).get("total_pages"),
+                            failed_stage=stage,
+                            errors=[f"{stage}  {type(exc).__name__}: {exc}"],
+                        )
+                    except Exception:
+                        logger.exception("worker: failure summary failed")
                 await db_mod.fail_job(pool, job["id"], str(exc), retryable=False)
     finally:
         await pool.close()

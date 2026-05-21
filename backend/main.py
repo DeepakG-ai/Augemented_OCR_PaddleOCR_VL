@@ -15,6 +15,7 @@ import mimetypes
 import os
 import time
 import traceback
+import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, timedelta
 from typing import AsyncGenerator
@@ -69,7 +70,6 @@ from .models import (
     VendorOut,
 )
 from .object_store import ARTIFACTS_BUCKET, DOCUMENTS_BUCKET, get_store
-from .folder_watcher import FolderWatcherManager
 from .scheduler import (
     init_scheduler, shutdown_scheduler, sync_job, remove_job,
     get_next_run_times, reload_all_schedules, set_context,
@@ -188,6 +188,9 @@ async def _folder_ingest_callback(user_id: str, pdf_path: str) -> None:
             })
             return
 
+        # Whoever logins (owns the watcher), bill to them.
+        billing_user_id = user_id
+
         result = await _submit_ingestion_job(
             pool,
             store,
@@ -199,6 +202,7 @@ async def _folder_ingest_callback(user_id: str, pdf_path: str) -> None:
             line_item_fields=list(tmpl.get("line_item_fields") or []),
             source_type="folder",
             source_ref=pdf_path,
+            metadata={"billing_user_id": billing_user_id},
         )
         _broadcast_config_event(user_id, {
             "type": "folder_ingest_started",
@@ -318,22 +322,8 @@ async def lifespan(app: FastAPI):
                 except Exception as exc:
                     logger.warning("Failed to bootstrap admin user %s: %s", admin_email, exc)
 
-    # Start folder watchers for every user already configured for folder-mode
-    app.state.watcher_mgr = FolderWatcherManager()
-    loop = asyncio.get_event_loop()
-    try:
-        all_configs = await db_mod.get_all_user_configs(app.state.pool)
-        for user_cfg in all_configs:
-            cfg = user_cfg.get("config", {})
-            if cfg.get("upload_mode") == "folder" and cfg.get("input_folder"):
-                app.state.watcher_mgr.start_for_user(
-                    user_cfg["user_id"],
-                    cfg["input_folder"],
-                    _folder_ingest_callback,
-                    loop,
-                )
-    except Exception as exc:
-        logger.warning("Could not initialise folder watchers: %s", exc)
+    # Folder watchers are disabled
+    app.state.watcher_mgr = None
 
     # Start APScheduler
     from .config import DATABASE_URL as _DB_URL
@@ -341,11 +331,27 @@ async def lifespan(app: FastAPI):
     set_context(app.state.pool, _folder_ingest_callback)
     await reload_all_schedules(app.state.pool)
 
+    # Suppress uvicorn access log noise for high-frequency polling routes
+    # (heartbeat, config-poll, scheduler-poll). Errors/warnings still surface.
+    import logging as _logging
+
+    class _QuietPaths(_logging.Filter):
+        _SKIP = ("/api/client/heartbeat", "/api/config", "/api/scheduler", "/health")
+        def filter(self, record: _logging.LogRecord) -> bool:
+            msg = record.getMessage()
+            return not any(p in msg for p in self._SKIP)
+
+    _q = _QuietPaths()
+    _uv = _logging.getLogger("uvicorn.access")
+    for _h in _uv.handlers:
+        _h.addFilter(_q)
+
     logger.info("DB pool, object store, and MLflow ready")
     yield
     logger.info("Shutting down -- closing connections")
     shutdown_scheduler()
-    app.state.watcher_mgr.stop_all()
+    if getattr(app.state, "watcher_mgr", None):
+        app.state.watcher_mgr.stop_all()
     await app.state.pool.close()
 
 
@@ -470,6 +476,68 @@ async def _submit_ingestion_job(
     return {"job": job, "extraction": extraction}
 
 
+# -- Access log middleware (ONE line per request — 2xx, 4xx AND 5xx) -------
+
+def _peek_user(request: Request) -> str:
+    """Best-effort caller id for the access line — no DB, never raises."""
+    try:
+        auth = request.headers.get("authorization", "")
+        raw = auth[7:] if auth.lower().startswith("bearer ") else request.query_params.get("token")
+        if not raw:
+            return "-"
+        from .auth import decode_token
+        claims = decode_token(raw)
+        return claims.get("email") or claims.get("sub") or "-"
+    except Exception:
+        return "-"
+
+
+_QUIET_PATHS = frozenset({
+    "/api/client/heartbeat", "/api/config", "/api/scheduler", "/health",
+})
+
+
+class AccessLogMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        rid = uuid.uuid4().hex[:4]
+        request.state.req_id = rid
+        stage_token = plog.current_stage.set("api")
+        t0 = time.perf_counter()
+        status = 500
+        try:
+            response = await call_next(request)
+            status = response.status_code
+            return response
+        finally:
+            ms = (time.perf_counter() - t0) * 1000
+            try:
+                # Skip INFO logging for high-frequency background polling routes.
+                # Errors/warnings (4xx/5xx) still surface regardless of path.
+                if status < 400 and request.url.path in _QUIET_PATHS:
+                    pass
+                else:
+                    user = _peek_user(request)
+                    base = f"{request.method} {request.url.path}"
+                    tail = f"req={rid} user={user} -> {status}"
+                    reason = getattr(request.state, "err_reason", None)
+                    if reason:
+                        tail += f' reason="{reason}"'
+                    ref = getattr(request.state, "trace_ref", None)
+                    if ref:
+                        tail += f" trace={ref}"
+                    line = f"{base}  | {tail} {ms:.0f}ms"
+                    lg = logging.getLogger("api")
+                    if status >= 500:
+                        lg.error(line)
+                    elif status in (401, 403):
+                        lg.warning(line)
+                    else:
+                        lg.info(line)
+            except Exception:
+                pass
+            plog.current_stage.reset(stage_token)
+
+
 # -- App --------------------------------------------------------------------
 
 app = FastAPI(
@@ -496,19 +564,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Added last → outermost: times and logs the full request lifecycle.
+app.add_middleware(AccessLogMiddleware)
 
 
 # -- Global exception handler (logs ALL unhandled errors to terminal) ------
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(
-        "Unhandled %s on %s %s:\n%s",
-        type(exc).__name__,
-        request.method,
-        request.url.path,
-        traceback.format_exc(),
+    # Loud + located inline; full traceback only in error.log under this ref.
+    # The access-log line for this request will echo the same trace=ref.
+    ref = plog.error(
+        f"{request.method} {request.url.path}",
+        exc=exc, logger="api",
     )
+    request.state.trace_ref = ref
+    request.state.err_reason = type(exc).__name__
     return Response(
         content=json.dumps({"detail": "Internal Server Error"}),
         status_code=500,
@@ -964,7 +1035,6 @@ async def get_template(request: Request, vendor_id: str, user: dict = Depends(ge
             tmpl["system_prompt_page1"] = extractor.build_system_prompt(
                 **prompt_args,
                 include_boxes=True,
-                vendor_name=(vendor or {}).get("name"),
             )
             tmpl["user_prompt_page1"] = extractor.build_user_message(
                 tmpl.get("header_fields") or [],
@@ -1416,10 +1486,8 @@ async def ingest_document(
             else:
                 vendor_trace["output"] = {"mode": "preselected", "vendor_id": vendor_id}
 
-        # Admin uploads: bill pages to admin's own account, not the vendor's client.
-        # This ensures admin usage shows on admin's dashboard and doesn't inflate
-        # any client's subscription quota counter.
-        billing_user_id = user["id"] if user.get("role") == "admin" else None
+        # Whoever logins, bill to them.
+        billing_user_id = user["id"]
 
         submitted = await _submit_ingestion_job(
             pool,
@@ -1537,7 +1605,7 @@ async def stream_job_status_sse(
                 
                 # Fetch the latest job for this extraction because the pipeline
                 # creates new sequential jobs for ocr, llm, and postprocess.
-                if extraction and extraction.get("status") not in {"done", "failed", "partial", "cancelled"}:
+                if extraction and extraction.get("status") not in {"done", "failed", "partial", "cancelled", "unverified"}:
                     latest_job = await db_mod.get_latest_job_for_extraction(pool, extraction["id"])
                     if latest_job:
                         current_job = latest_job
@@ -1548,7 +1616,7 @@ async def stream_job_status_sse(
             # If this job belongs to an extraction pipeline, only the extraction's
             # status determines if we are done. Otherwise, use the job's status.
             if extraction:
-                is_terminal = ext_status in ("done", "failed", "partial", "cancelled")
+                is_terminal = ext_status in ("done", "failed", "partial", "cancelled", "unverified")
             else:
                 is_terminal = job_status in ("done", "failed", "cancelled")
 
@@ -1558,7 +1626,7 @@ async def stream_job_status_sse(
 
             if fingerprint != last_fingerprint or is_terminal:
                 if is_terminal:
-                    if ext_status == "failed" or job_status == "failed":
+                    if ext_status in ("failed", "unverified") or job_status == "failed":
                         etype = "failed"
                     elif ext_status == "done":
                         etype = "done"
@@ -1834,7 +1902,10 @@ async def list_vendor_extractions(
     user: dict = Depends(get_current_user),
 ):
     await assert_vendor_access(request.app.state.pool, vendor_id, user)
-    rows = await db_mod.list_extractions(request.app.state.pool, vendor_id, limit)
+    filter_user = None if user["role"] == "admin" else user["id"]
+    rows = await db_mod.list_extractions(
+        request.app.state.pool, vendor_id, limit, user_id=filter_user
+    )
     return [ExtractionOut(**r) for r in rows]
 
 
@@ -2469,8 +2540,10 @@ async def get_user_extraction_page_usage(
         row = await conn.fetchrow(
             """
             SELECT e.id FROM extractions e
-            JOIN vendors v ON v.id = e.vendor_id AND v.user_id = $2::UUID
+            JOIN vendors v ON v.id = e.vendor_id
+            LEFT JOIN documents d ON d.id = e.document_id
             WHERE e.id = $1
+              AND COALESCE((d.metadata->>'billing_user_id')::UUID, v.user_id) = $2::UUID
             """,
             extraction_id,
             user["id"],
@@ -2538,11 +2611,34 @@ async def get_my_config(request: Request, user: dict = Depends(get_current_user)
     """Return the calling user's runtime configuration."""
     config = await db_mod.get_user_config(request.app.state.pool, user["id"])
     watcher_mgr = getattr(request.app.state, "watcher_mgr", None)
+
+    client_online = False
+    heartbeat_str = config.get("last_client_heartbeat")
+    if heartbeat_str:
+        try:
+            last_beat = datetime.fromisoformat(heartbeat_str)
+            client_online = (datetime.now(UTC) - last_beat).total_seconds() < 60
+        except Exception:
+            pass
+
     return {
         "user_id": user["id"],
         "config": config,
         "watcher_active": watcher_mgr.is_active(user["id"]) if watcher_mgr else False,
+        "client_online": client_online,
     }
+
+
+@app.post("/api/client/heartbeat")
+@limiter.limit("10/minute")
+async def client_heartbeat(request: Request, user: dict = Depends(get_current_user)):
+    """Client exe calls this every 30 s so the UI can show ACTIVE / INACTIVE."""
+    await db_mod.set_user_config(
+        request.app.state.pool,
+        user["id"],
+        {"last_client_heartbeat": datetime.now(UTC).isoformat()},
+    )
+    return {"status": "ok"}
 
 
 @app.put("/api/config")
@@ -2583,10 +2679,19 @@ async def config_sse_stream(request: Request, user: dict = Depends(get_current_u
         try:
             config = await db_mod.get_user_config(request.app.state.pool, uid)
             watcher_mgr = getattr(request.app.state, "watcher_mgr", None)
+            sse_client_online = False
+            hb_str = config.get("last_client_heartbeat")
+            if hb_str:
+                try:
+                    last_beat = datetime.fromisoformat(hb_str)
+                    sse_client_online = (datetime.now(UTC) - last_beat).total_seconds() < 60
+                except Exception:
+                    pass
             connected_event = json.dumps({
                 "type": "connected",
                 "config": config,
                 "watcher_active": watcher_mgr.is_active(uid) if watcher_mgr else False,
+                "client_online": sse_client_online,
             })
             yield f"data: {connected_event}\n\n"
             while not await request.is_disconnected():
@@ -2614,8 +2719,18 @@ async def admin_get_all_configs(request: Request, _: dict = Depends(require_admi
     """Admin: list every user's config."""
     rows = await db_mod.get_all_user_configs(request.app.state.pool)
     watcher_mgr = getattr(request.app.state, "watcher_mgr", None)
+    now = datetime.now(UTC)
     for row in rows:
         row["watcher_active"] = watcher_mgr.is_active(row["user_id"]) if watcher_mgr else False
+        client_online = False
+        heartbeat_str = row.get("config", {}).get("last_client_heartbeat")
+        if heartbeat_str:
+            try:
+                last_beat = datetime.fromisoformat(heartbeat_str)
+                client_online = (now - last_beat).total_seconds() < 60
+            except Exception:
+                pass
+        row["client_online"] = client_online
     return rows
 
 
@@ -2627,10 +2742,19 @@ async def admin_get_user_config(
     """Admin: get one user's config."""
     config = await db_mod.get_user_config(request.app.state.pool, target_user_id)
     watcher_mgr = getattr(request.app.state, "watcher_mgr", None)
+    client_online = False
+    heartbeat_str = config.get("last_client_heartbeat")
+    if heartbeat_str:
+        try:
+            last_beat = datetime.fromisoformat(heartbeat_str)
+            client_online = (datetime.now(UTC) - last_beat).total_seconds() < 60
+        except Exception:
+            pass
     return {
         "user_id": target_user_id,
         "config": config,
         "watcher_active": watcher_mgr.is_active(target_user_id) if watcher_mgr else False,
+        "client_online": client_online,
     }
 
 

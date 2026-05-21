@@ -21,6 +21,7 @@ if BACKEND_DIR not in sys.path:
 # Ensure SECRET_KEY exists so auth.py module-level paths don't blow up if
 # anything imports the encoder during a test.
 os.environ.setdefault("SECRET_KEY", "test-only-secret-do-not-use-in-prod")
+os.environ.setdefault("MLFLOW_ENABLED", "false")  # never emit real traces during tests
 
 try:
     from backend import main as _main

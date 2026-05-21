@@ -299,6 +299,7 @@ async function saveTemplate() {
         showToast('Run extraction first so the system can detect the vendor');
         return;
     }
+    addRule();
     const formatEl = document.getElementById('formatType');
     const promptEl = document.getElementById('promptInstructions');
     const payload = {

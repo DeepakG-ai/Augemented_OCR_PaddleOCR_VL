@@ -71,6 +71,47 @@ class LlmUsageRecordingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["total_tokens"], 2104)
         self.assertEqual(kwargs["llm_url"], "http://localhost:8001/v1/chat/completions")
 
+    async def test_call_llm_does_not_record_usage_on_json_failure(self) -> None:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {
+            "choices": [{"message": {"content": "not-valid-json-at-all"}}],
+            "usage": {
+                "prompt_tokens": 1643,
+                "completion_tokens": 461,
+                "total_tokens": 2104,
+            },
+        }
+
+        pool = object()
+        with patch("backend.extractor.httpx.AsyncClient") as MockClient, \
+             patch.object(extractor.db_mod, "record_llm_usage", new=AsyncMock(return_value={"id": 1})) as mock_record:
+            MockClient.return_value.__aenter__ = AsyncMock(return_value=MockClient.return_value)
+            MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value.post = AsyncMock(return_value=resp)
+
+            with self.assertRaises(ValueError) as ctx:
+                await extractor.call_llm(
+                    _b64(),
+                    "system",
+                    "user",
+                    "http://localhost:8001/v1/chat/completions",
+                    "qwen3vl",
+                    page_num=2,
+                    total_pages=5,
+                    pipeline_context={
+                        "document_id": 42,
+                        "extraction_id": 99,
+                        "vendor_id": "ROBERT_SCOTT",
+                        "job_id": 7,
+                    },
+                    pool=pool,
+                )
+            
+            self.assertIn("LLM returned invalid JSON", str(ctx.exception))
+            mock_record.assert_not_awaited()
+
 
 class LlmResponseGuardTests(unittest.IsolatedAsyncioTestCase):
     """call_llm must not crash when the LLM returns a malformed response."""

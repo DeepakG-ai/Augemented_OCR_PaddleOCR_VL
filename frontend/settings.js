@@ -8,6 +8,7 @@
 
 let _settingsSSE = null;        // current EventSource
 let _settingsAllConfigs = [];   // admin: list of all user configs
+let _clientOnline = false;      // desktop agent heartbeat status (REST only)
 
 // ── Scheduler state ───────────────────────────────────────────────────
 let _schedulerState  = { schedules: [], max_schedules: 3 };
@@ -70,7 +71,8 @@ function _renderAllConfigsTable(configs) {
                 <th style="text-align:left;padding:8px 12px;font-weight:500">UPLOAD MODE</th>
                 <th style="text-align:left;padding:8px 12px;font-weight:500">INPUT FOLDER</th>
                 <th style="text-align:left;padding:8px 12px;font-weight:500">OUTPUT FOLDER</th>
-                <th style="text-align:left;padding:8px 12px;font-weight:500">WATCHER</th>
+                <th style="text-align:left;padding:8px 12px;font-weight:500">DESKTOP AGENT</th>
+                <th style="text-align:left;padding:8px 12px;font-weight:500">SERVER WATCHER</th>
                 <th style="text-align:center;padding:8px 12px;font-weight:500">EDIT</th>
             </tr>
         </thead>
@@ -88,6 +90,9 @@ function _renderAllConfigsTable(configs) {
                 <td style="padding:8px 12px;color:var(--text-mid);font-family:var(--mono);font-size:10px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
                     title="${escapeHtml(u.config?.output_folder || '')}">
                     ${escapeHtml(u.config?.output_folder || '—')}
+                </td>
+                <td style="padding:8px 12px">
+                    ${_statusDot(u.client_online)}${u.client_online ? 'ACTIVE' : 'OFF'}
                 </td>
                 <td style="padding:8px 12px">
                     ${_statusDot(u.watcher_active)}${u.watcher_active ? 'ACTIVE' : 'OFF'}
@@ -230,10 +235,12 @@ function _renderActivityLog() {
 function _handleSSEEvent(ev) {
     switch (ev.type) {
         case 'connected':
+            if (ev.client_online !== undefined) _clientOnline = !!ev.client_online;
             _refreshOwnConfigDisplay(ev.config, ev.watcher_active);
             _appendActivity('Connected to config stream', 'var(--green)');
             break;
         case 'config_updated':
+            if (ev.client_online !== undefined) _clientOnline = !!ev.client_online;
             _refreshOwnConfigDisplay(ev.config, ev.watcher_active);
             _appendActivity('Config updated', 'var(--blue)');
             break;
@@ -259,8 +266,12 @@ function _refreshOwnConfigDisplay(config, watcherActive) {
     el.innerHTML = `
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px">
         <div style="background:var(--bg1);border:1px solid var(--border);border-radius:4px;padding:14px 16px">
+            <div style="font-size:9px;color:var(--text-dim);letter-spacing:0.12em;margin-bottom:6px">DESKTOP AGENT</div>
+            <div style="font-size:14px;font-weight:600">${_statusDot(_clientOnline)}${_clientOnline ? 'ACTIVE' : 'INACTIVE'}</div>
+        </div>
+        <div style="background:var(--bg1);border:1px solid var(--border);border-radius:4px;padding:14px 16px">
             <div style="font-size:9px;color:var(--text-dim);letter-spacing:0.12em;margin-bottom:6px">FOLDER WATCHER</div>
-            <div style="font-size:14px;font-weight:600">${_statusDot(watcherActive)}${watcherActive ? 'ACTIVE' : 'INACTIVE'}</div>
+            <div style="font-size:14px;font-weight:600">${_statusDot(watcherActive || _clientOnline)}${(watcherActive || _clientOnline) ? 'ACTIVE' : 'INACTIVE'}</div>
         </div>
         <div style="background:var(--bg1);border:1px solid var(--border);border-radius:4px;padding:14px 16px">
             <div style="font-size:9px;color:var(--text-dim);letter-spacing:0.12em;margin-bottom:6px">INPUT FOLDER</div>
@@ -676,6 +687,7 @@ async function renderSettingsPage(app) {
         const data = await apiJSON('/api/config');
         ownConfig = data.config || {};
         watcherActive = !!data.watcher_active;
+        _clientOnline = !!data.client_online;
     } catch (e) {
         console.warn('Settings load error:', e);
     }

@@ -336,7 +336,7 @@ class AuthHttpTests(unittest.TestCase):
 
     def test_client_a_can_read_their_own_extraction(self) -> None:
         ext = {
-            "id": 99, "document_id": 1, "vendor_id": "ACME", "vendor_name": "ACME",
+            "id": 99, "document_id": None, "vendor_id": "ACME", "vendor_name": "ACME",
             "template_id": None, "filename": "x.pdf", "total_pages": 1,
             "format_type": "single_po_multipage", "header_fields": [],
             "line_item_fields": [], "result": {}, "page_results": [],

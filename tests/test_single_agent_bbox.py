@@ -1,6 +1,6 @@
 """
-Tests for v5.2 single-agent extraction: page 1 returns {vendor_confirmed, fields, boxes},
-page 2+ returns {fields} only.
+Tests for v5.4 single-agent extraction: page 1 returns {fields, boxes},
+page 2+ returns {fields} only. vendor_confirmed removed — vendor_detector.py handles it.
 
 Covers:
   - System prompt dual mode (include_boxes=True vs False)
@@ -39,7 +39,7 @@ class SystemPromptDualModeTests(unittest.TestCase):
     """Verify build_system_prompt behaves differently for page 1 vs 2+."""
 
     def test_version_is_v5(self):
-        self.assertEqual(extractor.PROMPT_VERSION, "v5.2")
+        self.assertEqual(extractor.PROMPT_VERSION, "v5.4")
 
     def test_page1_prompt_contains_boxes_instruction(self):
         prompt = extractor.build_system_prompt(
@@ -48,8 +48,9 @@ class SystemPromptDualModeTests(unittest.TestCase):
         )
         self.assertIn("boxes", prompt.lower())
         self.assertIn("bbox_rules", prompt.lower())
-        self.assertIn("Return three top-level keys", prompt)
-        self.assertIn("vendor_confirmed", prompt)
+        self.assertIn("Return two top-level keys", prompt)
+        self.assertNotIn("vendor_confirmed", prompt)
+        self.assertNotIn("vendor_verification", prompt)
 
     def test_page2_prompt_no_boxes(self):
         prompt = extractor.build_system_prompt(
@@ -68,17 +69,16 @@ class SystemPromptDualModeTests(unittest.TestCase):
         self.assertNotIn("boxes", prompt.lower())
         self.assertIn("Return one top-level key", prompt)
 
-    def test_page1_prompt_contains_vendor_verification_when_vendor_name_given(self):
-        """Page 1 prompt verifies the detected vendor when a vendor name is available."""
+    def test_vendor_name_not_in_prompt(self):
+        """vendor_confirmed removed — vendor_detector.py owns detection, not the LLM."""
         prompt = extractor.build_system_prompt(
             HEADER, ITEMS, instructions=None, rules=[], format_type="single_po_multipage",
-            include_boxes=True, vendor_name="Robert Scott",
+            include_boxes=True,
         )
-        self.assertIn("vendor_verification", prompt)
-        self.assertIn("Robert Scott", prompt)
-        self.assertIn("vendor_confirmed", prompt)
+        self.assertNotIn("vendor_confirmed", prompt)
+        self.assertNotIn("vendor_verification", prompt)
 
-    def test_gold_correction_hints_appear_without_old_values(self):
+    def test_gold_correction_examples_include_original_and_corrected_values(self):
         gold = [{"correction_diff": {"supplier": {"original": "Wrong Co", "corrected": "ACME Corp"}}}]
         for include_boxes in (True, False):
             prompt = extractor.build_system_prompt(
@@ -86,9 +86,11 @@ class SystemPromptDualModeTests(unittest.TestCase):
                 gold_examples=gold, include_boxes=include_boxes,
             )
             self.assertIn("supplier", prompt)
-            self.assertIn("Values are intentionally redacted", prompt)
-            self.assertNotIn("ACME Corp", prompt)
-            self.assertNotIn("Wrong Co", prompt)
+            self.assertIn("correction_examples", prompt)
+            self.assertIn("original_value", prompt)
+            self.assertIn("correct_diff", prompt)
+            self.assertIn("Wrong Co", prompt)
+            self.assertIn("ACME Corp", prompt)
 
     def test_custom_instructions_appear_in_both_modes(self):
         for include_boxes in (True, False):
@@ -106,12 +108,9 @@ class UserMessageDualModeTests(unittest.TestCase):
     def test_page1_message_has_boxes_template(self):
         msg = extractor.build_user_message(HEADER, ITEMS, 1, 3, include_boxes=True)
         parsed_template = self._extract_json_template(msg)
-        self.assertIn("vendor_confirmed", parsed_template)
+        self.assertNotIn("vendor_confirmed", parsed_template)
         self.assertIn("fields", parsed_template)
         self.assertIn("boxes", parsed_template)
-        # vendor_confirmed is an unfilled slot the model populates — the
-        # template ships it as null, not a pre-set True.
-        self.assertIsNone(parsed_template["vendor_confirmed"])
 
     def test_page2_message_no_boxes(self):
         msg = extractor.build_user_message(HEADER, ITEMS, 2, 3, include_boxes=False)
@@ -128,7 +127,7 @@ class UserMessageDualModeTests(unittest.TestCase):
 
     def test_page1_message_uses_json_shape_for_boxes(self):
         msg = extractor.build_user_message(HEADER, ITEMS, 1, 3, include_boxes=True)
-        self.assertIn('"vendor_confirmed": null', msg)
+        self.assertNotIn('"vendor_confirmed"', msg)
         self.assertIn('"boxes"', msg)
 
     def test_page2_message_no_bbox_instructions(self):

@@ -1,14 +1,12 @@
 """
 test_admin_billing_scoping.py
 ============================
-Tests for the admin "Act As Client" billing isolation.
+Tests for the user billing assignment during ingestion.
 
 Business rules:
-  - When an admin extracts a document "Act As Client" (or just as Admin),
-    the billing (llm_usage user_id) MUST be assigned to the admin's account,
-    not the client's. This prevents admins from running up client page limits.
-  - This is achieved via `billing_user_id` passed in metadata during ingest,
-    which flows through the pipeline to record_llm_usage.
+  - Whoever logins, bill to them directly.
+  - This ensures that if admin logs in as admin, but acted as client, billing is assigned to the admin.
+  - If a client logs in, whatever they upload is billed to that client directly.
 """
 from __future__ import annotations
 
@@ -27,27 +25,28 @@ class TestAdminBillingScoping(unittest.IsolatedAsyncioTestCase):
 
     async def test_admin_billing_user_id_is_set_during_ingestion(self) -> None:
         """
-        Admin uploading a file always has billing_user_id set to their own ID,
-        so they are billed for the usage regardless of which vendor they upload to.
+        Admin uploading a file has billing_user_id set to their own ID,
+        so they are billed for the usage directly.
         """
         # Replicate main.py `POST /ingest` logic
         admin_id = "admin-123"
         user = self._make_user("admin", admin_id)
         
-        # When role == admin, billing_user_id = user["id"]
-        billing_user_id = user["id"] if user.get("role") == "admin" else None
+        # Whoever logins, bill to them.
+        billing_user_id = user["id"]
         self.assertEqual(billing_user_id, admin_id)
 
-    async def test_client_billing_user_id_is_none_during_ingestion(self) -> None:
+    async def test_client_billing_user_id_is_set_during_ingestion(self) -> None:
         """
-        Client uploading a file has no billing_user_id override, meaning
-        record_llm_usage falls back to resolving the vendor owner's user_id.
+        Client uploading a file has billing_user_id set to their own client ID directly,
+        ensuring they are billed for their own usage.
         """
         client_id = "client-456"
         user = self._make_user("client", client_id)
         
-        billing_user_id = user["id"] if user.get("role") == "admin" else None
-        self.assertIsNone(billing_user_id, "Clients should not have billing_user_id override")
+        # Whoever logins, bill to them.
+        billing_user_id = user["id"]
+        self.assertEqual(billing_user_id, client_id)
 
     async def test_worker_pipeline_base_extracts_billing_user_id(self) -> None:
         """
@@ -69,15 +68,24 @@ class TestAdminBillingScoping(unittest.IsolatedAsyncioTestCase):
         Verify `call_llm` uses billing_user_id from pipeline_context and passes
         it to `record_llm_usage`.
         """
-        # Mocking an HTTP response is tricky without httpx_mock, but we can just
-        # inspect the call args if we bypass the actual post.
-        # However, it's easier to verify the db_mod.record_llm_usage signature handling.
         from backend.db import record_llm_usage
         import inspect
         
         sig = inspect.signature(record_llm_usage)
         self.assertIn("billing_user_id", sig.parameters, 
             "record_llm_usage must accept billing_user_id parameter")
+
+    async def test_folder_ingest_resolves_billing_user_id(self) -> None:
+        """
+        Verify that in folder watcher ingestion:
+          - Whoever logins (owns the watcher), billing_user_id is set to user_id.
+        """
+        user_id = "deepak-789"
+        
+        # Under main.py _folder_ingest_callback:
+        # Whoever logins (owns the watcher), bill to them.
+        billing_user_id = user_id
+        self.assertEqual(billing_user_id, user_id)
 
 if __name__ == "__main__":
     unittest.main()

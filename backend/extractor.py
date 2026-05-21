@@ -22,6 +22,7 @@ import httpx
 from . import db as db_mod
 
 from .logging_config import get_logger
+from . import logging_config as plog
 from .config import (
     LLM_TEMPERATURE,
     LLM_TOP_P,
@@ -30,11 +31,10 @@ from .config import (
     LLM_TIMEOUT,
 )
 from .mlflow_tracing import (
-    trace_llm_call,
-    trace_page_extraction,
     trace_build_user_message,
     trace_merge_results,
 )
+from . import mlflow_tracing as mlf
 
 logger = get_logger(__name__)
 
@@ -50,57 +50,26 @@ def _strip_newlines(obj: Any) -> Any:
     return obj
 
 
-# v5.2 = vendor verification on page 1, value-redacted gold hints,
-# removed format descriptions / duplicate bbox / contradictory type rules.
-PROMPT_VERSION = "v5.2"
+# v5.4 = removed vendor_confirmed and restored verified gold correction diffs.
+PROMPT_VERSION = "v5.4"
 
 
-def _has_value(value: Any) -> bool:
-    """Return True when a correction side contains user-visible content."""
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return bool(value.strip())
-    if isinstance(value, (list, dict)):
-        return bool(value)
-    return True
-
-
-def _correction_hint(correction: Any) -> str:
-    """Summarize a correction without leaking the old or corrected value."""
-    if not isinstance(correction, dict):
-        return "reviewer changed this field"
-    original_has_value = _has_value(correction.get("original"))
-    corrected_has_value = _has_value(correction.get("corrected"))
-    if not original_has_value and corrected_has_value:
-        return "reviewer filled a missing value"
-    if original_has_value and not corrected_has_value:
-        return "reviewer cleared a value that was not visible"
-    return "reviewer replaced the extracted value"
-
-
-def _safe_gold_correction_hints(gold_examples: list[dict] | None) -> dict[str, dict[str, str]]:
-    """Return field-level correction hints with all document values redacted.
-
-    Gold examples are useful for identifying fields where the model commonly
-    makes mistakes, but passing prior corrected values into the prompt causes
-    value leakage on future documents. Keep only the field names and correction
-    categories.
-    """
-    hints: dict[str, dict[str, str]] = {}
+def _gold_correction_examples(gold_examples: list[dict] | None) -> dict[str, Any]:
+    """Return latest human correction diffs, remapped to prompt-facing key names."""
+    examples: dict[str, Any] = {}
     for ex in gold_examples or []:
         correction_diff = ex.get("correction_diff")
         if not isinstance(correction_diff, dict):
             continue
         for field_key, correction in correction_diff.items():
             key = str(field_key).strip()
-            if not key:
+            if not key or not isinstance(correction, dict):
                 continue
-            hints[key] = {
-                "history": _correction_hint(correction),
-                "instruction": "extract only the current visible document value; never reuse a prior correction",
+            examples[key] = {
+                "original_value": correction.get("original"),
+                "correct_diff": correction.get("corrected"),
             }
-    return hints
+    return examples
 
 # ── System Prompt (built once, stored in DB + Redis) ─────────────────
 
@@ -112,14 +81,12 @@ def build_system_prompt(
     format_type: str,
     gold_examples: list[dict] | None = None,
     include_boxes: bool = False,
-    vendor_name: str | None = None,
 ) -> str:
     """Build the reusable system prompt.
 
     Args:
-        gold_examples: Value-redacted correction hints from past human review.
+        gold_examples: Human-reviewed correction diffs from past extractions.
         include_boxes: If True (page 1), also request bounding boxes.
-        vendor_name: Detected vendor name for LLM-side verification (page 1).
     """
     context_section = ""
     if instructions and instructions.strip():
@@ -136,24 +103,22 @@ def build_system_prompt(
 {numbered}
 </extraction_rules>"""
 
-    # Value-safe correction hints — no old values leaked into prompt
+    # Verified gold examples from human corrections.
     gold_section = ""
-    correction_hints = _safe_gold_correction_hints(gold_examples)
-    if correction_hints:
-        hints_json = json.dumps(correction_hints, indent=2, ensure_ascii=False)
-        if hints_json.strip():
+    correction_examples = _gold_correction_examples(gold_examples)
+    if correction_examples:
+        examples_json = json.dumps(correction_examples, indent=2, ensure_ascii=False)
+        if examples_json.strip():
             gold_section = f"""
-<correction_hints>
-Human review has corrected these fields before. Values are intentionally redacted.
-Use this only as a warning that the field needs careful current-document reading:
+<correction_examples>
+Human review has corrected these field values. Do not copy either value. Instead look into the document and return the value which is exactly inside.
 
-{hints_json}
-</correction_hints>"""
+{examples_json}
+</correction_examples>"""
 
-    # ── Page 1: fields + boxes + vendor verification ──
+    # ── Page 1: fields + boxes; Page 2+: fields only ──
     if include_boxes:
-        return_keys = """Return three top-level keys:
-- `vendor_confirmed`: true if the document belongs to the detected vendor, false otherwise
+        return_keys = """Return two top-level keys:
 - `fields`: extracted values
 - `boxes`: bounding box of the LABEL text for each field"""
 
@@ -164,20 +129,10 @@ Use this only as a warning that the field needs careful current-document reading
 - Each box value MUST be a plain JSON array: [x1, y1, x2, y2] — four integers in a 0-1000 normalized grid relative to the full page image. Do NOT nest it in a dict or use any key like "bbox_2d".
 - If a label or column header is not visible on this page, set its box to null.
 </bbox_rules>"""
-
-        vendor_section = ""
-        if vendor_name:
-            vendor_section = f"""
-<vendor_verification>
-System detected this document belongs to: "{vendor_name}"
-Check the document header, letterhead, or company name in the image.
-Return vendor_confirmed: true if correct, false if the document belongs to a different company.
-</vendor_verification>"""
     else:
         return_keys = """Return one top-level key:
 - `fields`: extracted values"""
         bbox_rules = ""
-        vendor_section = ""
 
     return f"""You are a highly accurate document data extraction assistant.
 This request is processed one page at a time.
@@ -186,7 +141,6 @@ This request is processed one page at a time.
 {context_section}
 {rules_section}
 {gold_section}
-{vendor_section}
 {bbox_rules}
 <critical>
 Count the number of rows in the line items table FIRST, then extract that exact number of items.
@@ -229,12 +183,11 @@ def build_user_message(
         if line_item_fields:
             fields_template["line_items"] = [{col: None for col in line_item_fields}]
 
-        # ── Build JSON shape: page 1 includes vendor_confirmed + boxes ──
+        # ── Build JSON shape: page 1 includes boxes ──
         if include_boxes:
             all_keys = list(header_fields) + list(line_item_fields)
             boxes_template = {k: None for k in all_keys}
             full_template: dict[str, Any] = {
-                "vendor_confirmed": None,
                 "fields": fields_template,
                 "boxes": boxes_template,
             }
@@ -312,7 +265,7 @@ def compute_prompt_hash(
         "rules": sorted(rules),
         "format_type": format_type,
         "prompt_version": PROMPT_VERSION,
-        "gold_examples": _safe_gold_correction_hints(gold_examples),
+        "gold_examples": _gold_correction_examples(gold_examples),
     }, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()
 
@@ -324,7 +277,7 @@ async def get_or_build_system_prompt(
 ) -> tuple[str, str]:
     """Returns (system_prompt, prompt_hash). Cache: DB → build.
 
-    Includes value-redacted correction hints from past human review.
+    Includes verified correction diffs from past human review.
     """
 
     # Fetch one consolidated latest correction per field for this vendor.
@@ -341,7 +294,7 @@ async def get_or_build_system_prompt(
         logger.info("Prompt cache HIT (DB) vendor=%s hash=%s gold=%d", vendor_id, prompt_hash[:12], len(gold_examples))
         return tmpl["system_prompt"], prompt_hash
 
-    # 2. Build fresh (includes value-redacted correction hints)
+    # 2. Build fresh (includes verified correction diffs)
     logger.info("Prompt cache MISS — building vendor=%s hash=%s gold=%d", vendor_id, prompt_hash[:12], len(gold_examples))
     system_prompt = build_system_prompt(
         header_fields, line_item_fields, instructions, rules, format_type,
@@ -409,7 +362,17 @@ async def call_llm(
     }
 
     start = time.perf_counter()
-    with trace_llm_call(model, messages, temperature=LLM_TEMPERATURE, page_num=page_num, total_pages=total_pages) as trace_ctx:
+    with mlf.span(
+        "llm.chat",
+        mlf.LLM,
+        inputs={
+            "model": model,
+            "temperature": LLM_TEMPERATURE,
+            "page": page_num,
+            "total_pages": total_pages,
+            "messages": mlf.clean_chat_messages(messages),
+        },
+    ) as trace_ctx:
         async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
             # If a cancel_event is provided, race the HTTP request against it
             if cancel_event:
@@ -431,53 +394,65 @@ async def call_llm(
                 resp = await client.post(llm_url, json=payload)
 
             if resp.status_code != 200:
-                body = resp.text[:1000]
-                logger.error("LLM HTTP %d from %s — body: %s", resp.status_code, llm_url, body)
+                plog.error(
+                    f"page {page_num}/{total_pages} call failed",
+                    logger=__name__,
+                    post=llm_url, status=resp.status_code,
+                    body=resp.text[:200],
+                )
             resp.raise_for_status()
 
         resp_json = resp.json()
         _c0 = (resp_json.get("choices") or [{}])[0]
         _content = (_c0.get("message", {}).get("content", "") if isinstance(_c0, dict) else "")
-        trace_ctx["response"] = _content
         usage = resp_json.get("usage") or {}
         prompt_tokens = _usage_int(usage.get("prompt_tokens"))
         completion_tokens = _usage_int(usage.get("completion_tokens"))
         total_tokens = _usage_int(usage.get("total_tokens")) or (prompt_tokens + completion_tokens)
         duration_ms = (time.perf_counter() - start) * 1000
-        trace_ctx["usage"] = usage
-        logger.info(
-            "LLM tokens page=%d/%d prompt=%d completion=%d total=%d elapsed=%.0fms",
-            page_num, total_pages, prompt_tokens, completion_tokens, total_tokens, duration_ms,
+        trace_ctx["outputs"] = _content
+        trace_ctx["token_usage"] = {
+            "input_tokens": prompt_tokens,
+            "output_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
+        plog.info(
+            f"page {page_num}/{total_pages} ok",
+            logger=__name__,
+            post=llm_url, tok_in=prompt_tokens, tok_out=completion_tokens,
+            ms=duration_ms,
         )
-        if pool is not None:
-            context = pipeline_context or {}
-            try:
-                await db_mod.record_llm_usage(
-                    pool,
-                    doc_id=context.get("doc_id") or context.get("document_id"),
-                    extraction_id=context.get("extraction_id"),
-                    vendor_id=context.get("vendor_id"),
-                    page_num=page_num,
-                    total_pages=total_pages,
-                    call_type="extraction",
-                    model=model,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=total_tokens,
-                    duration_ms=duration_ms,
-                    llm_url=llm_url,
-                    request_id=context.get("request_id") or context.get("job_id"),
-                    # Override billing to admin when admin is the uploader
-                    billing_user_id=billing_user_id or context.get("billing_user_id"),
-                )
-            except Exception as exc:
-                logger.warning("Failed to record LLM usage for extraction page %s: %s", page_num, exc)
+        async def _record_usage_if_needed():
+            if pool is not None:
+                context = pipeline_context or {}
+                try:
+                    await db_mod.record_llm_usage(
+                        pool,
+                        doc_id=context.get("doc_id") or context.get("document_id"),
+                        extraction_id=context.get("extraction_id"),
+                        vendor_id=context.get("vendor_id"),
+                        page_num=page_num,
+                        total_pages=total_pages,
+                        call_type="extraction",
+                        model=model,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=total_tokens,
+                        duration_ms=duration_ms,
+                        llm_url=llm_url,
+                        request_id=context.get("request_id") or context.get("job_id"),
+                        # Override billing to admin when admin is the uploader
+                        billing_user_id=billing_user_id or context.get("billing_user_id"),
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to record LLM usage for extraction page %s: %s", page_num, exc)
 
     _choices = resp_json.get("choices") or []
     if not _choices or not isinstance(_choices[0], dict) or "message" not in _choices[0]:
-        logger.error(
-            "LLM response missing choices[0].message — raw: %s",
-            str(resp_json)[:500],
+        plog.error(
+            f"page {page_num}/{total_pages} malformed response (no choices[0].message)",
+            logger=__name__,
+            raw=str(resp_json)[:200],
         )
         return {}
     raw: str = (_choices[0].get("message") or {}).get("content", "").strip()
@@ -493,6 +468,7 @@ async def call_llm(
             fc = len([k for k in fields.keys() if k != "line_items"]) if isinstance(fields, dict) else 0
             li = len(fields.get("line_items") or []) if isinstance(fields, dict) else 0
             logger.info("Parsed page %d/%d: %d fields, %d line items", page_num, total_pages, fc, li)
+        await _record_usage_if_needed()
         return _strip_newlines(parsed)
     except json.JSONDecodeError:
         # Fallback 1: fix leading-zero numbers (e.g. 0070 -> "0070")
@@ -500,6 +476,7 @@ async def call_llm(
         try:
             parsed = json.loads(raw_fixed)
             logger.warning("LLM JSON recovered via leading-zero fix (page %d)", page_num)
+            await _record_usage_if_needed()
             return _strip_newlines(parsed)
         except json.JSONDecodeError:
             pass
@@ -510,6 +487,7 @@ async def call_llm(
             repaired = repair_json(raw, return_objects=True)
             if isinstance(repaired, dict):
                 logger.warning("LLM JSON recovered via json_repair (page %d)", page_num)
+                await _record_usage_if_needed()
                 return _strip_newlines(repaired)
         except ImportError:
             pass
@@ -517,9 +495,11 @@ async def call_llm(
             pass
 
         # All recovery attempts failed
-        logger.error("LLM JSON parse failed after all fallbacks. Raw response:\n%s", raw[:500])
-        if pipeline_context is not None:
-            logger.error("LLM JSON parse failed on page %d — raw: %s", page_num, raw[:200])
+        plog.error(
+            f"page {page_num}/{total_pages} JSON parse failed (all fallbacks exhausted)",
+            logger=__name__,
+            raw=raw[:200],
+        )
         raise ValueError(f"LLM returned invalid JSON: {raw[:200]}")
 
 
@@ -588,7 +568,11 @@ async def extract_document(
         is_page1 = page_num == 1
         effective_prompt = system_prompt_page1 if (is_page1 and system_prompt_page1) else system_prompt
 
-        with trace_page_extraction(page_num, total) as page_ctx:
+        with mlf.span(
+            f"page {page_num}",
+            mlf.CHAIN,
+            inputs={"page": page_num, "total_pages": total, "is_page1": is_page1},
+        ) as page_ctx:
             # Build user message with tracing
             with trace_build_user_message(page_num, total) as msg_ctx:
                 user_msg = build_user_message(
@@ -619,20 +603,28 @@ async def extract_document(
                 if pipeline_context is not None:
                     _header_out = {
                         k: v for k, v in _fields.items()
-                        if k not in ("line_items", "boxes", "vendor_confirmed")
+                        if k not in ("line_items", "boxes")
                         and not k.startswith("_")
                     } if isinstance(_fields, dict) else {}
                     logger.info("Page %d/%d extracted: %d line items | %s",
                                 page_num, total, _li_count,
                                 ", ".join(f"{k}={v}" for k, v in _header_out.items()) if _header_out else "(no fields)")
-                page_ctx["result"] = result
+                page_ctx["outputs"] = {
+                    "line_items": _li_count,
+                    "fields": [k for k in (_fields or {}).keys()
+                               if not str(k).startswith("_") and k != "line_items"]
+                    if isinstance(_fields, dict) else [],
+                }
                 return result
             except asyncio.CancelledError:
                 logger.info("Page %d LLM call cancelled by user", page_num)
                 page_ctx["error"] = "cancelled"
                 return {"_page": page_num, "_total_pages": total, "_error": "cancelled"}
             except (ValueError, httpx.HTTPError) as exc:
-                logger.error("Page %d extraction failed: %s", page_num, exc)
+                plog.error(
+                    f"page {page_num}/{total} extraction failed",
+                    logger=__name__, exc=exc,
+                )
                 page_ctx["error"] = str(exc)
                 return {"_page": page_num, "_total_pages": total, "_error": str(exc)}
 

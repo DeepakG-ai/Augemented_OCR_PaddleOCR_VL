@@ -223,6 +223,7 @@ class WorkerFlowIntegrationTests(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(patch.object(worker.db_mod, "update_extraction_progress", new=AsyncMock(side_effect=fake_update_extraction_progress)))
             stack.enter_context(patch.object(worker.db_mod, "ensure_job", new=AsyncMock(side_effect=fake_ensure_job)))
             stack.enter_context(patch.object(worker.db_mod, "get_extraction", new=AsyncMock(side_effect=fake_get_extraction)))
+            stack.enter_context(patch.object(worker.db_mod, "get_vendor", new=AsyncMock(return_value={"id": "V1", "name": "Vendor 1", "user_id": "U1"})))
             stack.enter_context(patch.object(worker.db_mod, "get_template", new=AsyncMock(return_value=None)))
             stack.enter_context(patch.object(worker.db_mod, "get_gold_examples", new=AsyncMock(return_value=[])))
             stack.enter_context(patch.object(worker.db_mod, "get_qwen_layout_boxes", new=AsyncMock(return_value={"vendor_name": {"normalized_box": [0.0, 0.0, 0.1, 0.05], "field_type": "header", "page_number": 1}})))

@@ -252,7 +252,7 @@ async function renderTemplatePage(app, vendorId) {
         if (!el) return;
         const prompts = window.tplPrompts || {};
         const promptMeta = {
-            page1System: ['btnPage1SystemPrompt', 'Page 1 system prompt: fields, vendor confirmation, and label/header boxes.'],
+            page1System: ['btnPage1SystemPrompt', 'Page 1 system prompt: fields and label/header boxes.'],
             page1User: ['btnPage1UserPrompt', 'Page 1 user message: fields plus the boxes response shape.'],
             page2System: ['btnPage2SystemPrompt', 'Page 2+ system prompt: fields only, using the same saved template instructions and rules.'],
             page2User: ['btnPage2UserPrompt', 'Page 2+ user message: fields-only response shape.'],
@@ -418,6 +418,7 @@ async function tplDeleteAlias(aliasId) {
 }
 
 async function saveTplConfig() {
+    tplAddRule();
     const payload = {
         format_type: document.getElementById('tplFormat').value,
         vendor_name: tplVendorName,

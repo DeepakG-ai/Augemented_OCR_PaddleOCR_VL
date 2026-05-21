@@ -167,7 +167,19 @@ async def assert_extraction_access(pool, extraction_id: int, user: dict) -> None
     ext = await db_mod.get_extraction(pool, int(extraction_id))
     if not ext:
         raise HTTPException(status_code=404, detail="Extraction not found")
-    await assert_vendor_access(pool, ext["vendor_id"], user)
+
+    # Verify the billing_user_id if present in document metadata
+    billing_user_id = None
+    if ext.get("document_id"):
+        doc = await db_mod.get_document(pool, ext["document_id"])
+        if doc and doc.get("metadata"):
+            billing_user_id = doc["metadata"].get("billing_user_id")
+
+    if billing_user_id:
+        if billing_user_id != user["id"]:
+            raise HTTPException(status_code=403, detail="Access denied")
+    else:
+        await assert_vendor_access(pool, ext["vendor_id"], user)
 
 
 async def assert_job_access(pool, job_id: int, user: dict) -> None:

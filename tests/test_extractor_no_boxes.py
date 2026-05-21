@@ -58,9 +58,9 @@ class ExtractorNoBboxTests(unittest.TestCase):
             self.assertIn(field, self.user_message)
 
     def test_system_prompt_version_v5(self):
-        self.assertEqual(extractor.PROMPT_VERSION, "v5.2")
+        self.assertEqual(extractor.PROMPT_VERSION, "v5.4")
 
-    def test_prompt_with_gold_examples_no_boxes_or_value_leak(self):
+    def test_prompt_with_gold_examples_no_boxes_and_includes_correction_diff(self):
         gold = [{"correction_diff": {"supplier": {"original": "Wrong Co", "corrected": "ACME Corp"}}}]
         prompt = extractor.build_system_prompt(
             HEADER_FIELDS, LINE_ITEM_FIELDS,
@@ -69,9 +69,11 @@ class ExtractorNoBboxTests(unittest.TestCase):
         )
         self.assertNotIn("boxes", prompt.lower())
         self.assertIn("supplier", prompt)
-        self.assertIn("Values are intentionally redacted", prompt)
-        self.assertNotIn("ACME Corp", prompt)
-        self.assertNotIn("Wrong Co", prompt)
+        self.assertIn("correction_examples", prompt)
+        self.assertIn("original_value", prompt)
+        self.assertIn("correct_diff", prompt)
+        self.assertIn("Wrong Co", prompt)
+        self.assertIn("ACME Corp", prompt)
 
     def test_auto_extract_mode_no_bbox(self):
         msg = extractor.build_user_message([], [], page_num=1, total_pages=1)

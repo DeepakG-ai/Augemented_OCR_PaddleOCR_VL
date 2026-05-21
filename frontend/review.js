@@ -141,6 +141,9 @@ let _rvDirty = false;          // true if user has made any corrections
 let _rvOriginalResult = {};    // immutable original Qwen3-VL result (for reset/undo)
 let _rvUndoStack = [];         // stack of {fieldKey, oldValue, oldFieldLoc} for Ctrl+Z
 let _rvPendingSelection = null; // {fieldKey, combinedText, box, matchedWords, avgScore} awaiting accept/reject
+let _rvCorrectionReasons = {};  // keyed by fieldKey → {reason_code, note}
+let _rvSelectedReasonCode = null;
+let _rvReasonModalCallback = null;
 
 async function renderReviewPage(app, extractionId) {
     _rvExtractionId = extractionId;
@@ -224,6 +227,9 @@ async function renderReviewPage(app, extractionId) {
     }
     _rvUndoStack = [];
     _rvPendingSelection = null;
+    _rvCorrectionReasons = {};
+    _rvSelectedReasonCode = null;
+    _rvReasonModalCallback = null;
     _rvExistingCorrectionFields = {};
     _rvExistingSpatialFields = {};
 
@@ -930,6 +936,7 @@ function rvApplySelection(displayLeft, displayTop, displayWidth, displayHeight) 
         combinedText,
         box: drawnBox,
         avgScore,
+        matchedWords,
     };
 
     // Show the accept/reject preview bar
@@ -1001,6 +1008,15 @@ function rvAcceptSelection() {
         if (!ok) return;
     }
 
+    // Show reason modal before applying
+    _rvShowReasonModal(sel, (reasonCode, note) => {
+        _rvApplyAcceptedSelection(sel, reasonCode, note);
+    });
+}
+
+function _rvApplyAcceptedSelection(sel, reasonCode, note) {
+    const fieldKey = sel.fieldKey;
+
     // Push undo entry BEFORE applying
     const oldValue = fieldKey.startsWith('line_item_')
         ? (() => { const p = fieldKey.replace('line_item_', '').split('_'); const r = parseInt(p[0], 10); const c = p.slice(1).join('_'); return _rvResult.line_items?.[r]?.[c]; })()
@@ -1030,6 +1046,11 @@ function rvAcceptSelection() {
         confidence: 'high',
     };
 
+    // Store reason for this field
+    if (reasonCode) {
+        _rvCorrectionReasons[fieldKey] = { reason_code: reasonCode, note: note || '' };
+    }
+
     _rvDirty = true;
     _rvPendingSelection = null;
 
@@ -1045,6 +1066,91 @@ function rvAcceptSelection() {
     rvUpdateJSON();
 
     showToast(`✓ Accepted: ${fieldKey.replace(/_/g, ' ')}`);
+}
+
+// ── Correction Reason Modal ───────────────────────────────────────────
+
+const _rvReasonOptions = [
+    { code: 'ocr_error',        label: 'OCR misread the text' },
+    { code: 'wrong_extraction', label: 'Qwen extracted wrong value' },
+    { code: 'wrong_location',   label: 'Field location was off' },
+    { code: 'missing_value',    label: 'Value was missing' },
+    { code: 'format_change',    label: 'New document format' },
+    { code: 'other',            label: 'Other (describe below)' },
+];
+
+function _rvShowReasonModal(sel, callback) {
+    _rvReasonModalCallback = callback;
+    _rvSelectedReasonCode = null;
+
+    const fieldLabel = sel.fieldKey.replace(/_/g, ' ').toUpperCase();
+    const displayText = sel.combinedText.length > 80
+        ? sel.combinedText.substring(0, 80) + '...'
+        : sel.combinedText;
+
+    const optionsHtml = _rvReasonOptions.map(opt => `
+        <button class="rv-reason-option" data-code="${escapeHtml(opt.code)}"
+                onclick="_rvSelectReason('${escapeInlineJsString(opt.code)}')">
+            <span class="rv-reason-option-dot"></span>
+            ${escapeHtml(opt.label)}
+        </button>`).join('');
+
+    const backdrop = document.createElement('div');
+    backdrop.className = 'rv-reason-backdrop';
+    backdrop.id = 'rvReasonBackdrop';
+    backdrop.innerHTML = `
+        <div class="rv-reason-modal" onclick="event.stopPropagation()">
+            <div class="rv-reason-title">Confirm Correction</div>
+            <div class="rv-reason-field-name">${fieldLabel}</div>
+            <div class="rv-reason-detected-label">Detected text</div>
+            <div class="rv-reason-detected-text">${escapeHtml(displayText)}</div>
+            <div class="rv-reason-ask">Why are you correcting this field?</div>
+            <div class="rv-reason-options" id="rvReasonOptions">${optionsHtml}</div>
+            <textarea class="rv-reason-other-input" id="rvReasonOtherInput"
+                      rows="2" placeholder="Describe the reason..."></textarea>
+            <div class="rv-reason-actions">
+                <button class="rv-reason-cancel-btn" onclick="_rvCancelReasonModal()">Cancel</button>
+                <button class="rv-reason-apply-btn" id="rvReasonApplyBtn"
+                        onclick="_rvConfirmReason()" disabled>Apply Correction</button>
+            </div>
+        </div>`;
+    backdrop.addEventListener('click', _rvCancelReasonModal);
+    document.body.appendChild(backdrop);
+}
+
+function _rvSelectReason(code) {
+    _rvSelectedReasonCode = code;
+    document.querySelectorAll('.rv-reason-option').forEach(el => {
+        el.classList.toggle('selected', el.dataset.code === code);
+    });
+    const otherInput = document.getElementById('rvReasonOtherInput');
+    if (otherInput) otherInput.style.display = code === 'other' ? 'block' : 'none';
+    const applyBtn = document.getElementById('rvReasonApplyBtn');
+    if (applyBtn) applyBtn.disabled = false;
+}
+
+function _rvConfirmReason() {
+    if (!_rvSelectedReasonCode) return;
+    let note = '';
+    if (_rvSelectedReasonCode === 'other') {
+        const input = document.getElementById('rvReasonOtherInput');
+        note = input ? input.value.trim() : '';
+    }
+    const cb = _rvReasonModalCallback;
+    _rvCloseReasonModal();
+    if (cb) cb(_rvSelectedReasonCode, note);
+}
+
+function _rvCancelReasonModal() {
+    _rvCloseReasonModal();
+    // Leave pending selection + preview bar in place so user can try again
+}
+
+function _rvCloseReasonModal() {
+    const backdrop = document.getElementById('rvReasonBackdrop');
+    if (backdrop) backdrop.remove();
+    _rvReasonModalCallback = null;
+    _rvSelectedReasonCode = null;
 }
 
 function rvRejectSelection() {
@@ -1271,12 +1377,26 @@ async function rvConfirm() {
             if (!_rvConfirmTypedOnlyChanges(typedOnlyFields)) {
                 return;
             }
+
+            // Build a combined note from all per-field reasons collected during this session
+            let combinedNote = null;
+            const reasonEntries = Object.entries(_rvCorrectionReasons);
+            if (reasonEntries.length) {
+                combinedNote = reasonEntries.map(([field, r]) => {
+                    const label = field.replace(/_/g, ' ');
+                    const text = r.note ? `${r.reason_code}: ${r.note}` : r.reason_code;
+                    return `${label} → ${text}`;
+                }).join('; ');
+            }
+
             await apiJSON(`/extractions/${_rvExtractionId}/corrections`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     corrected_result: payload,
                     field_locations: finalFieldLocs,
+                    reason_code: 'manual_review',
+                    note: combinedNote,
                 }),
             });
             // Update in-memory snapshots so reopening review shows saved state
