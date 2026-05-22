@@ -140,7 +140,7 @@ class AdminCreateUserTests(unittest.TestCase):
                 "role": "client",
             })
         self.assertEqual(r.status_code, 409)
-        self.assertIn("already registered", r.json()["detail"].lower())
+        self.assertIn("already registered", r.json()["error"]["message"].lower())
 
     def test_password_shorter_than_8_chars_returns_422(self) -> None:
         r = self.client.post("/admin/users", json={
@@ -196,7 +196,7 @@ class AdminDeactivateUserTests(unittest.TestCase):
         admin_id = "00000000-0000-0000-0000-000000000000"
         r = self.client.delete(f"/admin/users/{admin_id}")
         self.assertEqual(r.status_code, 400)
-        self.assertIn("yourself", r.json()["detail"].lower())
+        self.assertIn("yourself", r.json()["error"]["message"].lower())
 
     def test_nonexistent_user_returns_404(self) -> None:
         with patch.object(main.db_mod, "deactivate_user",

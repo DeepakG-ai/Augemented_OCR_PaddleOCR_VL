@@ -385,7 +385,7 @@ class AuthHttpTests(unittest.TestCase):
         with patch.object(main.db_mod, "get_vendor", new=AsyncMock(return_value=None)):
             r = self.client.post("/vendors", json={"id": "NEWCO", "name": "Newco Ltd"})
         self.assertEqual(r.status_code, 400)
-        self.assertIn("user_id", r.json()["detail"].lower())
+        self.assertIn("user_id", r.json()["error"]["message"].lower())
 
     def test_admin_post_vendor_with_user_id_succeeds(self) -> None:
         row = {"id": "NEWCO", "name": "Newco Ltd", "status": "idle",

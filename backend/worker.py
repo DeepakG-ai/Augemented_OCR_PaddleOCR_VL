@@ -58,6 +58,7 @@ def _pipeline_base(
         "vendor_name": extraction.get("vendor_name"),
         "filename": document.get("filename") or extraction.get("filename"),
         "billing_user_id": (document.get("metadata") or {}).get("billing_user_id"),
+        "api_key_id": (document.get("metadata") or {}).get("api_key_id"),
     }
 
 
@@ -898,6 +899,23 @@ async def _process_postprocess(pool, job: dict) -> None:
             "field_location_count": _field_location_count(field_locations),
             "status": "done",
         }
+    # ── Apply ERP field mapping (if configured for this vendor) ──
+    # Renames merged extraction fields to the program's canonical fields.
+    # Raw `result` is left untouched; the mapped copy is what API clients get.
+    try:
+        from . import field_mapper as _fm
+
+        mapping = await db_mod.get_field_mapping(pool, vendor_id) if vendor_id else None
+        if mapping and (mapping.get("header_map") or mapping.get("line_map")):
+            mapped = _fm.apply_mapping(result, mapping)
+            await db_mod.update_extraction_mapped_result(pool, extraction_id, mapped)
+            logger.info("ERP field mapping applied: ext=%s", extraction_id)
+        else:
+            # No mapping configured — clear any stale mapped_result.
+            await db_mod.update_extraction_mapped_result(pool, extraction_id, None)
+    except Exception as exc:
+        logger.warning("ERP field mapping failed ext=%s: %s", extraction_id, exc)
+
     if await _stop_if_cancelled(pool, extraction_id, "postprocess", "Cancelled before completion"):
         return
     await db_mod.set_extraction_status(

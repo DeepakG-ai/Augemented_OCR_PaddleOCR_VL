@@ -1,0 +1,98 @@
+{
+  "status": "done",
+  "file": "RJ SCHINNER 563773.pdf",
+  "timestamp": "2026-05-18T13:35:48.457728+00:00",
+  "extraction": {
+    "bill_to": "RJ SCHINNER CO., INC 1899 WILSTON PARK DRIVE MEADOWBROOK FALLS WI 53051",
+    "ship_to": "RJ SCHINNER - GRAND PRAIRIE TX 3001 ALOUETTE DRIVE SUITE 300 GRAND PRAIRIE TX 75052 469-348-0042 Fax 469-277-8804",
+    "po_number": "P1416144",
+    "line_items": [
+      {
+        "item": "3PB-F-20-BX",
+        "pack": "12/bx",
+        "_page": 1,
+        "order_qty": 24,
+        "unit_price": 6.22
+      },
+      {
+        "item": "105G-F-02",
+        "pack": "4/cs",
+        "_page": 1,
+        "order_qty": 15,
+        "unit_price": 41.89
+      },
+      {
+        "item": "3WDS-F-06-BX",
+        "pack": "10/bx",
+        "_page": 1,
+        "order_qty": 24,
+        "unit_price": 15.69
+      },
+      {
+        "item": "EBC-F-04-BX",
+        "pack": "12/bx",
+        "_page": 1,
+        "order_qty": 6,
+        "unit_price": 17.15
+      },
+      {
+        "item": "4PB-F-20-BX",
+        "pack": "12/bx",
+        "_page": 1,
+        "order_qty": 60,
+        "unit_price": 7.34
+      },
+      {
+        "item": "CITP-F-66",
+        "pack": "1/pl",
+        "_page": 1,
+        "order_qty": 3,
+        "unit_price": 33.61
+      },
+      {
+        "item": "OFB-F-01-BX",
+        "pack": "8/bx",
+        "_page": 1,
+        "order_qty": 12,
+        "unit_price": 27.66
+      },
+      {
+        "item": "OFB-F-06-BX",
+        "pack": "8/bx",
+        "_page": 1,
+        "order_qty": 18,
+        "unit_price": 27.66
+      },
+      {
+        "item": "OFB-F-54-BX",
+        "pack": "8/bx",
+        "_page": 1,
+        "order_qty": 6,
+        "unit_price": 27.66
+      },
+      {
+        "item": "OFB-F-72-BX",
+        "pack": "8/bx",
+        "_page": 2,
+        "order_qty": 18,
+        "unit_price": 27.66
+      },
+      {
+        "item": "OFCAB-F-000I01",
+        "pack": "12/cs",
+        "_page": 2,
+        "order_qty": 2,
+        "unit_price": 144.76
+      },
+      {
+        "item": null,
+        "pack": null,
+        "_page": 3,
+        "order_qty": null,
+        "unit_price": null
+      }
+    ],
+    "order_date": "11/14/25",
+    "required_date": "11/28/25"
+  }
+}

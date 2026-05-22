@@ -1,0 +1,157 @@
+{
+  "fields": {
+    "supplier": "Fresh Products LLC\n30600 Oregon Road\nPerrysburgh, OH 43551\nUSA",
+    "deliver_to": "Crown Warehouse\nBen Pollard\nUnit 7 Crown Business Park\nCowm Top Lane\nRochdale, OL11 2PU\nEngland",
+    "document_date": "10. April 2025",
+    "purchase_order_no": "PO31160",
+    "line_items": [
+      {
+        "no": "105321",
+        "variant": "MANGO",
+        "qty": "45.00",
+        "uom": "BOX 6X10",
+        "unit_cost": "75.22"
+      },
+      {
+        "no": "105321",
+        "variant": "OCEAN",
+        "qty": "25.00",
+        "uom": "BOX 6X10",
+        "unit_cost": "75.22"
+      },
+      {
+        "no": "105233",
+        "variant": null,
+        "qty": "9.00",
+        "uom": "BOX 30",
+        "unit_cost": "0.00"
+      },
+      {
+        "no": "105379",
+        "variant": "CITRUS",
+        "qty": "24.00",
+        "uom": "BOX 6X10",
+        "unit_cost": "79.36"
+      },
+      {
+        "no": "105379",
+        "variant": "MANGO",
+        "qty": "12.00",
+        "uom": "BOX 6X10",
+        "unit_cost": "79.36"
+      },
+      {
+        "no": "105379",
+        "variant": "FABULOUS",
+        "qty": "12.00",
+        "uom": "BOX 6X10",
+        "unit_cost": "79.36"
+      },
+      {
+        "no": "105378",
+        "variant": "MANGO",
+        "qty": "20.00",
+        "uom": "BOX 6X12",
+        "unit_cost": "116.01"
+      },
+      {
+        "no": "105378",
+        "variant": "HONEYSUC KL",
+        "qty": "20.00",
+        "uom": "BOX 6X12",
+        "unit_cost": "116.01"
+      },
+      {
+        "no": "105378",
+        "variant": "SPICEDAPP",
+        "qty": "6.00",
+        "uom": "BOX 6X12",
+        "unit_cost": "116.01"
+      },
+      {
+        "no": "105380",
+        "variant": "COTTON",
+        "qty": "8.00",
+        "uom": "BOX 6X12",
+        "unit_cost": "63.38"
+      },
+      {
+        "no": "105380",
+        "variant": "MANGO",
+        "qty": "8.00",
+        "uom": "BOX 6X12",
+        "unit_cost": "63.38"
+      },
+      {
+        "no": "105316",
+        "variant": "MANGO",
+        "qty": "25.00",
+        "uom": "BOX 6X10",
+        "unit_cost": "75.76"
+      },
+      {
+        "no": "105316",
+        "variant": "OCEAN",
+        "qty": "20.00",
+        "uom": "BOX 6X10",
+        "unit_cost": "75.76"
+      }
+    ]
+  },
+  "boxes": {
+    "supplier": [
+      151,
+      79,
+      211,
+      89
+    ],
+    "deliver_to": [
+      366,
+      151,
+      430,
+      161
+    ],
+    "document_date": [
+      103,
+      312,
+      202,
+      322
+    ],
+    "purchase_order_no": [
+      254,
+      312,
+      379,
+      322
+    ],
+    "no": [
+      71,
+      391,
+      91,
+      401
+    ],
+    "variant": [
+      198,
+      391,
+      243,
+      401
+    ],
+    "qty": [
+      643,
+      391,
+      669,
+      401
+    ],
+    "uom": [
+      686,
+      391,
+      718,
+      401
+    ],
+    "unit_cost": [
+      828,
+      391,
+      886,
+      401
+    ]
+  }
+}

@@ -26,6 +26,11 @@ async def fake_acquire(conn):
     yield conn
 
 
+@asynccontextmanager
+async def fake_transaction():
+    yield
+
+
 class DBVendorFilteringTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_list_vendors_client_scoped_to_own_vendors(self) -> None:
@@ -125,6 +130,23 @@ class DBVendorFilteringTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(row)
         pool.acquire.assert_not_called()
+
+    async def test_delete_vendor_removes_gold_examples_before_vendor_row(self) -> None:
+        pool = MagicMock()
+        conn = MagicMock()
+        conn.execute = AsyncMock(return_value="DELETE 1")
+        conn.transaction.return_value = fake_transaction()
+        pool.acquire.return_value = fake_acquire(conn)
+
+        deleted = await db_mod.delete_vendor(pool, "17")
+
+        self.assertTrue(deleted)
+        queries = [call.args[0] for call in conn.execute.call_args_list]
+        self.assertIn("DELETE FROM gold_examples WHERE vendor_id = $1", queries)
+        self.assertLess(
+            queries.index("DELETE FROM gold_examples WHERE vendor_id = $1"),
+            queries.index("DELETE FROM vendors WHERE id = $1"),
+        )
 
 
 if __name__ == "__main__":

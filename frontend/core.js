@@ -215,6 +215,9 @@ async function router() {
     } else if (route === '/extract') {
         app.className = 'app extract-layout';
         await renderExtractPage(app);
+    } else if (route === '/mapper') {
+        app.className = 'app';
+        await renderMapperPage(app);
     } else if (route === '/history') {
         app.className = 'app';
         await renderHistoryPage(app);
@@ -240,6 +243,9 @@ async function router() {
     } else if (route === '/admin/users') {
         app.className = 'app';
         await renderAdminUsersPage(app);
+    } else if (route === '/admin/api-keys') {
+        app.className = 'app';
+        await renderApiKeysPage(app);
     } else if (route === '/review') {
         // Bare /review (no ID) — redirect to last extraction's review
         if (reviewExtractionId) {
@@ -295,11 +301,13 @@ function headerHTML() {
             <a class="nav-tab" data-route="/vendors" href="#/vendors">Vendors</a>
             <a class="nav-tab" data-route="/saved-templates" href="#/saved-templates">Templates</a>
             <a class="nav-tab" data-route="/extract" href="#/extract">Extraction</a>
+            <a class="nav-tab" data-route="/mapper" href="#/mapper">Mapper</a>
             <a class="nav-tab" data-route="/history" href="#/history">History</a>
             <a class="nav-tab" data-route="/review" href="#/review">Review</a>
             <a class="nav-tab" data-route="/dashboard" href="#/dashboard">Dashboard</a>
             <a class="nav-tab" data-route="/settings" href="#/settings">Settings</a>
-            ${isAdmin ? `<a class="nav-tab" data-route="/admin/users" href="#/admin/users" style="color:var(--blue)">Users</a>` : ''}
+            ${isAdmin ? `<a class="nav-tab" data-route="/admin/users" href="#/admin/users">Users</a>` : ''}
+            ${isAdmin ? `<a class="nav-tab" data-route="/admin/api-keys" href="#/admin/api-keys">API Keys</a>` : ''}
         </nav>
         <div class="header-right">
             <button class="theme-toggle-btn" id="themeToggleBtn" onclick="toggleTheme()">${themeLabel}</button>

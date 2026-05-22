@@ -31,7 +31,7 @@ class LegacyRouteTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 410)
-        self.assertIn("/ingest/ui", response.json()["detail"])
+        self.assertIn("/ingest/ui", response.json()["error"]["message"])
 
 
 class WorkerPipelineTests(unittest.IsolatedAsyncioTestCase):

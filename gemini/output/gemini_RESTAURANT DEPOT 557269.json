@@ -1,0 +1,101 @@
+{
+  "fields": {
+    "bill_to": "RD AMERICA LLC\nI T 1710 WHITESTONE EXPRESSWAY\nL O WHITESTONE\nL NY\n11357-3054",
+    "ship_to": "RESTAURANT DEPOT #75\nH T 1300 N GLENVILLE DRIVE\nI O RICHARDSON\nP TX\n75081-2413",
+    "supplier": "FRESH PRODUCTS LLC\nU I 30600 OREGON ROAD\nP E PERRYSBURG\nP R\nOH 43551",
+    "po_number": "175-43929",
+    "order_date": "08/22/25",
+    "line_items": [
+      {
+        "our_item_code": "2260122",
+        "pack": "024/001",
+        "our_units": "48",
+        "list_cost": "2.500",
+        "master_cases": "2"
+      },
+      {
+        "our_item_code": "2260124",
+        "pack": "001/001",
+        "our_units": "36",
+        "list_cost": "1.330",
+        "master_cases": "36"
+      },
+      {
+        "our_item_code": "2260128",
+        "pack": "001/002",
+        "our_units": "81",
+        "list_cost": "3.250",
+        "master_cases": "81"
+      },
+      {
+        "our_item_code": "2260129",
+        "pack": "001/002",
+        "our_units": "81",
+        "list_cost": "3.250",
+        "master_cases": "81"
+      }
+    ]
+  },
+  "boxes": {
+    "bill_to": [
+      19,
+      85,
+      27,
+      100
+    ],
+    "ship_to": [
+      292,
+      85,
+      300,
+      100
+    ],
+    "supplier": [
+      560,
+      85,
+      588,
+      100
+    ],
+    "po_number": [
+      833,
+      38,
+      892,
+      52
+    ],
+    "order_date": [
+      833,
+      100,
+      906,
+      114
+    ],
+    "our_item_code": [
+      13,
+      389,
+      85,
+      417
+    ],
+    "pack": [
+      181,
+      404,
+      231,
+      417
+    ],
+    "our_units": [
+      558,
+      404,
+      596,
+      432
+    ],
+    "list_cost": [
+      626,
+      389,
+      658,
+      417
+    ],
+    "master_cases": [
+      514,
+      404,
+      558,
+      432
+    ]
+  }
+}

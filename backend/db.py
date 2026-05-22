@@ -179,6 +179,20 @@ CREATE TABLE IF NOT EXISTS llm_usage (
     duration_ms       REAL,
     llm_url           TEXT
 );
+
+CREATE TABLE IF NOT EXISTS field_mappings (
+    id              SERIAL PRIMARY KEY,
+    vendor_id       TEXT REFERENCES vendors(id) ON DELETE CASCADE,
+    template_id     INT  REFERENCES templates(id) ON DELETE SET NULL,
+    header_map      JSONB NOT NULL DEFAULT '{}'::jsonb,
+    line_map        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    header_snapshot JSONB NOT NULL DEFAULT '[]'::jsonb,
+    line_snapshot   JSONB NOT NULL DEFAULT '[]'::jsonb,
+    pending_notices JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(vendor_id)
+);
 """
 
 
@@ -506,8 +520,15 @@ async def init(pool: asyncpg.Pool) -> None:
                     WHERE table_name = 'users' AND column_name = 'subscription_limit'
                 ) THEN
                     ALTER TABLE users ADD COLUMN subscription_limit INT NOT NULL DEFAULT 0;
+                ELSE
+                    ALTER TABLE users ALTER COLUMN subscription_limit SET DEFAULT 0;
                 END IF;
             END $$;
+        """)
+        # Retroactively reset clients who got the legacy 1000 default limit back to 0
+        await conn.execute("""
+            UPDATE users SET subscription_limit = 0 
+            WHERE role = 'client' AND subscription_limit = 1000;
         """)
         # Migration: per-user runtime configuration (input/output folders, upload mode)
         await conn.execute("""
@@ -545,6 +566,81 @@ async def init(pool: asyncpg.Pool) -> None:
                     ALTER TABLE user_schedules ADD COLUMN is_executing BOOLEAN NOT NULL DEFAULT FALSE;
                 END IF;
             END $$;
+        """)
+        # Migration: API keys table for programmatic access
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS api_keys (
+                id          SERIAL PRIMARY KEY,
+                user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                label       TEXT NOT NULL,
+                key_hash    VARCHAR(255) UNIQUE NOT NULL,
+                prefix      VARCHAR(32) NOT NULL,
+                is_active   BOOLEAN DEFAULT TRUE,
+                created_at  TIMESTAMPTZ DEFAULT NOW(),
+                last_used_at TIMESTAMPTZ
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
+            CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
+        """)
+        # Migration: widen prefix column if it was created as VARCHAR(16)
+        await conn.execute("""
+            DO $$ BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='api_keys' AND column_name='prefix'
+                      AND character_maximum_length < 32
+                ) THEN
+                    ALTER TABLE api_keys ALTER COLUMN prefix TYPE VARCHAR(32);
+                END IF;
+            END $$;
+        """)
+        # Migration: add encrypted_key column for admin key recovery
+        await conn.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='api_keys' AND column_name='encrypted_key'
+                ) THEN
+                    ALTER TABLE api_keys ADD COLUMN encrypted_key TEXT;
+                END IF;
+            END $$;
+        """)
+        # Migration: add expires_at column for API key expiry
+        await conn.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='api_keys' AND column_name='expires_at'
+                ) THEN
+                    ALTER TABLE api_keys ADD COLUMN expires_at TIMESTAMPTZ;
+                END IF;
+            END $$;
+        """)
+        # Migration: add api_key_id to llm_usage for per-key usage tracking
+        await conn.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='llm_usage' AND column_name='api_key_id'
+                ) THEN
+                    ALTER TABLE llm_usage ADD COLUMN api_key_id INT;
+                END IF;
+            END $$;
+        """)
+        # ERP field mapping: mapped_result holds the canonical-field JSON sent
+        # to API-key clients. Raw `result` stays untouched for review/spatial memory.
+        await conn.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='extractions' AND column_name='mapped_result'
+                ) THEN
+                    ALTER TABLE extractions ADD COLUMN mapped_result JSONB;
+                END IF;
+            END $$;
+            CREATE INDEX IF NOT EXISTS field_mappings_vendor_idx
+                ON field_mappings (vendor_id);
         """)
 
 
@@ -617,6 +713,7 @@ async def record_llm_usage(
     llm_url: str = "",
     request_id: str | None = None,
     billing_user_id: str | None = None,  # override: admin uploads bill to admin, not vendor owner
+    api_key_id: int | None = None,       # which API key made this call (for per-key reporting)
 ) -> dict:
     """Persist one LLM call's usage counters.
 
@@ -657,11 +754,11 @@ async def record_llm_usage(
             INSERT INTO llm_usage
                 (request_id, doc_id, extraction_id, vendor_id, user_id, page_num, total_pages,
                  call_type, model, prompt_tokens, completion_tokens, total_tokens,
-                 duration_ms, llm_url)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                 duration_ms, llm_url, api_key_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             RETURNING id, ts, request_id, doc_id, extraction_id, vendor_id, user_id,
                       page_num, total_pages, call_type, model, prompt_tokens,
-                      completion_tokens, total_tokens, duration_ms, llm_url
+                      completion_tokens, total_tokens, duration_ms, llm_url, api_key_id
             """,
             request_id_str,
             resolved_doc_id_str,
@@ -677,6 +774,7 @@ async def record_llm_usage(
             total_tokens,
             duration_ms,
             llm_url,
+            api_key_id,
         )
         return dict(row)
 
@@ -1139,15 +1237,18 @@ async def create_user(
     email: str,
     hashed_pw: str,
     role: str = "client",
+    subscription_limit: int | None = None,
 ) -> dict:
+    from backend.config import DEFAULT_SUBSCRIPTION_LIMIT
+    limit = subscription_limit if subscription_limit is not None else DEFAULT_SUBSCRIPTION_LIMIT
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            INSERT INTO users (email, hashed_pw, role)
-            VALUES ($1, $2, $3)
-            RETURNING id, email, role, is_active, created_at
+            INSERT INTO users (email, hashed_pw, role, subscription_limit)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id, email, role, is_active, created_at, subscription_limit
             """,
-            email.lower().strip(), hashed_pw, role,
+            email.lower().strip(), hashed_pw, role, limit,
         )
         return _stringify_uuid_fields(dict(row), "id")
 
@@ -1156,7 +1257,7 @@ async def get_user_by_email(pool: asyncpg.Pool, email: str) -> dict | None:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT id, email, hashed_pw, role, is_active, created_at
+            SELECT id, email, hashed_pw, role, is_active, created_at, subscription_limit
             FROM users WHERE email = $1
             """,
             email.lower().strip(),
@@ -1171,7 +1272,7 @@ async def get_user_by_id(pool: asyncpg.Pool, user_id: str) -> dict | None:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT id, email, role, is_active, created_at
+            SELECT id, email, role, is_active, created_at, subscription_limit
             FROM users WHERE id = $1
             """,
             user_uuid,
@@ -1240,6 +1341,7 @@ async def delete_vendor(pool: asyncpg.Pool, vendor_id: str) -> bool:
         async with conn.transaction():
             # Some deployments still have vendor foreign keys without ON DELETE
             # CASCADE, so delete dependents explicitly before removing the vendor.
+            await conn.execute("DELETE FROM gold_examples WHERE vendor_id = $1", vendor_id)
             await conn.execute("DELETE FROM extractions WHERE vendor_id = $1", vendor_id)
             await conn.execute("DELETE FROM documents WHERE vendor_id = $1", vendor_id)
             await conn.execute("DELETE FROM vendor_aliases WHERE vendor_id = $1", vendor_id)
@@ -1573,6 +1675,104 @@ async def list_all_templates(pool: asyncpg.Pool, user_id: str | None = None) -> 
             _parse_jsonb(d, "header_fields", "line_item_fields", "extraction_rules")
             results.append(d)
         return results
+
+
+# -- Field mapping queries -------------------------------------------------
+
+_FIELD_MAPPING_COLS = """
+    id, vendor_id, template_id, header_map, line_map,
+    header_snapshot, line_snapshot, pending_notices, created_at, updated_at
+"""
+
+
+async def get_field_mapping(pool: asyncpg.Pool, vendor_id: str) -> dict | None:
+    """Return the ERP field mapping for a vendor, or None if not configured."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"SELECT {_FIELD_MAPPING_COLS} FROM field_mappings WHERE vendor_id = $1",
+            vendor_id,
+        )
+        if not row:
+            return None
+        d = dict(row)
+        _parse_jsonb(d, "header_map", "line_map", "header_snapshot",
+                     "line_snapshot", "pending_notices")
+        return d
+
+
+async def upsert_field_mapping(
+    pool: asyncpg.Pool,
+    vendor_id: str,
+    template_id: int | None,
+    header_map: dict,
+    line_map: dict,
+    header_snapshot: list[str],
+    line_snapshot: list[str],
+    pending_notices: list[dict],
+) -> dict:
+    """Insert or update a vendor's ERP field mapping (one per vendor)."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"""
+            INSERT INTO field_mappings
+                (vendor_id, template_id, header_map, line_map,
+                 header_snapshot, line_snapshot, pending_notices, updated_at)
+            VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, NOW())
+            ON CONFLICT (vendor_id) DO UPDATE SET
+                template_id     = EXCLUDED.template_id,
+                header_map      = EXCLUDED.header_map,
+                line_map        = EXCLUDED.line_map,
+                header_snapshot = EXCLUDED.header_snapshot,
+                line_snapshot   = EXCLUDED.line_snapshot,
+                pending_notices = EXCLUDED.pending_notices,
+                updated_at      = NOW()
+            RETURNING {_FIELD_MAPPING_COLS}
+            """,
+            vendor_id, template_id,
+            json.dumps(header_map), json.dumps(line_map),
+            json.dumps(header_snapshot), json.dumps(line_snapshot),
+            json.dumps(pending_notices),
+        )
+        d = dict(row)
+        _parse_jsonb(d, "header_map", "line_map", "header_snapshot",
+                     "line_snapshot", "pending_notices")
+        return d
+
+
+async def set_field_mapping_notices(
+    pool: asyncpg.Pool, vendor_id: str, pending_notices: list[dict],
+) -> None:
+    """Overwrite the pending rename notices for a vendor's mapping."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE field_mappings SET pending_notices = $2::jsonb, updated_at = NOW() "
+            "WHERE vendor_id = $1",
+            vendor_id, json.dumps(pending_notices),
+        )
+
+
+async def update_extraction_mapped_result(
+    pool: asyncpg.Pool, extraction_id: int, mapped_result: Any,
+) -> None:
+    """Store (or clear) the canonical-field mapped result for an extraction."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE extractions SET mapped_result = $2::jsonb, updated_at = NOW() "
+            "WHERE id = $1",
+            extraction_id,
+            json.dumps(mapped_result) if mapped_result is not None else None,
+        )
+
+
+async def get_extraction_mapped_result(pool: asyncpg.Pool, extraction_id: int) -> Any:
+    """Return the stored mapped_result for an extraction, or None."""
+    async with pool.acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT mapped_result FROM extractions WHERE id = $1", extraction_id,
+        )
+        if isinstance(val, str):
+            return json.loads(val)
+        return val
 
 
 # -- Document queries ------------------------------------------------------
@@ -2950,3 +3150,118 @@ async def get_user_is_executing(pool: asyncpg.Pool, user_id: str) -> bool:
             uid,
         )
     return bool(row["running"]) if row else False
+
+
+# -- API Key CRUD ----------------------------------------------------------
+
+async def get_api_key_encrypted(pool: asyncpg.Pool, key_id: int) -> dict | None:
+    """Fetch the encrypted raw key for admin reveal."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, label, encrypted_key FROM api_keys WHERE id = $1",
+            key_id,
+        )
+    return dict(row) if row else None
+
+
+async def create_api_key(
+    pool: asyncpg.Pool,
+    *,
+    user_id: str,
+    label: str,
+    key_hash: str,
+    prefix: str,
+    encrypted_key: str | None = None,
+    expires_at=None,
+) -> dict:
+    """Create a new API key row. Returns the created record."""
+    from uuid import UUID as _UUID
+    uid = _UUID(user_id) if isinstance(user_id, str) else user_id
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO api_keys (user_id, label, key_hash, prefix, encrypted_key, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id, user_id, label, key_hash, prefix, is_active, created_at, last_used_at, expires_at
+            """,
+            uid, label, key_hash, prefix, encrypted_key, expires_at,
+        )
+    return _record(row) if row else {}
+
+
+async def list_api_keys(pool: asyncpg.Pool) -> list[dict]:
+    """List all API keys with owner email and usage stats."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT ak.id, ak.user_id, ak.label, ak.prefix, ak.is_active,
+                   ak.created_at, ak.last_used_at, ak.expires_at,
+                   u.email AS owner_email,
+                   COALESCE(SUM(lu.total_tokens), 0)::BIGINT AS total_tokens,
+                   COALESCE(COUNT(DISTINCT (lu.extraction_id, lu.page_num)) FILTER (WHERE lu.call_type = 'extraction' AND lu.page_num IS NOT NULL), 0)::BIGINT AS total_pages,
+                   COUNT(DISTINCT lu.doc_id)::INT AS total_documents
+            FROM api_keys ak
+            JOIN users u ON u.id = ak.user_id
+            LEFT JOIN llm_usage lu ON lu.api_key_id = ak.id
+            GROUP BY ak.id, ak.user_id, ak.label, ak.prefix, ak.is_active,
+                     ak.created_at, ak.last_used_at, ak.expires_at, u.email
+            ORDER BY ak.created_at DESC
+            """
+        )
+    return [dict(r) for r in rows]
+
+
+async def verify_api_key_hash(pool: asyncpg.Pool, key_hash: str) -> dict | None:
+    """Look up an API key by its SHA-256 hash. Returns {id, user_id, is_active} or None.
+    Returns None if the key has expired.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, user_id, is_active
+            FROM api_keys
+            WHERE key_hash = $1
+              AND (expires_at IS NULL OR expires_at > NOW())
+            """,
+            key_hash,
+        )
+    return dict(row) if row else None
+
+
+async def touch_api_key(pool: asyncpg.Pool, key_hash: str) -> None:
+    """Update last_used_at timestamp for an API key."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE api_keys SET last_used_at = NOW() WHERE key_hash = $1",
+            key_hash,
+        )
+
+
+async def deactivate_api_key(pool: asyncpg.Pool, key_id: int) -> bool:
+    """Deactivate an API key (soft disable)."""
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE api_keys SET is_active = FALSE WHERE id = $1",
+            key_id,
+        )
+    return result == "UPDATE 1"
+
+
+async def activate_api_key(pool: asyncpg.Pool, key_id: int) -> bool:
+    """Reactivate a previously deactivated API key."""
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE api_keys SET is_active = TRUE WHERE id = $1",
+            key_id,
+        )
+    return result == "UPDATE 1"
+
+
+async def delete_api_key(pool: asyncpg.Pool, key_id: int) -> bool:
+    """Hard-delete an API key row."""
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM api_keys WHERE id = $1",
+            key_id,
+        )
+    return result == "DELETE 1"

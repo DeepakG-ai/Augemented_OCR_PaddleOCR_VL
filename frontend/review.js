@@ -404,7 +404,7 @@ function _rvConfirmTypedOnlyChanges(fields) {
     const preview = fields.slice(0, 6).join(', ');
     const extra = fields.length > 6 ? ` and ${fields.length - 6} more` : '';
     return window.confirm(
-        `Manual typed edits will override Qwen's final JSON value for: ${preview}${extra}.\n\n` +
+        `Manual typed edits will override AI's final JSON value for: ${preview}${extra}.\n\n` +
         `These typed edits will NOT create spatial memory because no value box was selected on the document.\n\n` +
         `Use the draw/select button when you want future same-layout PDFs to reuse a field location.\n\n` +
         `Continue saving these value-only corrections?`
@@ -1072,7 +1072,7 @@ function _rvApplyAcceptedSelection(sel, reasonCode, note) {
 
 const _rvReasonOptions = [
     { code: 'ocr_error',        label: 'OCR misread the text' },
-    { code: 'wrong_extraction', label: 'Qwen extracted wrong value' },
+    { code: 'wrong_extraction', label: 'AI extracted wrong value' },
     { code: 'wrong_location',   label: 'Field location was off' },
     { code: 'missing_value',    label: 'Value was missing' },
     { code: 'format_change',    label: 'New document format' },

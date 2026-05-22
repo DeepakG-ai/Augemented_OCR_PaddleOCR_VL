@@ -58,6 +58,39 @@ class UserResetPassword(BaseModel):
     new_password: str = Field(..., min_length=8, max_length=256)
 
 
+class ApiKeyCreate(BaseModel):
+    label: str = Field(
+        ...,
+        min_length=2,
+        max_length=64,
+        description="Human-readable name for this key (e.g. ap_automation, client.6)",
+    )
+    owner_user_id: str = Field(
+        ...,
+        description="UUID of the existing client user who owns this key.",
+    )
+    expires_days: int | None = Field(
+        None,
+        description="Expiry in days from now. 30, 90, 365, or null for no expiry.",
+    )
+
+
+class ApiKeyOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    user_id: str | None = None
+    label: str
+    prefix: str
+    is_active: bool = True
+    owner_email: str | None = None
+    total_tokens: int = 0
+    total_documents: int = 0
+    total_pages: int = 0
+    created_at: datetime | None = None
+    last_used_at: datetime | None = None
+    expires_at: datetime | None = None
+
+
 class VendorOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str

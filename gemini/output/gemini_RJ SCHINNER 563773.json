@@ -1,0 +1,121 @@
+{
+  "fields": {
+    "ship_to": "RJ SCHINNER - GRAND PRAIRIE TX\n3001 ALOUETTE DRIVE SUITE 300\nGRAND PRAIRIE TX 75052\n469-348-0042 Fax 469-277-8804",
+    "bill_to": "RJ SCHINNER CO., INC\nN89 W14700 PATRITA DRIVE\nMENOMONEE FALLS WI 53051",
+    "po_number": "P1416144",
+    "order_date": "11/14/25",
+    "required_date": "11/28/25",
+    "line_items": [
+      {
+        "order_qty": "24",
+        "item": "3PB-F-20-BX",
+        "pack": "12/bx",
+        "unit_price": "6.220"
+      },
+      {
+        "order_qty": "15",
+        "item": "105G-F-02",
+        "pack": "4/cs",
+        "unit_price": "41.890"
+      },
+      {
+        "order_qty": "24",
+        "item": "3WDS-F-06-BX",
+        "pack": "10/bx",
+        "unit_price": "15.690"
+      },
+      {
+        "order_qty": "6",
+        "item": "EBC-F-04-BX",
+        "pack": "12/bx",
+        "unit_price": "17.150"
+      },
+      {
+        "order_qty": "60",
+        "item": "4PB-F-20-BX",
+        "pack": "12/bx",
+        "unit_price": "7.340"
+      },
+      {
+        "order_qty": "3",
+        "item": "CITP-F-66",
+        "pack": "1/pl",
+        "unit_price": "33.610"
+      },
+      {
+        "order_qty": "12",
+        "item": "OFB-F-01-BX",
+        "pack": "8/bx",
+        "unit_price": "27.660"
+      },
+      {
+        "order_qty": "18",
+        "item": "OFB-F-06-BX",
+        "pack": "8/bx",
+        "unit_price": "27.660"
+      },
+      {
+        "order_qty": "6",
+        "item": "OFB-F-54-BX",
+        "pack": "8/bx",
+        "unit_price": "27.660"
+      }
+    ]
+  },
+  "boxes": {
+    "ship_to": [
+      584,
+      171,
+      636,
+      181
+    ],
+    "bill_to": [
+      678,
+      103,
+      730,
+      113
+    ],
+    "po_number": [
+      831,
+      55,
+      907,
+      65
+    ],
+    "order_date": [
+      693,
+      55,
+      759,
+      65
+    ],
+    "required_date": [
+      459,
+      258,
+      535,
+      268
+    ],
+    "order_qty": [
+      34,
+      305,
+      88,
+      315
+    ],
+    "item": [
+      212,
+      305,
+      248,
+      315
+    ],
+    "pack": [
+      668,
+      305,
+      694,
+      315
+    ],
+    "unit_price": [
+      774,
+      305,
+      830,
+      315
+    ]
+  }
+}

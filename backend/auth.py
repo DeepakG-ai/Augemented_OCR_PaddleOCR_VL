@@ -9,11 +9,15 @@ Admin role bypasses every assert.
 """
 from __future__ import annotations
 
+import asyncio
+import base64
+import hashlib
 import os
+import secrets
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
-from fastapi import Depends, HTTPException, Query, Request, status
+from fastapi import Depends, Header, HTTPException, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 
@@ -92,6 +96,36 @@ def decode_token(token: str) -> dict:
         ) from exc
 
 
+# -- API Key generation -----------------------------------------------------
+
+def generate_api_key() -> tuple[str, str, str]:
+    """Generate a new API key. Returns (raw_key, key_hash, prefix).
+
+    The raw key is shown to the admin ONCE. We store only the SHA-256 hash.
+    """
+    raw = "po_live_" + secrets.token_urlsafe(32)
+    hashed = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    prefix = raw[:16] + "..."
+    return raw, hashed, prefix
+
+
+def _fernet():
+    from cryptography.fernet import Fernet
+    secret = os.getenv("SECRET_KEY", SECRET_KEY)
+    if not secret:
+        raise RuntimeError("SECRET_KEY not configured — cannot encrypt API key")
+    key = base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest())
+    return Fernet(key)
+
+
+def encrypt_api_key(raw_key: str) -> str:
+    return _fernet().encrypt(raw_key.encode()).decode()
+
+
+def decrypt_api_key(encrypted: str) -> str:
+    return _fernet().decrypt(encrypted.encode()).decode()
+
+
 # -- FastAPI dependency -----------------------------------------------------
 
 async def get_current_user(
@@ -135,6 +169,80 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="Malformed token")
 
     return {"id": str(user_id), "role": role, "email": email}
+
+
+async def get_current_user_or_api_key(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    token: str | None = Query(None, description="Token for SSE/EventSource clients"),
+    x_api_key: str | None = Header(None, alias="X-API-Key"),
+) -> dict:
+    """Dual auth: X-API-Key header OR JWT Bearer token.
+
+    API keys resolve to the owning user, so all downstream vendor-isolation
+    logic works unchanged.
+    """
+    pool = getattr(request.app.state, "pool", None)
+
+    # ── API Key path ──────────────────────────────────────────────────
+    if x_api_key:
+        if not pool:
+            raise HTTPException(status_code=500, detail="Database pool unavailable")
+
+        hashed = hashlib.sha256(x_api_key.encode("utf-8")).hexdigest()
+        key_row = await db_mod.verify_api_key_hash(pool, hashed)
+
+        if not key_row or not key_row["is_active"]:
+            raise HTTPException(status_code=401, detail="Invalid or inactive API key")
+
+        user_id = key_row["user_id"]
+        record = await db_mod.get_user_by_id(pool, str(user_id))
+        if not record or not record.get("is_active", True):
+            raise HTTPException(status_code=401, detail="API key owner disabled")
+
+        # Fire-and-forget: update last_used_at
+        asyncio.ensure_future(db_mod.touch_api_key(pool, hashed))
+
+        return {
+            "id": str(user_id),
+            "role": record.get("role"),
+            "email": record.get("email"),
+            "auth_method": "api_key",
+            "api_key_id": key_row["id"],
+        }
+
+    # ── JWT path (fallback) ───────────────────────────────────────────
+    raw_token: str | None = None
+    if credentials and credentials.scheme.lower() == "bearer":
+        raw_token = credentials.credentials
+    elif token:
+        raw_token = token
+
+    if not raw_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    payload = decode_token(raw_token)
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Malformed token")
+
+    role = payload.get("role")
+    email = payload.get("email")
+    if pool is not None:
+        record = await db_mod.get_user_by_id(pool, user_id)
+        if not record or not record.get("is_active", True):
+            raise HTTPException(status_code=401, detail="User disabled or missing")
+        role = record.get("role")
+        email = record.get("email")
+
+    if not role:
+        raise HTTPException(status_code=401, detail="Malformed token")
+
+    return {"id": str(user_id), "role": role, "email": email, "auth_method": "jwt", "api_key_id": None}
 
 
 async def require_admin(user: dict = Depends(get_current_user)) -> dict:

@@ -477,7 +477,7 @@ const PIPELINE_STAGES = [
     { id: 'detect', label: 'Detecting Vendor', detail: 'Reading page 1' },
     { id: 'normalize', label: 'PDF Rendering', detail: 'Classifying pages and extracting geometry' },
     { id: 'ocr', label: 'OCR Bounding Box', detail: 'Waiting for page classification' },
-    { id: 'llm', label: 'Vision Extraction', detail: 'Qwen VL extraction' },
+    { id: 'llm', label: 'Vision Extraction', detail: 'AI Vision extraction' },
     { id: 'json', label: 'JSON Created', detail: 'Structured output assembled' },
     { id: 'postprocess', label: 'Post Processing', detail: 'Field mapping and review memory' },
 ];

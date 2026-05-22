@@ -7,6 +7,7 @@ let _vendorPageClients = [];
 
 async function renderVendorsPage(app) {
     let vendors = [];
+    let allUsers = [];
     try { vendors = await apiJSON('/vendors'); } catch (e) { console.warn(e); }
     db.vendors = vendors;
 
@@ -14,7 +15,7 @@ async function renderVendorsPage(app) {
     _vendorPageClients = [];
     if (isAdmin) {
         try {
-            const allUsers = await apiJSON('/admin/users');
+            allUsers = await apiJSON('/admin/users');
             _vendorPageClients = allUsers.filter(u => u.role === 'client' && u.is_active);
         } catch (e) { console.warn(e); }
     }
@@ -37,14 +38,14 @@ async function renderVendorsPage(app) {
     </div>` + vendorModalHTML();
 
     if (isAdmin) {
-        renderVendorCardsByClient(vendors, _vendorPageClients);
+        renderVendorCardsByClient(vendors, _vendorPageClients, allUsers);
     } else {
         renderVendorCards(vendors);
     }
     updateNavActive();
 }
 
-function renderVendorCardsByClient(vendors, clients) {
+function renderVendorCardsByClient(vendors, clients, allUsers = []) {
     const c = document.getElementById('vendorCards');
     if (!c) return;
     if (!vendors.length) {
@@ -53,7 +54,8 @@ function renderVendorCardsByClient(vendors, clients) {
     }
 
     const clientMap = {};
-    clients.forEach(u => { clientMap[u.id] = u.email; });
+    const usersToMap = allUsers && allUsers.length ? allUsers : clients;
+    usersToMap.forEach(u => { clientMap[u.id] = u.email; });
 
     const groups = {};
     vendors.forEach(v => {

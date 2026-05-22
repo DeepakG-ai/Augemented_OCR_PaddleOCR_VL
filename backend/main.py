@@ -22,11 +22,12 @@ from typing import AsyncGenerator
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -44,12 +45,16 @@ from .auth import (
     assert_job_access,
     assert_vendor_access,
     create_access_token,
+    generate_api_key,
     get_current_user,
+    get_current_user_or_api_key,
     hash_password,
     require_admin,
     verify_password,
 )
 from .models import (
+    ApiKeyCreate,
+    ApiKeyOut,
     ExtractionJobStartOut,
     ExtractionOut,
     HealthOut,
@@ -263,7 +268,7 @@ class MaxUploadSizeMiddleware(BaseHTTPMiddleware):
         content_length = request.headers.get("content-length")
         if content_length and int(content_length) > MAX_UPLOAD_BYTES:
             return Response(
-                content=json.dumps({"detail": f"Upload exceeds {MAX_UPLOAD_BYTES // (1024*1024)} MB limit"}),
+                content=json.dumps({"error": {"code": "FILE_TOO_LARGE", "message": f"Upload exceeds {MAX_UPLOAD_BYTES // (1024*1024)} MB limit"}}),
                 status_code=413,
                 media_type="application/json",
             )
@@ -548,7 +553,6 @@ app = FastAPI(
 )
 
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(MaxUploadSizeMiddleware)
 app.add_middleware(
     CORSMiddleware,
@@ -568,22 +572,94 @@ app.add_middleware(
 app.add_middleware(AccessLogMiddleware)
 
 
-# -- Global exception handler (logs ALL unhandled errors to terminal) ------
+# ── Unified error envelope ──────────────────────────────────────────────────
+# Every error — HTTPException, validation, rate limit, unhandled — returns:
+#   { "error": { "code": "SNAKE_CASE", "message": "...", ...extra_fields } }
+
+_HTTP_CODE_NAMES: dict[int, str] = {
+    400: "BAD_REQUEST",
+    401: "UNAUTHORIZED",
+    402: "PAYMENT_REQUIRED",
+    403: "FORBIDDEN",
+    404: "NOT_FOUND",
+    409: "CONFLICT",
+    410: "GONE",
+    413: "FILE_TOO_LARGE",
+    422: "VALIDATION_ERROR",
+    429: "RATE_LIMITED",
+    500: "INTERNAL_ERROR",
+    503: "SERVICE_UNAVAILABLE",
+    504: "TIMEOUT",
+}
+
+
+def _error_body(status: int, detail) -> dict:
+    """Build the standard { error: { code, message, ...extras } } envelope."""
+    if isinstance(detail, dict):
+        # Already structured — promote to top-level error object as-is.
+        # Callers must include at least 'code' and 'message'.
+        error = detail
+    else:
+        error = {
+            "code": _HTTP_CODE_NAMES.get(status, "ERROR"),
+            "message": str(detail),
+        }
+    return {"error": error}
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=_error_body(exc.status_code, exc.detail),
+        headers=getattr(exc, "headers", None) or {},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "Request validation failed",
+                "fields": exc.errors(),
+            }
+        },
+    )
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": {
+                "code": "RATE_LIMITED",
+                "message": f"Rate limit exceeded: {exc.detail}",
+            }
+        },
+    )
+
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    # Loud + located inline; full traceback only in error.log under this ref.
-    # The access-log line for this request will echo the same trace=ref.
     ref = plog.error(
         f"{request.method} {request.url.path}",
         exc=exc, logger="api",
     )
     request.state.trace_ref = ref
     request.state.err_reason = type(exc).__name__
-    return Response(
-        content=json.dumps({"detail": "Internal Server Error"}),
+    return JSONResponse(
         status_code=500,
-        media_type="application/json",
+        content={
+            "error": {
+                "code": "INTERNAL_ERROR",
+                "message": "Internal server error",
+                "ref": ref,
+            }
+        },
     )
 
 
@@ -799,6 +875,146 @@ async def admin_update_subscription_limit(
         raise HTTPException(status_code=404, detail="User not found")
     logger.info("Admin %s updated subscription_limit for user %s to %d", user["id"], user_id, new_limit)
     return {"status": "updated", "user_id": user_id, "subscription_limit": new_limit}
+
+
+# -- Admin: API Key Management -----------------------------------------------
+
+@app.post("/admin/api-keys", status_code=201)
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_create_api_key(
+    request: Request,
+    body: ApiKeyCreate,
+    user: dict = Depends(require_admin),
+):
+    """Create a new API key for an existing client user."""
+    pool = request.app.state.pool
+    label = body.label.strip()
+
+    # Validate owner user exists and is a client
+    owner = await db_mod.get_user_by_id(pool, body.owner_user_id)
+    if not owner:
+        raise HTTPException(status_code=404, detail="User not found")
+    if owner.get("role") not in ("client", "admin"):
+        raise HTTPException(status_code=400, detail="API keys can only be created for client or admin users")
+
+    # Generate key
+    raw_key, key_hash, prefix = generate_api_key()
+    from .auth import encrypt_api_key
+    from datetime import datetime, timedelta, timezone as _tz
+    import asyncpg as _asyncpg
+    encrypted = encrypt_api_key(raw_key)
+    expires_at = None
+    if body.expires_days:
+        expires_at = datetime.now(_tz.utc) + timedelta(days=body.expires_days)
+    try:
+        key_row = await db_mod.create_api_key(
+            pool,
+            user_id=body.owner_user_id,
+            label=label,
+            key_hash=key_hash,
+            prefix=prefix,
+            encrypted_key=encrypted,
+            expires_at=expires_at,
+        )
+    except _asyncpg.UniqueViolationError:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A key named '{label}' already exists for this user. Choose a different name.",
+        )
+    logger.info("Admin %s created API key '%s' for user %s (expires=%s)", user["id"], label, body.owner_user_id, expires_at)
+
+    return {"id": key_row.get("id"), "raw_key": raw_key, "label": label, "prefix": prefix}
+
+
+@app.get("/admin/api-keys/{key_id}/reveal")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_reveal_api_key(
+    request: Request,
+    key_id: int,
+    _user: dict = Depends(require_admin),
+):
+    """Return the decrypted raw key for a given API key ID. Admin only."""
+    pool = request.app.state.pool
+    row = await db_mod.get_api_key_encrypted(pool, key_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="API key not found")
+    if not row.get("encrypted_key"):
+        raise HTTPException(
+            status_code=404,
+            detail="This key was created before encrypted storage was added. Deactivate it and create a new one.",
+        )
+    from .auth import decrypt_api_key
+    raw = decrypt_api_key(row["encrypted_key"])
+    return {"raw_key": raw, "label": row["label"]}
+
+
+@app.get("/admin/api-keys", response_model=list[ApiKeyOut])
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_list_api_keys(
+    request: Request,
+    _user: dict = Depends(require_admin),
+):
+    """List all API keys with usage stats."""
+    rows = await db_mod.list_api_keys(request.app.state.pool)
+    out = []
+    for r in rows:
+        out.append(ApiKeyOut(
+            id=r["id"],
+            user_id=str(r["user_id"]) if r.get("user_id") else None,
+            label=r["label"],
+            prefix=r["prefix"],
+            is_active=r.get("is_active", True),
+            owner_email=r.get("owner_email"),
+            total_tokens=int(r.get("total_tokens") or 0),
+            total_documents=int(r.get("total_documents") or 0),
+            total_pages=int(r.get("total_pages") or 0),
+            created_at=r.get("created_at"),
+            last_used_at=r.get("last_used_at"),
+            expires_at=r.get("expires_at"),
+        ))
+    return out
+
+
+@app.patch("/admin/api-keys/{key_id}/deactivate")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_deactivate_api_key(
+    request: Request,
+    key_id: int,
+    _user: dict = Depends(require_admin),
+):
+    """Deactivate an API key. It stops working immediately."""
+    ok = await db_mod.deactivate_api_key(request.app.state.pool, key_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="API key not found")
+    return {"status": "deactivated", "key_id": key_id}
+
+
+@app.patch("/admin/api-keys/{key_id}/reactivate")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_reactivate_api_key(
+    request: Request,
+    key_id: int,
+    _user: dict = Depends(require_admin),
+):
+    """Reactivate a previously deactivated API key."""
+    ok = await db_mod.activate_api_key(request.app.state.pool, key_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="API key not found")
+    return {"status": "reactivated", "key_id": key_id}
+
+
+@app.delete("/admin/api-keys/{key_id}")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_delete_api_key(
+    request: Request,
+    key_id: int,
+    _user: dict = Depends(require_admin),
+):
+    """Hard-delete an API key. Usage history in llm_usage is preserved."""
+    ok = await db_mod.delete_api_key(request.app.state.pool, key_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="API key not found")
+    return {"status": "deleted", "key_id": key_id}
 
 
 # -- Vendors ----------------------------------------------------------------
@@ -1173,6 +1389,55 @@ async def save_template(
                     vendor_id, stale_boxes, stale_mem,
                 )
 
+        # ── ERP mapping: carry field renames forward (position-based) ──
+        # If a mapped field is renamed in the template, move the mapping to
+        # the new name and queue a notice. Orphaned source fields are pruned.
+        try:
+            existing_map = await db_mod.get_field_mapping(pool, vendor_id)
+            if existing_map and tmpl:
+                from . import field_mapper as _fm
+
+                new_header = list(body.header_fields or [])
+                new_line = list(body.line_item_fields or [])
+                header_renames = _fm.detect_renames(
+                    existing_map.get("header_snapshot"), new_header)
+                line_renames = _fm.detect_renames(
+                    existing_map.get("line_snapshot"), new_line)
+
+                prev_header_map = existing_map.get("header_map") or {}
+                prev_line_map = existing_map.get("line_map") or {}
+                new_header_map = _fm.apply_renames(prev_header_map, header_renames)
+                new_line_map = _fm.apply_renames(prev_line_map, line_renames)
+                # Drop mappings whose source field no longer exists in the template.
+                new_header_map = {k: v for k, v in new_header_map.items() if k in new_header}
+                new_line_map = {k: v for k, v in new_line_map.items() if k in new_line}
+
+                notices = list(existing_map.get("pending_notices") or [])
+                now_iso = datetime.now(UTC).isoformat()
+                for old, new in header_renames:
+                    notices.append({
+                        "section": "header", "old": old, "new": new,
+                        "at": now_iso, "remapped": old in prev_header_map,
+                    })
+                for old, new in line_renames:
+                    notices.append({
+                        "section": "line", "old": old, "new": new,
+                        "at": now_iso, "remapped": old in prev_line_map,
+                    })
+
+                await db_mod.upsert_field_mapping(
+                    pool, vendor_id, tmpl["id"],
+                    new_header_map, new_line_map,
+                    new_header, new_line, notices,
+                )
+                if header_renames or line_renames:
+                    logger.info(
+                        "ERP mapping rename carried forward: vendor=%s header=%s line=%s",
+                        vendor_id, header_renames, line_renames,
+                    )
+        except Exception as map_exc:
+            logger.warning("ERP mapping rename check failed vendor=%s: %s", vendor_id, map_exc)
+
         return TemplateSaveResponse(
             template_id=tmpl["id"],
             prompt_hash=prompt_hash,
@@ -1181,6 +1446,133 @@ async def save_template(
     except Exception:
         logger.error("Template save FAILED vendor=%s:\n%s", vendor_id, traceback.format_exc())
         raise
+
+
+# -- ERP Field Mapping -----------------------------------------------------
+
+@app.get("/vendors/{vendor_id}/mapping")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_vendor_mapping(
+    request: Request, vendor_id: str, user: dict = Depends(get_current_user),
+):
+    """Return the ERP field mapping for a vendor plus the canonical targets."""
+    pool = request.app.state.pool
+    await assert_vendor_access(pool, vendor_id, user)
+    from . import field_mapper as _fm
+
+    tmpl = await db_mod.get_template(pool, vendor_id)
+    mapping = await db_mod.get_field_mapping(pool, vendor_id)
+    return {
+        "vendor_id": vendor_id,
+        "template_id": (tmpl or {}).get("id"),
+        "has_template": tmpl is not None,
+        "source_header_fields": (tmpl or {}).get("header_fields") or [],
+        "source_line_fields": (tmpl or {}).get("line_item_fields") or [],
+        "target_header_fields": _fm.HEADER_TARGETS,
+        "target_line_fields": _fm.LINE_TARGETS,
+        "header_map": (mapping or {}).get("header_map") or {},
+        "line_map": (mapping or {}).get("line_map") or {},
+        "pending_notices": (mapping or {}).get("pending_notices") or [],
+        "configured": mapping is not None,
+    }
+
+
+@app.post("/vendors/{vendor_id}/mapping")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def save_vendor_mapping(
+    request: Request,
+    vendor_id: str,
+    body: dict = Body(...),
+    user: dict = Depends(get_current_user),
+):
+    """Save (upsert) a vendor's ERP field mapping. One mapping per vendor."""
+    pool = request.app.state.pool
+    await assert_vendor_access(pool, vendor_id, user)
+    from . import field_mapper as _fm
+
+    tmpl = await db_mod.get_template(pool, vendor_id)
+    if not tmpl:
+        raise HTTPException(
+            status_code=404,
+            detail="Configure a template for this vendor before saving a mapping.",
+        )
+
+    header_map = body.get("header_map")
+    line_map = body.get("line_map")
+    if not isinstance(header_map, dict) or not isinstance(line_map, dict):
+        raise HTTPException(400, detail="header_map and line_map must be objects.")
+
+    # Keep only entries that point at a known canonical target field.
+    header_map = {str(k): v for k, v in header_map.items() if v in _fm.HEADER_TARGETS}
+    line_map = {str(k): v for k, v in line_map.items() if v in _fm.LINE_TARGETS}
+
+    existing = await db_mod.get_field_mapping(pool, vendor_id)
+    saved = await db_mod.upsert_field_mapping(
+        pool, vendor_id, tmpl["id"], header_map, line_map,
+        tmpl.get("header_fields") or [], tmpl.get("line_item_fields") or [],
+        (existing or {}).get("pending_notices") or [],
+    )
+    logger.info(
+        "ERP mapping saved: vendor=%s header=%d line=%d",
+        vendor_id, len(header_map), len(line_map),
+    )
+    return {
+        "status": "ok",
+        "vendor_id": vendor_id,
+        "header_map": saved["header_map"],
+        "line_map": saved["line_map"],
+    }
+
+
+@app.delete("/vendors/{vendor_id}/mapping/notices")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def clear_vendor_mapping_notices(
+    request: Request, vendor_id: str, user: dict = Depends(get_current_user),
+):
+    """Dismiss all pending rename notices for a vendor's mapping."""
+    pool = request.app.state.pool
+    await assert_vendor_access(pool, vendor_id, user)
+    if await db_mod.get_field_mapping(pool, vendor_id):
+        await db_mod.set_field_mapping_notices(pool, vendor_id, [])
+    return {"status": "ok"}
+
+
+@app.get("/vendors/{vendor_id}/mapping/sample")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def get_vendor_mapping_sample(
+    request: Request, vendor_id: str, user: dict = Depends(get_current_user),
+):
+    """Return the latest real extraction for the source panel: all header
+    fields plus a single representative line item (not the whole list)."""
+    pool = request.app.state.pool
+    await assert_vendor_access(pool, vendor_id, user)
+
+    extractions = await db_mod.list_extractions(pool, vendor_id, limit=15)
+    chosen = None
+    for ext in extractions:
+        if ext.get("result"):
+            chosen = ext
+            break
+    if not chosen:
+        return {"has_data": False}
+
+    result = chosen.get("result")
+    doc = result[0] if isinstance(result, list) and result else result
+    if not isinstance(doc, dict):
+        return {"has_data": False}
+
+    header = {k: v for k, v in doc.items() if k != "line_items"}
+    line_items = doc.get("line_items") or []
+    line_item = line_items[0] if line_items and isinstance(line_items[0], dict) else {}
+    return {
+        "has_data": True,
+        "extraction_id": chosen.get("id"),
+        "filename": chosen.get("filename"),
+        "format_type": chosen.get("format_type"),
+        "header": header,
+        "line_item": line_item,
+        "line_item_count": len(line_items),
+    }
 
 
 # -- Extraction (with SSE progress streaming) ------------------------------
@@ -2941,6 +3333,8 @@ def _row_to_sched(row: dict) -> dict:
     utc_hour   = int(parts[1]) if len(parts) >= 2 else None
     utc_minute = int(parts[0]) if len(parts) >= 1 else None
     next_runs  = get_next_run_times(row["id"], 1)
+    last_ran   = row.get("last_ran_at")
+    last_ran_str = last_ran.isoformat() if last_ran else None
     return {
         "id":           row["id"],
         "enabled":      row.get("enabled", False),
@@ -2948,6 +3342,7 @@ def _row_to_sched(row: dict) -> dict:
         "utc_hour":     utc_hour,
         "utc_minute":   utc_minute,
         "next_run":     next_runs[0] if next_runs else None,
+        "last_ran_at":  last_ran_str,
     }
 
 
@@ -3020,6 +3415,191 @@ async def delete_user_schedule(
     remove_job(schedule_id)
     await db_mod.delete_user_schedule(pool, schedule_id)
     return {"deleted": True, "schedule_id": schedule_id}
+
+
+@app.post("/api/scheduler/{schedule_id}/ran")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def mark_schedule_ran_endpoint(
+    request: Request, schedule_id: int, user: dict = Depends(get_current_user)
+):
+    """Mark a schedule as run."""
+    pool = request.app.state.pool
+    existing = await db_mod.get_schedule(pool, schedule_id)
+    if not existing or str(existing.get("user_id")) != str(user["id"]):
+        raise HTTPException(404, detail="Schedule not found")
+    await db_mod.mark_schedule_ran(pool, schedule_id)
+    return {"status": "ok"}
+
+
+# -- Programmatic Extraction API (API Key clients) ---------------------------
+
+@app.post("/v1/extract")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def extract_via_api_key(
+    request: Request,
+    file: UploadFile = File(...),
+    vendor_id: str | None = Form(None),
+    user: dict = Depends(get_current_user_or_api_key),
+):
+    """Synchronous PDF extraction endpoint for programmatic (API-key) clients.
+
+    Accepts a PDF via multipart form upload. Detects vendor from the API key
+    owner's vendor aliases, loads their template, runs the full pipeline
+    (render -> OCR -> Qwen3-VL -> normalize), records usage, and returns
+    structured JSON.
+
+    Authentication: X-API-Key header or JWT Bearer token.
+    """
+    pool = request.app.state.pool
+    store = request.app.state.store
+
+    file_bytes = await file.read()
+    filename = file.filename or "unknown.pdf"
+
+    # -- Subscription quota check (same as /ingest) ----------------------------
+    if user.get("role") != "admin":
+        try:
+            usage_info = await db_mod.get_user_billable_pages(pool, user["id"])
+            u_used = usage_info["billable_pages"]
+            u_limit = usage_info["subscription_limit"]
+            if u_used >= u_limit:
+                raise HTTPException(
+                    status_code=402,
+                    detail={
+                        "code": "QUOTA_EXCEEDED",
+                        "message": f"Page quota exceeded. Used {u_used} of {u_limit} pages.",
+                        "subscription_limit": u_limit,
+                        "total_extracted_pages": u_used,
+                    },
+                )
+        except HTTPException:
+            raise
+        except Exception as usage_exc:
+            logger.error("Subscription quota check failed: %s", usage_exc)
+            raise HTTPException(503, detail="Service temporarily unavailable. Please retry.")
+
+    logger.info("[v1/extract] File received: %s (%d bytes, auth=%s, user=%s)",
+                filename, len(file_bytes), user.get("auth_method"), user.get("email"))
+
+    # -- Vendor detection (scoped to API key owner) ----------------------------
+    if not vendor_id:
+        from . import geometry as _geo
+        from . import vendor_detector as _vd
+        from . import ocr_runner as _ocr
+
+        # Render page 1 only for detection
+        if filename.lower().endswith(".pdf"):
+            rendered = await processor.pdf_to_images(file_bytes, max_pages=1)
+        else:
+            rendered = await processor.image_file_to_b64(file_bytes)
+
+        if not rendered:
+            raise HTTPException(400, detail="Could not render any pages from the uploaded file")
+
+        page1 = rendered[0]
+        page1_meta = {"page_number": 1, "width": page1.get("width", 0), "height": page1.get("height", 0)}
+
+        # Digital-first text extraction
+        page_words = []
+        if filename.lower().endswith(".pdf"):
+            geo_pages = _geo.compute_pdf_geometry(file_bytes, [page1_meta])
+            page_words = geo_pages[0].get("words", []) if geo_pages else []
+
+        # PaddleOCR fallback
+        if not page_words:
+            ocr_pages = await _ocr.run_ocr_on_pages([{
+                "page_number": 1,
+                "image_b64": page1["image_b64"],
+                "mime_type": page1.get("mime_type", "image/jpeg"),
+            }])
+            page_words = ocr_pages[0].get("words", []) if ocr_pages else []
+
+        # Always scope to this user's vendors
+        detect_uid = user["id"]
+        match = await _vd.detect_vendor(pool, page_words, user_id=detect_uid)
+        if match is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No vendor template found for this document. Please create a vendor and template first.",
+            )
+        vendor_id = match.vendor_id
+
+    # Enforce ownership
+    await assert_vendor_access(pool, vendor_id, user)
+
+    # -- Submit to the existing ingestion pipeline (async job) -----------------
+    submitted = await _submit_ingestion_job(
+        pool,
+        store,
+        file_bytes=file_bytes,
+        filename=filename,
+        vendor_id=vendor_id,
+        format_type=None,       # always defer to template
+        header_fields=[],
+        line_item_fields=[],
+        source_type="rest",
+        source_ref=f"api_key:{user.get('api_key_id', 'jwt')}",
+        metadata={"billing_user_id": user["id"], "auth_method": user.get("auth_method"), "api_key_id": user.get("api_key_id")},
+    )
+
+    job_id = submitted["job"]["id"]
+    extraction_id = submitted["extraction"]["id"]
+
+    # -- Poll for completion (synchronous wait, max ~5 min) --------------------
+    import asyncio as _aio
+    max_wait = 300  # seconds
+    poll_interval = 1.0  # seconds
+    elapsed = 0.0
+
+    while elapsed < max_wait:
+        extraction = await db_mod.get_extraction(pool, extraction_id)
+        if not extraction:
+            break
+        ext_status = extraction.get("status", "")
+        if ext_status in ("done", "complete", "failed", "cancelled"):
+            break
+        await _aio.sleep(poll_interval)
+        elapsed += poll_interval
+
+    # Fetch final extraction result
+    extraction = await db_mod.get_extraction(pool, extraction_id)
+    if not extraction:
+        raise HTTPException(500, detail="Extraction record missing after job completion")
+
+    ext_status = extraction.get("status", "unknown")
+    if ext_status == "failed":
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "EXTRACTION_FAILED",
+                "message": f"Extraction failed: {extraction.get('error', 'unknown error')}",
+                "extraction_id": extraction_id,
+            },
+        )
+    if ext_status not in ("done", "complete"):
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "code": "EXTRACTION_TIMEOUT",
+                "message": "Extraction did not complete within 5 minutes. Try again later.",
+                "extraction_id": extraction_id,
+                "status": ext_status,
+            },
+        )
+
+    # If an ERP field mapping is configured for this vendor, postprocess has
+    # stored a canonical-field copy — send that to the client instead of raw.
+    mapped_result = await db_mod.get_extraction_mapped_result(pool, extraction_id)
+    mapping_applied = mapped_result is not None
+    return {
+        "extraction_id": extraction_id,
+        "vendor_id": extraction.get("vendor_id"),
+        "pages": extraction.get("total_pages", 0),
+        "duration_ms": extraction.get("duration_ms"),
+        "mapping_applied": mapping_applied,
+        "completed_at": datetime.now(UTC).isoformat(),
+        "result": mapped_result if mapping_applied else extraction.get("result"),
+    }
 
 
 # -- Static Frontend --------------------------------------------------------

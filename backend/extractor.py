@@ -443,6 +443,7 @@ async def call_llm(
                         request_id=context.get("request_id") or context.get("job_id"),
                         # Override billing to admin when admin is the uploader
                         billing_user_id=billing_user_id or context.get("billing_user_id"),
+                        api_key_id=context.get("api_key_id"),
                     )
                 except Exception as exc:
                     logger.warning("Failed to record LLM usage for extraction page %s: %s", page_num, exc)

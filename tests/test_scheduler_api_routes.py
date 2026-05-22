@@ -86,13 +86,13 @@ class UploadConflict409RouteTests(unittest.TestCase):
         """The 409 body must mention 'Scheduler' so the user understands why."""
         with patch.object(db_mod, "get_user_is_executing", new=AsyncMock(return_value=True)):
             resp = self._post_ingest("ui")
-        self.assertIn("Scheduler", resp.json().get("detail", ""))
+        self.assertIn("Scheduler", resp.json().get("error", {}).get("message", ""))
 
     def test_409_is_not_raised_for_empty_detail(self):
         """Sanity: the 409 response body has a non-empty detail field."""
         with patch.object(db_mod, "get_user_is_executing", new=AsyncMock(return_value=True)):
             resp = self._post_ingest("ui")
-        self.assertTrue(resp.json().get("detail", "").strip())
+        self.assertTrue(resp.json().get("error", {}).get("message", "").strip())
 
     # -- Non-blocking path ----------------------------------------------------
 
@@ -165,9 +165,10 @@ class SchedulerStartLimitRouteTests(unittest.TestCase):
         full = [_sched_row(i, _TEST_USER_ID) for i in range(1, 4)]
         with patch.object(db_mod, "get_user_schedules", new=AsyncMock(return_value=full)):
             resp = self.client.post("/api/scheduler/start", json={"hour": 9, "minute": 0})
-        detail = resp.json().get("detail", "")
-        self.assertIn("Maximum", detail)
-        self.assertIn("3", detail)
+        error_body = resp.json().get("error", {})
+        message = error_body.get("message", "")
+        self.assertIn("Maximum", message)
+        self.assertIn("3", message)
 
     def test_exactly_three_existing_blocks_new_create(self):
         """At the limit (3) any new schedule attempt is blocked."""

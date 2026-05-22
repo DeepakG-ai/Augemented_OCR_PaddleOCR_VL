@@ -1,0 +1,152 @@
+{
+  "status": "done",
+  "file": "American Paper and Twine 557737.pdf",
+  "timestamp": "2026-05-18T13:56:44.081955+00:00",
+  "extraction": {
+    "vendor": "FRESH PRODUCTS LLC",
+    "ship_to": "AMERICAN PAPER & TWINE CO.",
+    "po_number": "U62787",
+    "line_items": [
+      {
+        "qty": "5",
+        "uom": "CS",
+        "_page": 1,
+        "unit_cost": "28.00000",
+        "item_number": "028518"
+      },
+      {
+        "qty": "1",
+        "uom": "CS",
+        "_page": 1,
+        "unit_cost": "121.87000",
+        "item_number": "042823"
+      },
+      {
+        "qty": "1",
+        "uom": "CS",
+        "_page": 1,
+        "unit_cost": "121.87000",
+        "item_number": "042823"
+      },
+      {
+        "qty": "6",
+        "uom": "BX",
+        "_page": 1,
+        "unit_cost": "17.14500",
+        "item_number": "1102538"
+      },
+      {
+        "qty": "6",
+        "uom": "BX",
+        "_page": 1,
+        "unit_cost": "17.93000",
+        "item_number": "750123"
+      },
+      {
+        "qty": "6",
+        "uom": "BX",
+        "_page": 1,
+        "unit_cost": "17.92666",
+        "item_number": "750124"
+      },
+      {
+        "qty": "6",
+        "uom": "BX",
+        "_page": 1,
+        "unit_cost": "17.92666",
+        "item_number": "750130"
+      },
+      {
+        "qty": 2,
+        "uom": "CS",
+        "_page": 2,
+        "unit_cost": 106.96,
+        "item_number": "759803"
+      },
+      {
+        "qty": 8,
+        "uom": "CS",
+        "_page": 2,
+        "unit_cost": 27.0,
+        "item_number": "760040"
+      },
+      {
+        "qty": 15,
+        "uom": "CS",
+        "_page": 2,
+        "unit_cost": 22.5,
+        "item_number": "760225"
+      },
+      {
+        "qty": 2,
+        "uom": "CS",
+        "_page": 2,
+        "unit_cost": 9.5,
+        "item_number": "760226"
+      },
+      {
+        "qty": 5,
+        "uom": "CS",
+        "_page": 2,
+        "unit_cost": 69.85,
+        "item_number": "760327"
+      },
+      {
+        "qty": 3,
+        "uom": "CS",
+        "_page": 2,
+        "unit_cost": 40.6,
+        "item_number": "770759"
+      },
+      {
+        "qty": 30,
+        "uom": "BX",
+        "_page": 2,
+        "unit_cost": 17.93,
+        "item_number": "770781"
+      },
+      {
+        "qty": 12,
+        "uom": "BX",
+        "_page": 3,
+        "unit_cost": 17.93,
+        "item_number": "770783"
+      },
+      {
+        "qty": 6,
+        "uom": "BX",
+        "_page": 3,
+        "unit_cost": 17.93,
+        "item_number": "770783"
+      },
+      {
+        "qty": 30,
+        "uom": "BX",
+        "_page": 3,
+        "unit_cost": 15.253,
+        "item_number": "770787"
+      },
+      {
+        "qty": 24,
+        "uom": "BX",
+        "_page": 3,
+        "unit_cost": 15.253,
+        "item_number": "770852"
+      },
+      {
+        "qty": 24,
+        "uom": "BX",
+        "_page": 3,
+        "unit_cost": 15.253,
+        "item_number": "770852"
+      },
+      {
+        "qty": 24,
+        "uom": "BX",
+        "_page": 3,
+        "unit_cost": 15.253,
+        "item_number": "770856"
+      }
+    ]
+  }
+}
