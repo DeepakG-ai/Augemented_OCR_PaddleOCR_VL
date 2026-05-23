@@ -134,6 +134,116 @@ def decrypt_api_key(encrypted: str) -> str:
 async def get_current_user(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+) -> dict:
+    """
+    Extract user strictly from Bearer header.
+    """
+    raw_token: str | None = None
+    if credentials and credentials.scheme.lower() == "bearer":
+        raw_token = credentials.credentials
+
+    if not raw_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    payload = decode_token(raw_token)
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Malformed token")
+
+    role = payload.get("role")
+    email = payload.get("email")
+    pool = getattr(request.app.state, "pool", None)
+    if pool is not None:
+        record = await db_mod.get_user_by_id(pool, user_id)
+        if not record or not record.get("is_active", True):
+            raise HTTPException(status_code=401, detail="User disabled or missing")
+        role = record.get("role")
+        email = record.get("email")
+
+    if not role:
+        raise HTTPException(status_code=401, detail="Malformed token")
+
+    return {"id": str(user_id), "role": role, "email": email}
+
+
+async def get_current_user_or_api_key(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    x_api_key: str | None = Header(None, alias="X-API-Key"),
+) -> dict:
+    """Dual auth: X-API-Key header OR JWT Bearer token strictly from header.
+
+    API keys resolve to the owning user, so all downstream vendor-isolation
+    logic works unchanged.
+    """
+    pool = getattr(request.app.state, "pool", None)
+
+    # ── API Key path ──────────────────────────────────────────────────
+    if x_api_key:
+        if not pool:
+            raise HTTPException(status_code=500, detail="Database pool unavailable")
+
+        hashed = hashlib.sha256(x_api_key.encode("utf-8")).hexdigest()
+        key_row = await db_mod.verify_api_key_hash(pool, hashed)
+
+        if not key_row or not key_row["is_active"]:
+            raise HTTPException(status_code=401, detail="Invalid or inactive API key")
+
+        user_id = key_row["user_id"]
+        record = await db_mod.get_user_by_id(pool, str(user_id))
+        if not record or not record.get("is_active", True):
+            raise HTTPException(status_code=401, detail="API key owner disabled")
+
+        # Fire-and-forget: update last_used_at
+        asyncio.ensure_future(db_mod.touch_api_key(pool, hashed))
+
+        return {
+            "id": str(user_id),
+            "role": record.get("role"),
+            "email": record.get("email"),
+            "auth_method": "api_key",
+            "api_key_id": key_row["id"],
+        }
+
+    # ── JWT path (fallback) ───────────────────────────────────────────
+    raw_token: str | None = None
+    if credentials and credentials.scheme.lower() == "bearer":
+        raw_token = credentials.credentials
+
+    if not raw_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    payload = decode_token(raw_token)
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Malformed token")
+
+    role = payload.get("role")
+    email = payload.get("email")
+    if pool is not None:
+        record = await db_mod.get_user_by_id(pool, user_id)
+        if not record or not record.get("is_active", True):
+            raise HTTPException(status_code=401, detail="User disabled or missing")
+        role = record.get("role")
+        email = record.get("email")
+
+    if not role:
+        raise HTTPException(status_code=401, detail="Malformed token")
+
+    return {"id": str(user_id), "role": role, "email": email, "auth_method": "jwt", "api_key_id": None}
+
+
+async def get_current_user_sse(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
     token: str | None = Query(None, description="Token for SSE/EventSource clients"),
 ) -> dict:
     """
@@ -172,80 +282,6 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="Malformed token")
 
     return {"id": str(user_id), "role": role, "email": email}
-
-
-async def get_current_user_or_api_key(
-    request: Request,
-    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
-    token: str | None = Query(None, description="Token for SSE/EventSource clients"),
-    x_api_key: str | None = Header(None, alias="X-API-Key"),
-) -> dict:
-    """Dual auth: X-API-Key header OR JWT Bearer token.
-
-    API keys resolve to the owning user, so all downstream vendor-isolation
-    logic works unchanged.
-    """
-    pool = getattr(request.app.state, "pool", None)
-
-    # ── API Key path ──────────────────────────────────────────────────
-    if x_api_key:
-        if not pool:
-            raise HTTPException(status_code=500, detail="Database pool unavailable")
-
-        hashed = hashlib.sha256(x_api_key.encode("utf-8")).hexdigest()
-        key_row = await db_mod.verify_api_key_hash(pool, hashed)
-
-        if not key_row or not key_row["is_active"]:
-            raise HTTPException(status_code=401, detail="Invalid or inactive API key")
-
-        user_id = key_row["user_id"]
-        record = await db_mod.get_user_by_id(pool, str(user_id))
-        if not record or not record.get("is_active", True):
-            raise HTTPException(status_code=401, detail="API key owner disabled")
-
-        # Fire-and-forget: update last_used_at
-        asyncio.ensure_future(db_mod.touch_api_key(pool, hashed))
-
-        return {
-            "id": str(user_id),
-            "role": record.get("role"),
-            "email": record.get("email"),
-            "auth_method": "api_key",
-            "api_key_id": key_row["id"],
-        }
-
-    # ── JWT path (fallback) ───────────────────────────────────────────
-    raw_token: str | None = None
-    if credentials and credentials.scheme.lower() == "bearer":
-        raw_token = credentials.credentials
-    elif token:
-        raw_token = token
-
-    if not raw_token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    payload = decode_token(raw_token)
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Malformed token")
-
-    role = payload.get("role")
-    email = payload.get("email")
-    if pool is not None:
-        record = await db_mod.get_user_by_id(pool, user_id)
-        if not record or not record.get("is_active", True):
-            raise HTTPException(status_code=401, detail="User disabled or missing")
-        role = record.get("role")
-        email = record.get("email")
-
-    if not role:
-        raise HTTPException(status_code=401, detail="Malformed token")
-
-    return {"id": str(user_id), "role": role, "email": email, "auth_method": "jwt", "api_key_id": None}
 
 
 async def require_admin(user: dict = Depends(get_current_user)) -> dict:

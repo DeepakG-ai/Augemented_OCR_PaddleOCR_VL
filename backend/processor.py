@@ -36,6 +36,19 @@ _FPDF_LCD_TEXT = 0x02
 _executor = ThreadPoolExecutor(max_workers=PDF_WORKERS)
 
 
+def count_pdf_pages(file_bytes: bytes) -> int:
+    """Return PDF page count without rendering. Raises ValueError on corrupt input."""
+    pdf = None
+    try:
+        pdf = pdfium.PdfDocument(file_bytes)
+        return len(pdf)
+    except Exception as exc:
+        raise ValueError(f"Could not open PDF to count pages: {exc}") from exc
+    finally:
+        if pdf is not None:
+            pdf.close()
+
+
 # ── Qwen3-VL dual-constraint resize ───────────────────────────────────────────
 
 def _resize_to_vlm_budget(img: Image.Image) -> Image.Image:

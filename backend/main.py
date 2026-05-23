@@ -11,6 +11,7 @@ import asyncio
 import base64
 import json
 import logging
+import hashlib
 import mimetypes
 import os
 import time
@@ -22,7 +23,7 @@ from typing import AsyncGenerator
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -48,6 +49,7 @@ from .auth import (
     generate_api_key,
     get_current_user,
     get_current_user_or_api_key,
+    get_current_user_sse,
     hash_password,
     require_admin,
     verify_password,
@@ -96,7 +98,7 @@ from .mlflow_tracing import (
     trace_paddle_ocr,
 )
 
-from .config import LLM_URL, LLM_MODEL, RATE_LIMIT_PER_MINUTE as RATE_LIMIT, MAX_UPLOAD_BYTES
+from .config import LLM_URL, LLM_MODEL, RATE_LIMIT_PER_MINUTE as RATE_LIMIT, MAX_UPLOAD_BYTES, MAX_DOCUMENT_PAGES
 from .config import DEFAULT_SUBSCRIPTION_LIMIT, SUBSCRIPTION_WARNING_THRESHOLD
 from .config import PIPELINE_LOG_DIR
 
@@ -162,65 +164,119 @@ async def _folder_ingest_callback(user_id: str, pdf_path: str) -> None:
         file_bytes = path.read_bytes()
         filename = path.name
 
+        # Hard page cap — same rule as /ingest/ui
+        if filename.lower().endswith(".pdf"):
+            try:
+                pdf_page_count = processor.count_pdf_pages(file_bytes)
+            except ValueError:
+                logger.warning("folder_ingest: unreadable PDF path=%s", pdf_path)
+                _broadcast_config_event(user_id, {
+                    "type": "folder_ingest_error",
+                    "path": pdf_path,
+                    "reason": "unreadable_pdf",
+                })
+                return
+            if pdf_page_count > MAX_DOCUMENT_PAGES:
+                logger.warning(
+                    "folder_ingest: PDF too large (%d pages, max %d) path=%s",
+                    pdf_page_count, MAX_DOCUMENT_PAGES, pdf_path,
+                )
+                _broadcast_config_event(user_id, {
+                    "type": "folder_ingest_error",
+                    "path": pdf_path,
+                    "reason": "document_too_large",
+                    "pages": pdf_page_count,
+                    "max_pages": MAX_DOCUMENT_PAGES,
+                })
+                return
+        else:
+            pdf_page_count = 1
+
+        # Quota reservation — atomic, same as /ingest/ui
+        quota = await db_mod.reserve_quota(pool, user_id, pdf_page_count)
+        if not quota["allowed"]:
+            logger.warning(
+                "folder_ingest: quota exceeded user=%s used=%d limit=%d incoming=%d",
+                user_id, quota["used"], quota["limit"], pdf_page_count,
+            )
+            _broadcast_config_event(user_id, {
+                "type": "folder_ingest_error",
+                "path": pdf_path,
+                "reason": "quota_exceeded",
+                "used": quota["used"],
+                "limit": quota["limit"],
+            })
+            return
+
         # Lazy imports to avoid circular import at module load time.
         from . import geometry as geo_mod
         from . import vendor_detector as vd_mod
         from . import ocr_runner as ocr_mod
 
-        # Render page 1 for vendor detection.
-        rendered = await render_page_1_for_detection(file_bytes, filename)
-        if not rendered:
-            logger.warning("folder_ingest: no pages rendered path=%s", pdf_path)
-            return
-        page1 = rendered[0]
-        page1_meta = {"page_number": 1, "width": page1.get("width", 0), "height": page1.get("height", 0)}
-        geo_pages = geo_mod.compute_pdf_geometry(file_bytes, [page1_meta])
-        page_words = (geo_pages[0].get("words", []) if geo_pages else [])
-        if not page_words:
-            ocr_pages = await ocr_mod.run_ocr_on_pages([{
-                "page_number": 1,
-                "image_b64": page1["image_b64"],
-                "mime_type": page1.get("mime_type", "image/jpeg"),
-            }])
-            page_words = ocr_pages[0].get("words", []) if ocr_pages else []
+        _job_submitted = False
+        try:
+            # Render page 1 for vendor detection.
+            rendered = await render_page_1_for_detection(file_bytes, filename)
+            if not rendered:
+                logger.warning("folder_ingest: no pages rendered path=%s", pdf_path)
+                return
+            page1 = rendered[0]
+            page1_meta = {"page_number": 1, "width": page1.get("width", 0), "height": page1.get("height", 0)}
+            geo_pages = geo_mod.compute_pdf_geometry(file_bytes, [page1_meta])
+            page_words = (geo_pages[0].get("words", []) if geo_pages else [])
+            if not page_words:
+                ocr_pages = await ocr_mod.run_ocr_on_pages([{
+                    "page_number": 1,
+                    "image_b64": page1["image_b64"],
+                    "mime_type": page1.get("mime_type", "image/jpeg"),
+                }])
+                page_words = ocr_pages[0].get("words", []) if ocr_pages else []
 
-        match = await vd_mod.detect_vendor(pool, page_words, user_id=user_id)
-        if match is None:
-            logger.warning("folder_ingest: vendor not detected path=%s user=%s", pdf_path, user_id)
-            _broadcast_config_event(user_id, {
-                "type": "folder_ingest_error",
-                "path": pdf_path,
-                "reason": "vendor_not_detected",
-            })
-            return
+            match = await vd_mod.detect_vendor(pool, page_words, user_id=user_id)
+            if match is None:
+                logger.warning("folder_ingest: vendor not detected path=%s user=%s", pdf_path, user_id)
+                _broadcast_config_event(user_id, {
+                    "type": "folder_ingest_error",
+                    "path": pdf_path,
+                    "reason": "vendor_not_detected",
+                })
+                return
 
-        tmpl = await db_mod.get_template(pool, match.vendor_id)
-        if not tmpl:
-            logger.warning("folder_ingest: no template for vendor=%s", match.vendor_id)
-            _broadcast_config_event(user_id, {
-                "type": "folder_ingest_error",
-                "path": pdf_path,
-                "reason": "no_template",
-                "vendor_id": match.vendor_id,
-            })
-            return
+            tmpl = await db_mod.get_template(pool, match.vendor_id)
+            if not tmpl:
+                logger.warning("folder_ingest: no template for vendor=%s", match.vendor_id)
+                _broadcast_config_event(user_id, {
+                    "type": "folder_ingest_error",
+                    "path": pdf_path,
+                    "reason": "no_template",
+                    "vendor_id": match.vendor_id,
+                })
+                return
 
-        # Whoever logins (owns the watcher), bill to them.
-        billing_user_id = user_id
+            # Whoever logins (owns the watcher), bill to them.
+            billing_user_id = user_id
 
-        result = await _submit_ingestion_job(
-            pool,
-            store,
-            file_bytes=file_bytes,
-            filename=filename,
-            vendor_id=match.vendor_id,
-            format_type=tmpl.get("format_type", "single_po_multipage"),
-            header_fields=list(tmpl.get("header_fields") or []),
-            line_item_fields=list(tmpl.get("line_item_fields") or []),
-            source_type="folder",
-            source_ref=pdf_path,
-            metadata={"billing_user_id": billing_user_id},
-        )
+            result = await _submit_ingestion_job(
+                pool,
+                store,
+                file_bytes=file_bytes,
+                filename=filename,
+                vendor_id=match.vendor_id,
+                format_type=tmpl.get("format_type", "single_po_multipage"),
+                header_fields=list(tmpl.get("header_fields") or []),
+                line_item_fields=list(tmpl.get("line_item_fields") or []),
+                source_type="folder",
+                source_ref=pdf_path,
+                metadata={"billing_user_id": billing_user_id},
+                reserved_pages=pdf_page_count,
+            )
+            _job_submitted = True
+        finally:
+            if not _job_submitted:
+                try:
+                    await db_mod.release_quota_reservation(pool, user_id, pdf_page_count)
+                except Exception:
+                    pass
         _broadcast_config_event(user_id, {
             "type": "folder_ingest_started",
             "path": pdf_path,
@@ -415,6 +471,7 @@ async def _submit_ingestion_job(
     source_ref: str | None = None,
     metadata: dict | None = None,
     trace_context: dict | None = None,
+    reserved_pages: int | None = None,
 ) -> dict:
     tmpl = await db_mod.get_template(pool, vendor_id)
     if not tmpl:
@@ -441,6 +498,8 @@ async def _submit_ingestion_job(
     mime_type = _guess_mime_type(filename)
     store.put_bytes(DOCUMENTS_BUCKET, object_key, file_bytes, mime_type)
     document_metadata = dict(metadata or {})
+    if reserved_pages:
+        document_metadata["reserved_pages"] = reserved_pages
     if trace_context:
         document_metadata["trace_context"] = trace_context
 
@@ -683,7 +742,11 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 # -- Health -----------------------------------------------------------------
 
-@app.get("/health", response_model=HealthOut)
+@app.get("/live")
+async def liveness():
+    return {"status": "ok"}
+
+@app.get("/health")
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def health(request: Request):
     try:
@@ -692,7 +755,9 @@ async def health(request: Request):
         db_status = "connected"
     except Exception:
         db_status = "disconnected"
-    return HealthOut(status="ok", db=db_status)
+    body = {"status": "ok" if db_status == "connected" else "error", "db": db_status}
+    return JSONResponse(status_code=200 if db_status == "connected" else 503, content=body)
+
 
 
 # -- Auth -------------------------------------------------------------------
@@ -1697,74 +1762,109 @@ async def ingest_document(
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail={"code": "INVALID_JSON_FIELD", "message": f"header_fields or line_item_fields is not valid JSON: {exc}"}) from exc
 
-    # -- Subscription quota check (soft limit) ---------------------------------
-    # Soft-limit model: the request that pushed usage to/past the limit was
-    # allowed through. Every subsequent request is blocked with 402 until an
-    # admin raises the limit. Admins are never subject to quota checks.
+    # -- Page count + hard cap -------------------------------------------------
+    if filename.lower().endswith(".pdf"):
+        try:
+            incoming_pages = processor.count_pdf_pages(file_bytes)
+        except ValueError:
+            raise HTTPException(400, detail="Could not read the uploaded PDF.")
+        if incoming_pages > MAX_DOCUMENT_PAGES:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "DOCUMENT_TOO_LARGE",
+                    "message": f"PDF has {incoming_pages} pages. Maximum allowed is {MAX_DOCUMENT_PAGES} pages.",
+                    "pages": incoming_pages,
+                    "max_pages": MAX_DOCUMENT_PAGES,
+                },
+            )
+    else:
+        incoming_pages = 1
+
+    # -- Subscription quota check (atomic reservation) -------------------------
+    # Admins are never subject to quota checks.
     usage_warning = None
     if user.get("role") != "admin":
         try:
-            usage_info = await db_mod.get_user_billable_pages(pool, user["id"])
-            u_used = usage_info["billable_pages"]
-            u_limit = usage_info["subscription_limit"]
-            u_remaining = usage_info["remaining"]
-            u_pct = u_used / max(u_limit, 1)
-            if u_used >= u_limit:
-                _user_record = await db_mod.get_user_by_id(pool, user["id"])
-                page_logger.log_limit_alert(
-                    user_id=user["id"],
-                    email=(_user_record or {}).get("email"),
-                    total_extracted_pages=u_used,
-                    subscription_limit=u_limit,
-                    alert_type="exceeded",
-                    filename=filename,
-                )
-                overage = u_used - u_limit
-                raise HTTPException(
-                    status_code=402,
-                    detail={
-                        "code": "QUOTA_EXCEEDED",
-                        "message": (
-                            f"Page limit exceeded. "
-                            f"Subscription: {u_limit} pages, "
-                            f"Extracted: {u_used} pages, "
-                            f"Overage: {overage} pages. "
-                            "Contact your administrator to increase your limit."
-                        ),
-                        "subscription_limit": u_limit,
-                        "total_extracted_pages": u_used,
-                        "overage": overage,
-                    },
-                )
-            elif u_pct >= SUBSCRIPTION_WARNING_THRESHOLD:
-                usage_warning = {
-                    "level": "warning",
-                    "message": (
-                        f"You have used {u_used} of {u_limit} pages "
-                        f"({round(u_pct * 100, 1)}%). "
-                        f"Only {u_remaining} pages remaining."
-                    ),
-                    "subscription_limit": u_limit,
-                    "total_extracted_pages": u_used,
-                    "remaining": u_remaining,
-                }
-                _user_record = await db_mod.get_user_by_id(pool, user["id"])
-                page_logger.log_limit_alert(
-                    user_id=user["id"],
-                    email=(_user_record or {}).get("email"),
-                    total_extracted_pages=u_used,
-                    subscription_limit=u_limit,
-                    alert_type="warning",
-                    filename=filename,
-                )
-        except HTTPException:
-            raise
+            quota = await db_mod.reserve_quota(pool, user["id"], incoming_pages)
         except Exception as usage_exc:
             logger.error("Subscription quota check failed — blocking upload: %s", usage_exc)
             raise HTTPException(
                 status_code=503,
                 detail="Service temporarily unavailable. Please retry.",
             )
+        if not quota["allowed"]:
+            _user_record = await db_mod.get_user_by_id(pool, user["id"])
+            page_logger.log_limit_alert(
+                user_id=user["id"],
+                email=(_user_record or {}).get("email"),
+                total_extracted_pages=quota["used"],
+                subscription_limit=quota["limit"],
+                alert_type="exceeded",
+                filename=filename,
+            )
+            overage = max(quota["used"] - quota["limit"], 0)
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "code": "QUOTA_EXCEEDED",
+                    "message": (
+                        f"Uploading this document ({incoming_pages} pages) would exceed your "
+                        f"subscription limit of {quota['limit']} pages. "
+                        f"You have {quota['remaining']} pages remaining. "
+                        "Contact your administrator to increase your limit."
+                    ),
+                    "subscription_limit": quota["limit"],
+                    "total_extracted_pages": quota["used"],
+                    "incoming_pages": incoming_pages,
+                    "remaining": quota["remaining"],
+                    "overage": overage,
+                },
+            )
+        # Set warning if near threshold or grace overage
+        u_pct = quota["used"] / max(quota["limit"], 1)
+        if quota["reason"] == "grace":
+            _user_record = await db_mod.get_user_by_id(pool, user["id"])
+            page_logger.log_limit_alert(
+                user_id=user["id"],
+                email=(_user_record or {}).get("email"),
+                total_extracted_pages=quota["used"],
+                subscription_limit=quota["limit"],
+                alert_type="small_overage",
+                filename=filename,
+            )
+            usage_warning = {
+                "level": "warning",
+                "message": (
+                    f"This upload ({incoming_pages} pages) slightly exceeds your remaining "
+                    f"quota ({quota['remaining']} pages). It has been allowed as a small overage."
+                ),
+                "subscription_limit": quota["limit"],
+                "total_extracted_pages": quota["used"],
+                "incoming_pages": incoming_pages,
+                "remaining": quota["remaining"],
+            }
+        elif u_pct >= SUBSCRIPTION_WARNING_THRESHOLD:
+            _user_record = await db_mod.get_user_by_id(pool, user["id"])
+            page_logger.log_limit_alert(
+                user_id=user["id"],
+                email=(_user_record or {}).get("email"),
+                total_extracted_pages=quota["used"],
+                subscription_limit=quota["limit"],
+                alert_type="warning",
+                filename=filename,
+            )
+            usage_warning = {
+                "level": "warning",
+                "message": (
+                    f"You have used {quota['used']} of {quota['limit']} pages "
+                    f"({round(u_pct * 100, 1)}%). "
+                    f"Only {quota['remaining']} pages remaining."
+                ),
+                "subscription_limit": quota["limit"],
+                "total_extracted_pages": quota["used"],
+                "remaining": quota["remaining"],
+            }
 
     logger.info("File received: %s (%d bytes, source=%s, vendor=%s)",
                 filename, len(file_bytes), source_type, vendor_id)
@@ -1797,6 +1897,11 @@ async def ingest_document(
 
                 if not rendered:
                     logger.warning("Vendor detection failed: no rendered pages")
+                    if user.get("role") != "admin":
+                        try:
+                            await db_mod.release_quota_reservation(pool, user["id"], incoming_pages)
+                        except Exception:
+                            pass
                     raise HTTPException(400, detail="Could not render any pages from the uploaded file")
 
                 page1 = rendered[0]
@@ -1877,6 +1982,11 @@ async def ingest_document(
                         "status": "blocked_unknown_vendor",
                         "errors": None,
                     })
+                    if user.get("role") != "admin":
+                        try:
+                            await db_mod.release_quota_reservation(pool, user["id"], incoming_pages)
+                        except Exception:
+                            pass
                     raise HTTPException(
                         status_code=409,
                         detail={
@@ -1909,20 +2019,29 @@ async def ingest_document(
         # Whoever logins, bill to them.
         billing_user_id = user["id"]
 
-        submitted = await _submit_ingestion_job(
-            pool,
-            request.app.state.store,
-            file_bytes=file_bytes,
-            filename=filename,
-            vendor_id=vendor_id,
-            format_type=format_type,
-            header_fields=req_header,
-            line_item_fields=req_items,
-            source_type=source_type,
-            source_ref=source_ref,
-            trace_context=trace_context,
-            metadata={"billing_user_id": billing_user_id} if billing_user_id else None,
-        )
+        try:
+            submitted = await _submit_ingestion_job(
+                pool,
+                request.app.state.store,
+                file_bytes=file_bytes,
+                filename=filename,
+                vendor_id=vendor_id,
+                format_type=format_type,
+                header_fields=req_header,
+                line_item_fields=req_items,
+                source_type=source_type,
+                source_ref=source_ref,
+                trace_context=trace_context,
+                metadata={"billing_user_id": billing_user_id} if billing_user_id else None,
+                reserved_pages=incoming_pages if user.get("role") != "admin" else None,
+            )
+        except Exception:
+            if user.get("role") != "admin":
+                try:
+                    await db_mod.release_quota_reservation(pool, user["id"], incoming_pages)
+                except Exception:
+                    pass
+            raise
         resp = ExtractionJobStartOut(
             job_id=submitted["job"]["id"],
             extraction_id=submitted["extraction"]["id"],
@@ -1971,7 +2090,7 @@ async def get_job_status(request: Request, job_id: int, user: dict = Depends(get
 
 @app.get("/jobs/{job_id}/stream")
 async def stream_job_status_sse(
-    request: Request, job_id: int, user: dict = Depends(get_current_user),
+    request: Request, job_id: int, user: dict = Depends(get_current_user_sse),
 ):
     """SSE stream for real-time job progress.
 
@@ -2092,6 +2211,16 @@ async def request_job_cancel(
     extraction = await db_mod.get_extraction(pool, extraction_id)
     if not extraction:
         raise HTTPException(404, detail="Extraction not found")
+    _TERMINAL = {"done", "failed", "partial", "cancelled"}
+    if extraction["status"] in _TERMINAL:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "CONFLICT",
+                "message": f"Cannot cancel extraction in terminal state '{extraction['status']}'",
+                "current_status": extraction["status"],
+            }
+        )
     await db_mod.set_cancel_requested(pool, extraction_id, True)
     cancel_counts = await db_mod.cancel_jobs_for_extraction(pool, extraction_id)
     has_running_work = cancel_counts.get("cancelling", 0) > 0
@@ -3092,7 +3221,7 @@ async def update_my_config(request: Request, user: dict = Depends(get_current_us
 
 
 @app.get("/api/config/stream")
-async def config_sse_stream(request: Request, user: dict = Depends(get_current_user)):
+async def config_sse_stream(request: Request, user: dict = Depends(get_current_user_sse)):
     """SSE stream — pushes config_updated and folder_ingest_* events to this user."""
     uid = user["id"]
     queue: asyncio.Queue = asyncio.Queue(maxsize=64)
@@ -3470,14 +3599,15 @@ async def extract_via_api_key(
     request: Request,
     file: UploadFile = File(...),
     vendor_id: str | None = Form(None),
+    async_mode: bool = Query(False, alias="async"),
     user: dict = Depends(get_current_user_or_api_key),
 ):
-    """Synchronous PDF extraction endpoint for programmatic (API-key) clients.
+    """Synchronous/Asynchronous PDF extraction endpoint for programmatic (API-key) clients.
 
     Accepts a PDF via multipart form upload. Detects vendor from the API key
     owner's vendor aliases, loads their template, runs the full pipeline
     (render -> OCR -> Qwen3-VL -> normalize), records usage, and returns
-    structured JSON.
+    structured JSON. Supports idempotency via Idempotency-Key header.
 
     Authentication: X-API-Key header or JWT Bearer token.
     """
@@ -3487,95 +3617,235 @@ async def extract_via_api_key(
     file_bytes = await file.read()
     filename = file.filename or "unknown.pdf"
 
-    # -- Subscription quota check (same as /ingest) ----------------------------
-    if user.get("role") != "admin":
-        try:
-            usage_info = await db_mod.get_user_billable_pages(pool, user["id"])
-            u_used = usage_info["billable_pages"]
-            u_limit = usage_info["subscription_limit"]
-            if u_used >= u_limit:
+    # Compute file hash
+    file_sha256 = hashlib.sha256(file_bytes).hexdigest()
+    idempotency_key = request.headers.get("Idempotency-Key")
+
+    claim = None
+    extraction_id = None
+
+    if idempotency_key:
+        claim = await db_mod.claim_idempotency(pool, user["id"], idempotency_key, file_sha256)
+        if claim["status"] == "conflict":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "CONFLICT",
+                    "message": "Idempotency key conflict: same key used with different payload/file.",
+                }
+            )
+        elif claim["status"] == "duplicate":
+            extraction_id = claim["extraction_id"]
+            ext_status = claim["extraction_status"]
+
+            if extraction_id is None or ext_status is None:
+                # First request is still in-flight (claim exists but extraction not yet bound).
+                # Return 202 so the caller retries rather than creating a duplicate extraction.
+                return JSONResponse(
+                    status_code=202,
+                    content={
+                        "status": "initializing",
+                        "message": "Original request is still creating the extraction. Retry shortly.",
+                        "retry_after_seconds": 2,
+                    },
+                    headers={"Retry-After": "2"},
+                )
+
+            if ext_status in ("failed", "cancelled"):
+                # Terminal failure — evict and re-run as fresh
+                await db_mod.delete_idempotency_claim(pool, user["id"], idempotency_key)
+                claim = await db_mod.claim_idempotency(pool, user["id"], idempotency_key, file_sha256)
+                extraction_id = None
+            else:
+                # Active or complete duplicate
+                if ext_status in ("done", "complete", "partial"):
+                    # Return cached result
+                    extraction = await db_mod.get_extraction(pool, extraction_id)
+                    if not extraction:
+                        raise HTTPException(500, detail="Extraction record missing")
+                    mapped_result = await db_mod.get_extraction_mapped_result(pool, extraction_id)
+                    mapping_applied = mapped_result is not None
+                    return {
+                        "extraction_id": extraction_id,
+                        "vendor_id": extraction.get("vendor_id"),
+                        "pages": extraction.get("total_pages", 0),
+                        "duration_ms": extraction.get("duration_ms"),
+                        "mapping_applied": mapping_applied,
+                        "completed_at": extraction.get("updated_at").isoformat() if extraction.get("updated_at") else datetime.now(UTC).isoformat(),
+                        "result": mapped_result if mapping_applied else extraction.get("result"),
+                        "cached": True,
+                    }
+                else:
+                    # Active: queued or processing or cancelling
+                    if async_mode:
+                        return JSONResponse(
+                            status_code=202,
+                            content={
+                                "status": ext_status,
+                                "extraction_id": extraction_id,
+                                "status_url": f"/extractions/{extraction_id}",
+                            }
+                        )
+                    # For sync_mode, we skip submitting job and proceed directly to polling
+
+    if extraction_id is None:
+        # -- Page count + hard cap -------------------------------------------------
+        if filename.lower().endswith(".pdf"):
+            try:
+                incoming_pages = processor.count_pdf_pages(file_bytes)
+            except ValueError:
+                raise HTTPException(400, detail="Could not read the uploaded PDF.")
+            if incoming_pages > MAX_DOCUMENT_PAGES:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "DOCUMENT_TOO_LARGE",
+                        "message": f"PDF has {incoming_pages} pages. Maximum allowed is {MAX_DOCUMENT_PAGES} pages.",
+                        "pages": incoming_pages,
+                        "max_pages": MAX_DOCUMENT_PAGES,
+                    },
+                )
+        else:
+            incoming_pages = 1
+
+        # -- Subscription quota check (atomic reservation) -------------------------
+        if user.get("role") != "admin":
+            try:
+                quota = await db_mod.reserve_quota(pool, user["id"], incoming_pages)
+            except Exception as usage_exc:
+                logger.error("Subscription quota check failed: %s", usage_exc)
+                raise HTTPException(503, detail="Service temporarily unavailable. Please retry.")
+            if not quota["allowed"]:
                 raise HTTPException(
                     status_code=402,
                     detail={
                         "code": "QUOTA_EXCEEDED",
-                        "message": f"Page quota exceeded. Used {u_used} of {u_limit} pages.",
-                        "subscription_limit": u_limit,
-                        "total_extracted_pages": u_used,
+                        "message": (
+                            f"Uploading this document ({incoming_pages} pages) would exceed your "
+                            f"subscription limit of {quota['limit']} pages. "
+                            f"You have {quota['remaining']} pages remaining."
+                        ),
+                        "subscription_limit": quota["limit"],
+                        "total_extracted_pages": quota["used"],
+                        "incoming_pages": incoming_pages,
+                        "remaining": quota["remaining"],
                     },
                 )
-        except HTTPException:
-            raise
-        except Exception as usage_exc:
-            logger.error("Subscription quota check failed: %s", usage_exc)
-            raise HTTPException(503, detail="Service temporarily unavailable. Please retry.")
 
-    logger.info("[v1/extract] File received: %s (%d bytes, auth=%s, user=%s)",
-                filename, len(file_bytes), user.get("auth_method"), user.get("email"))
+        _job_submitted = False
+        try:
+            logger.info("[v1/extract] File received: %s (%d bytes, auth=%s, user=%s)",
+                        filename, len(file_bytes), user.get("auth_method"), user.get("email"))
 
-    # -- Vendor detection (scoped to API key owner) ----------------------------
-    if not vendor_id:
-        from . import geometry as _geo
-        from . import vendor_detector as _vd
-        from . import ocr_runner as _ocr
+            # -- Vendor detection (scoped to API key owner) ----------------------------
+            if not vendor_id:
+                from . import geometry as _geo
+                from . import vendor_detector as _vd
+                from . import ocr_runner as _ocr
 
-        # Render page 1 only for detection
-        rendered = await render_page_1_for_detection(file_bytes, filename)
+                # Render page 1 only for detection
+                rendered = await render_page_1_for_detection(file_bytes, filename)
 
-        if not rendered:
-            raise HTTPException(400, detail="Could not render any pages from the uploaded file")
+                if not rendered:
+                    raise HTTPException(400, detail="Could not render any pages from the uploaded file")
 
-        page1 = rendered[0]
-        page1_meta = {"page_number": 1, "width": page1.get("width", 0), "height": page1.get("height", 0)}
+                page1 = rendered[0]
+                page1_meta = {"page_number": 1, "width": page1.get("width", 0), "height": page1.get("height", 0)}
 
-        # Digital-first text extraction
-        page_words = []
-        if filename.lower().endswith(".pdf"):
-            geo_pages = _geo.compute_pdf_geometry(file_bytes, [page1_meta])
-            page_words = geo_pages[0].get("words", []) if geo_pages else []
+                # Digital-first text extraction
+                page_words = []
+                if filename.lower().endswith(".pdf"):
+                    geo_pages = _geo.compute_pdf_geometry(file_bytes, [page1_meta])
+                    page_words = geo_pages[0].get("words", []) if geo_pages else []
 
-        # PaddleOCR fallback
-        if not page_words:
-            ocr_pages = await _ocr.run_ocr_on_pages([{
-                "page_number": 1,
-                "image_b64": page1["image_b64"],
-                "mime_type": page1.get("mime_type", "image/jpeg"),
-            }])
-            page_words = ocr_pages[0].get("words", []) if ocr_pages else []
+                # PaddleOCR fallback
+                if not page_words:
+                    ocr_pages = await _ocr.run_ocr_on_pages([{
+                        "page_number": 1,
+                        "image_b64": page1["image_b64"],
+                        "mime_type": page1.get("mime_type", "image/jpeg"),
+                    }])
+                    page_words = ocr_pages[0].get("words", []) if ocr_pages else []
 
-        # Always scope to this user's vendors
-        detect_uid = user["id"]
-        match = await _vd.detect_vendor(pool, page_words, user_id=detect_uid)
-        if match is None:
-            raise HTTPException(
-                status_code=400,
-                detail="No vendor template found for this document. Please create a vendor and template first.",
+                # Always scope to this user's vendors
+                detect_uid = user["id"]
+                match = await _vd.detect_vendor(pool, page_words, user_id=detect_uid)
+                if match is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="No vendor template found for this document. Please create a vendor and template first.",
+                    )
+                vendor_id = match.vendor_id
+
+            # Enforce ownership
+            await assert_vendor_access(pool, vendor_id, user)
+
+            # -- Ingestion metadata including hash/key
+            doc_metadata = {
+                "billing_user_id": user["id"],
+                "auth_method": user.get("auth_method"),
+                "api_key_id": user.get("api_key_id"),
+            }
+            if idempotency_key:
+                doc_metadata["idempotency_key"] = idempotency_key
+                doc_metadata["file_sha256"] = file_sha256
+
+            # -- Submit to the existing ingestion pipeline (async job) -----------------
+            submitted = await _submit_ingestion_job(
+                pool,
+                store,
+                file_bytes=file_bytes,
+                filename=filename,
+                vendor_id=vendor_id,
+                format_type=None,       # always defer to template
+                header_fields=[],
+                line_item_fields=[],
+                source_type="rest",
+                source_ref=f"api_key:{user.get('api_key_id', 'jwt')}",
+                metadata=doc_metadata,
+                reserved_pages=incoming_pages if user.get("role") != "admin" else None,
             )
-        vendor_id = match.vendor_id
+            _job_submitted = True
 
-    # Enforce ownership
-    await assert_vendor_access(pool, vendor_id, user)
+            extraction_id = submitted["extraction"]["id"]
+            document_id = submitted["extraction"].get("document_id")
 
-    # -- Submit to the existing ingestion pipeline (async job) -----------------
-    submitted = await _submit_ingestion_job(
-        pool,
-        store,
-        file_bytes=file_bytes,
-        filename=filename,
-        vendor_id=vendor_id,
-        format_type=None,       # always defer to template
-        header_fields=[],
-        line_item_fields=[],
-        source_type="rest",
-        source_ref=f"api_key:{user.get('api_key_id', 'jwt')}",
-        metadata={"billing_user_id": user["id"], "auth_method": user.get("auth_method"), "api_key_id": user.get("api_key_id")},
-    )
+            if claim and claim.get("claim_id"):
+                await db_mod.bind_idempotency_claim(pool, claim["claim_id"], extraction_id, document_id)
 
-    job_id = submitted["job"]["id"]
-    extraction_id = submitted["extraction"]["id"]
+            if async_mode:
+                return JSONResponse(
+                    status_code=202,
+                    content={
+                        "status": "queued",
+                        "extraction_id": extraction_id,
+                        "status_url": f"/extractions/{extraction_id}",
+                    }
+                )
+        except Exception:
+            if user.get("role") != "admin" and not _job_submitted:
+                try:
+                    await db_mod.release_quota_reservation(pool, user["id"], incoming_pages)
+                except Exception:
+                    pass
+            raise
 
-    # -- Poll for completion (synchronous wait, max ~5 min) --------------------
+    # -- Poll for completion (synchronous wait, scales with page count) ---------
     import asyncio as _aio
-    max_wait = 300  # seconds
+    # Fetch total pages for wait calculation if fresh run
+    extraction_record = await db_mod.get_extraction(pool, extraction_id)
+    total_pages = extraction_record.get("total_pages") if extraction_record else 1
+    # Fallback to incoming_pages if total_pages is not populated yet
+    if not total_pages or total_pages == 0:
+        if filename.lower().endswith(".pdf"):
+            try:
+                total_pages = processor.count_pdf_pages(file_bytes)
+            except Exception:
+                total_pages = 1
+        else:
+            total_pages = 1
+
+    max_wait = 480 if total_pages >= 20 else 300
     poll_interval = 1.0  # seconds
     elapsed = 0.0
 
@@ -3584,7 +3854,8 @@ async def extract_via_api_key(
         if not extraction:
             break
         ext_status = extraction.get("status", "")
-        if ext_status in ("done", "complete", "failed", "cancelled"):
+        # partial is terminal for this poll check
+        if ext_status in ("done", "complete", "failed", "cancelled", "partial"):
             break
         await _aio.sleep(poll_interval)
         elapsed += poll_interval
@@ -3604,12 +3875,13 @@ async def extract_via_api_key(
                 "extraction_id": extraction_id,
             },
         )
-    if ext_status not in ("done", "complete"):
+    # partial is a valid terminal state now
+    if ext_status not in ("done", "complete", "partial"):
         raise HTTPException(
             status_code=504,
             detail={
                 "code": "EXTRACTION_TIMEOUT",
-                "message": "Extraction did not complete within 5 minutes. Try again later.",
+                "message": f"Extraction did not complete within {max_wait} seconds. Try again later.",
                 "extraction_id": extraction_id,
                 "status": ext_status,
             },
@@ -3625,7 +3897,7 @@ async def extract_via_api_key(
         "pages": extraction.get("total_pages", 0),
         "duration_ms": extraction.get("duration_ms"),
         "mapping_applied": mapping_applied,
-        "completed_at": datetime.now(UTC).isoformat(),
+        "completed_at": extraction.get("updated_at").isoformat() if extraction.get("updated_at") else datetime.now(UTC).isoformat(),
         "result": mapped_result if mapping_applied else extraction.get("result"),
     }
 

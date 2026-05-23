@@ -154,6 +154,19 @@ async def _stop_if_cancelled(pool, extraction_id: int, stage: str, message: str)
         status,
         progress={"stage": stage, "message": message},
     )
+    try:
+        doc = await db_mod.get_document(pool, extraction_row.get("document_id"))
+        billing_uid = ((doc or {}).get("metadata") or {}).get("billing_user_id") if doc else None
+        if billing_uid:
+            total_pages = (
+                extraction_row.get("total_pages")
+                or ((doc or {}).get("metadata") or {}).get("reserved_pages")
+                or 0
+            )
+            if total_pages:
+                await db_mod.release_quota_reservation(pool, billing_uid, total_pages)
+    except Exception as exc:
+        logger.warning("quota release failed (cancel) ext=%s: %s", extraction_id, exc)
     return True
 
 
@@ -336,6 +349,7 @@ async def _process_normalize(pool, job: dict) -> None:
             ],
         }
     await db_mod.set_total_pages(pool, extraction_id, len(page_rows))
+
     await db_mod.update_extraction_progress(
         pool,
         extraction_id,
@@ -797,7 +811,8 @@ async def _process_postprocess(pool, job: dict) -> None:
     extraction_row = await db_mod.get_extraction(pool, extraction_id)
     if not extraction_row:
         raise ValueError("Extraction not found for postprocess job")
-    base = _pipeline_base(extraction=extraction_row, job=job)
+    document = await db_mod.get_document(pool, extraction_row.get("document_id") or job.get("document_id"))
+    base = _pipeline_base(extraction=extraction_row, document=document, job=job)
     logger.info("── POSTPROCESS started ── ext=%s", extraction_id)
 
     result = extraction_row.get("result")
@@ -956,6 +971,12 @@ async def _process_postprocess(pool, job: dict) -> None:
         "done",
         progress={"stage": "postprocess", "message": "Field mapping complete"},
     )
+    billing_uid = base.get("billing_user_id")
+    if billing_uid:
+        try:
+            await db_mod.release_quota_reservation(pool, billing_uid, extraction_row.get("total_pages") or 0)
+        except Exception as _rel_exc:
+            logger.warning("quota release failed ext=%s: %s", extraction_id, _rel_exc)
     try:
         tok = await db_mod.get_extraction_token_totals(pool, extraction_id)
         _final = await db_mod.get_extraction(pool, extraction_id) or extraction_row
@@ -1177,6 +1198,19 @@ async def run_worker(stage: str, worker_name: str) -> None:
                         )
                     except Exception:
                         logger.exception("worker: failure summary failed")
+                    try:
+                        _fr_doc = await db_mod.get_document(pool, (_fr or {}).get("document_id")) if _fr else None
+                        _billing = ((_fr_doc or {}).get("metadata") or {}).get("billing_user_id") if _fr_doc else None
+                        if _billing:
+                            _pages = (
+                                (_fr or {}).get("total_pages")
+                                or ((_fr_doc or {}).get("metadata") or {}).get("reserved_pages")
+                                or 0
+                            )
+                            if _pages:
+                                await db_mod.release_quota_reservation(pool, _billing, _pages)
+                    except Exception as _q_exc:
+                        logger.warning("quota release failed (fail) ext=%s: %s", job.get("extraction_id"), _q_exc)
                 await db_mod.fail_job(pool, job["id"], str(exc), retryable=False)
     finally:
         await pool.close()

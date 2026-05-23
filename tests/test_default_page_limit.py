@@ -42,6 +42,20 @@ def _client(uid: str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa") -> dict:
     return {"id": uid, "role": "client", "email": f"{uid}@test"}
 
 
+def _quota_result(used: int, limit: int, incoming: int = 1, grace_pages: int = 10) -> dict:
+    """Build a reserve_quota() response for mocking."""
+    remaining = max(limit - used, 0)
+    would_exceed = (used + incoming) > limit
+    if not would_exceed:
+        reason, allowed = "ok", True
+    elif used < limit and incoming <= grace_pages:
+        reason, allowed = "grace", True
+    else:
+        reason, allowed = "exceeded", False
+    return {"allowed": allowed, "reason": reason, "used": used, "limit": limit,
+            "remaining": remaining, "pending": 0}
+
+
 def _created_user_row(
     uid: str = "new-user-uuid",
     email: str = "newuser@test.com",
@@ -267,6 +281,9 @@ class ZeroLimitUserBlockedTests(unittest.TestCase):
         )
         _sched.start()
         self.addCleanup(_sched.stop)
+        _pages = patch.object(main.processor, "count_pdf_pages", return_value=1)
+        _pages.start()
+        self.addCleanup(_pages.stop)
 
     def tearDown(self):
         main.app.dependency_overrides[get_current_user] = _admin
@@ -274,8 +291,8 @@ class ZeroLimitUserBlockedTests(unittest.TestCase):
     def test_ingest_ui_blocked_for_zero_limit_user(self) -> None:
         """POST /ingest/ui → 402 for a fresh user (limit=0, used=0)."""
         main.app.dependency_overrides[get_current_user] = lambda: _client()
-        with patch.object(main.db_mod, "get_user_billable_pages",
-                          new=AsyncMock(return_value=_usage(0, 0))), \
+        with patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(0, 0))), \
              patch.object(main.db_mod, "get_user_by_id",
                           new=AsyncMock(return_value={"email": "fresh@test.com"})):
             r = self.client.post(
@@ -304,8 +321,8 @@ class ZeroLimitUserBlockedTests(unittest.TestCase):
     def test_402_detail_says_limit_zero(self) -> None:
         """The 402 body must show subscription_limit=0, not 1000."""
         main.app.dependency_overrides[get_current_user] = lambda: _client()
-        with patch.object(main.db_mod, "get_user_billable_pages",
-                          new=AsyncMock(return_value=_usage(0, 0))), \
+        with patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(0, 0))), \
              patch.object(main.db_mod, "get_user_by_id",
                           new=AsyncMock(return_value={"email": "fresh@test.com"})):
             r = self.client.post(
@@ -320,8 +337,8 @@ class ZeroLimitUserBlockedTests(unittest.TestCase):
     def test_admin_bypasses_zero_limit(self) -> None:
         """Admin role is never subject to quota, even with limit=0."""
         main.app.dependency_overrides[get_current_user] = _admin
-        with patch.object(main.db_mod, "get_user_billable_pages",
-                          new=AsyncMock(return_value=_usage(0, 0))) as mock_check, \
+        with patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(0, 0))) as mock_quota, \
              patch.object(main, "_submit_ingestion_job",
                           new=AsyncMock(return_value={
                               "job": {"id": 1, "status": "queued"},
@@ -333,7 +350,7 @@ class ZeroLimitUserBlockedTests(unittest.TestCase):
                 files={"file": ("doc.pdf", b"%PDF-fake", "application/pdf")},
                 data={"vendor_id": "acme"},
             )
-        mock_check.assert_not_called()
+        mock_quota.assert_not_called()
         self.assertNotEqual(r.status_code, 402)
 
 

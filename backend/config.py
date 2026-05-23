@@ -66,6 +66,7 @@ WORKER_POLL_SECONDS = _env_float("WORKER_POLL_SECONDS", 1.0)
 RATE_LIMIT_PER_MINUTE = os.getenv("RATE_LIMIT_PER_MINUTE", "30")
 MAX_UPLOAD_MB         = _env_int("MAX_UPLOAD_MB", 50)
 MAX_UPLOAD_BYTES      = MAX_UPLOAD_MB * 1024 * 1024
+MAX_DOCUMENT_PAGES    = _env_int("MAX_DOCUMENT_PAGES", 100)
 
 # ---------------------------------------------------------------------------
 # PDF / image processing

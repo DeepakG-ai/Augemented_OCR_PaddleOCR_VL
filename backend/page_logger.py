@@ -6,7 +6,6 @@ Never raises — billing log failures must not crash the pipeline.
 """
 from __future__ import annotations
 
-import atexit
 import logging
 import os
 import threading
@@ -18,7 +17,39 @@ _LOG_PATH = os.environ.get(
     "PAGE_USAGE_LOG_PATH",
     os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs", "page_usage", "log.txt"),
 )
-# Shared process locking and dynamic file-append handles for cross-process compatibility
+
+_ALERTS_LOG_PATH = os.environ.get(
+    "PAGE_ALERTS_LOG_PATH",
+    os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs", "page_usage", "alerts.log"),
+)
+
+# Persistent open handles — created on first use, reused on subsequent calls.
+# Tests reset these to None in setUp to force re-open against a temp path.
+_log_file = None
+_alerts_file = None
+_handle_lock = threading.Lock()
+
+
+def _get_log_file():
+    """Return the persistent append handle for the usage log, opening it on first call."""
+    global _log_file
+    if _log_file is None or _log_file.closed:
+        with _handle_lock:
+            if _log_file is None or _log_file.closed:
+                os.makedirs(os.path.dirname(_LOG_PATH), exist_ok=True)
+                _log_file = open(_LOG_PATH, "a", encoding="utf-8", buffering=1)
+    return _log_file
+
+
+def _get_alerts_file():
+    """Return the persistent append handle for the alerts log, opening it on first call."""
+    global _alerts_file
+    if _alerts_file is None or _alerts_file.closed:
+        with _handle_lock:
+            if _alerts_file is None or _alerts_file.closed:
+                os.makedirs(os.path.dirname(_ALERTS_LOG_PATH), exist_ok=True)
+                _alerts_file = open(_ALERTS_LOG_PATH, "a", encoding="utf-8", buffering=1)
+    return _alerts_file
 
 
 def _fmt_value(value) -> str:
@@ -89,42 +120,11 @@ def append_log(record: dict) -> None:
     try:
         record.setdefault("ts", datetime.now(timezone.utc).isoformat())
         line = _format_record(record, prefix="PAGE_USAGE") + "\n"
-        os.makedirs(os.path.dirname(_LOG_PATH), exist_ok=True)
-        with open(_LOG_PATH, "a", encoding="utf-8") as f:
-            try:
-                import fcntl
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            except ImportError:
-                try:
-                    import msvcrt
-                    f.seek(0)
-                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
-                except (ImportError, OSError):
-                    pass
-            
-            f.write(line)
-            f.flush()
-            
-            try:
-                import fcntl
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            except ImportError:
-                try:
-                    import msvcrt
-                    f.seek(0)
-                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
-                except (ImportError, OSError):
-                    pass
+        f = _get_log_file()
+        f.write(line)
+        f.flush()
     except Exception as exc:
         logger.warning("page_logger: failed to write usage log: %s", exc)
-
-
-# -- Subscription alerts log -----------------------------------------------
-
-_ALERTS_LOG_PATH = os.environ.get(
-    "PAGE_ALERTS_LOG_PATH",
-    os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs", "page_usage", "alerts.log"),
-)
 
 
 def log_limit_alert(
@@ -137,16 +137,9 @@ def log_limit_alert(
     extraction_id: int | None = None,
     filename: str | None = None,
 ) -> None:
-    """Append one human-readable line to the alerts log when a user hits or nears their limit.
+    """Append one line to the alerts log when a user hits or nears their limit.
 
-    alert_type:
-        - 'warning'  — user is above the warning threshold (e.g. 90%) but not yet blocked
-        - 'exceeded' — user is already over their limit and this upload was blocked
-
-    overage = subscription_limit - total_extracted_pages
-        negative → over limit (e.g. -3 means 3 pages over)
-        positive → pages still available
-
+    alert_type: 'warning' | 'exceeded' | 'small_overage'
     Never raises — billing alerts must not crash the pipeline.
     """
     try:
@@ -164,32 +157,8 @@ def log_limit_alert(
         if extraction_id is not None:
             record["extraction_id"] = extraction_id
         line = _format_record(record, prefix="LIMIT_ALERT") + "\n"
-        
-        os.makedirs(os.path.dirname(_ALERTS_LOG_PATH), exist_ok=True)
-        with open(_ALERTS_LOG_PATH, "a", encoding="utf-8") as f:
-            try:
-                import fcntl
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            except ImportError:
-                try:
-                    import msvcrt
-                    f.seek(0)
-                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
-                except (ImportError, OSError):
-                    pass
-            
-            f.write(line)
-            f.flush()
-            
-            try:
-                import fcntl
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            except ImportError:
-                try:
-                    import msvcrt
-                    f.seek(0)
-                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
-                except (ImportError, OSError):
-                    pass
+        f = _get_alerts_file()
+        f.write(line)
+        f.flush()
     except Exception as exc:
         logger.warning("page_logger: failed to write limit alert: %s", exc)

@@ -64,6 +64,26 @@ def _usage(used: int, limit: int) -> dict:
     }
 
 
+def _quota_result(used: int, limit: int, incoming: int = 1, grace_pages: int = 10) -> dict:
+    """Build a reserve_quota() response for mocking."""
+    remaining = max(limit - used, 0)
+    would_exceed = (used + incoming) > limit
+    if not would_exceed:
+        reason, allowed = "ok", True
+    elif used < limit and incoming <= grace_pages:
+        reason, allowed = "grace", True
+    else:
+        reason, allowed = "exceeded", False
+    return {
+        "allowed": allowed,
+        "reason": reason,
+        "used": used,
+        "limit": limit,
+        "remaining": remaining,
+        "pending": 0,
+    }
+
+
 def _fake_submission() -> dict:
     """Minimal dict that satisfies the ingest endpoint's response builder."""
     return {
@@ -200,6 +220,11 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
         )
         _sched.start()
         self.addCleanup(_sched.stop)
+        # Fake PDF bytes can't be parsed — stub the page counter so quota
+        # tests reach their assertion without hitting 400.
+        _pages = patch.object(main.processor, "count_pdf_pages", return_value=1)
+        _pages.start()
+        self.addCleanup(_pages.stop)
 
     def _use_client(self, uid: str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"):
         main.app.dependency_overrides[get_current_user] = lambda: _client_user(uid)
@@ -215,8 +240,8 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
     def test_blocked_zero_limit_zero_used(self):
         """New user: limit=0, used=0 → 402. Admin must set a plan first."""
         self._use_client()
-        with patch.object(main.db_mod, "get_user_billable_pages",
-                          new=AsyncMock(return_value=_usage(0, 0))), \
+        with patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(0, 0))), \
              patch.object(main.db_mod, "get_user_by_id",
                           new=AsyncMock(return_value={"email": "c@test.com"})):
             r = self.client.post(
@@ -229,10 +254,10 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
     # -- Blocked scenarios ---------------------------------------------------
 
     def test_blocked_when_used_equals_limit(self):
-        """used == limit → 402: the previous doc was the soft-limit allowance."""
+        """used == limit → 402."""
         self._use_client()
-        with patch.object(main.db_mod, "get_user_billable_pages",
-                          new=AsyncMock(return_value=_usage(500, 500))), \
+        with patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(500, 500))), \
              patch.object(main.db_mod, "get_user_by_id",
                           new=AsyncMock(return_value={"email": "c@test.com"})):
             r = self.client.post(
@@ -244,13 +269,13 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
         self.assertEqual(body["error"]["code"], "QUOTA_EXCEEDED")
         self.assertEqual(body["error"]["total_extracted_pages"], 500)
         self.assertEqual(body["error"]["subscription_limit"], 500)
-        self.assertEqual(body["error"]["overage"], 0)  # exactly at limit
+        self.assertEqual(body["error"]["overage"], 0)
 
     def test_402_detail_has_positive_overage_when_over(self):
         """used > limit → overage is positive (used - limit) in the 402 detail."""
         self._use_client()
-        with patch.object(main.db_mod, "get_user_billable_pages",
-                          new=AsyncMock(return_value=_usage(1003, 1000))), \
+        with patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(1003, 1000))), \
              patch.object(main.db_mod, "get_user_by_id",
                           new=AsyncMock(return_value={"email": "c@test.com"})):
             r = self.client.post(
@@ -266,8 +291,8 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
     def test_blocked_when_already_over_limit(self):
         """used > limit (previous doc caused overage) → 402."""
         self._use_client()
-        with patch.object(main.db_mod, "get_user_billable_pages",
-                          new=AsyncMock(return_value=_usage(503, 500))), \
+        with patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(503, 500))), \
              patch.object(main.db_mod, "get_user_by_id",
                           new=AsyncMock(return_value={"email": "c@test.com"})):
             r = self.client.post(
@@ -279,8 +304,8 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
     def test_error_message_includes_upgrade_hint(self):
         """402 detail message must tell the user to contact admin."""
         self._use_client()
-        with patch.object(main.db_mod, "get_user_billable_pages",
-                          new=AsyncMock(return_value=_usage(500, 500))), \
+        with patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(500, 500))), \
              patch.object(main.db_mod, "get_user_by_id",
                           new=AsyncMock(return_value={"email": "c@test.com"})):
             r = self.client.post(
@@ -290,15 +315,68 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
         msg = r.json()["error"]["message"].lower()
         self.assertIn("administrator", msg)
 
+    # -- New pre-flight quota tests (finding 3: missing coverage) -----------
+
+    def test_hard_cap_101_pages_returns_400(self):
+        """PDF with 101 pages must be rejected 400 DOCUMENT_TOO_LARGE before quota check."""
+        self._use_client()
+        with patch.object(main.processor, "count_pdf_pages", return_value=101), \
+             patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(0, 5000))) as mock_quota:
+            # No vendor_id so assert_vendor_access is skipped; page cap runs first
+            r = self.client.post(
+                "/ingest/ui",
+                files={"file": ("big.pdf", b"%PDF-fake", "application/pdf")},
+            )
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.json()["error"]["code"], "DOCUMENT_TOO_LARGE")
+        mock_quota.assert_not_called()
+
+    def test_preflight_blocks_50_pages_when_1_remaining(self):
+        """used=99, limit=100, incoming=50 → 402 because 50 > 10 grace threshold."""
+        self._use_client()
+        with patch.object(main.processor, "count_pdf_pages", return_value=50), \
+             patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(99, 100, incoming=50))), \
+             patch.object(main.db_mod, "get_user_by_id",
+                          new=AsyncMock(return_value={"email": "c@test.com"})):
+            r = self.client.post(
+                "/ingest/ui",
+                files={"file": ("doc.pdf", b"%PDF-fake", "application/pdf")},
+            )
+        self.assertEqual(r.status_code, 402)
+        body = r.json()["error"]
+        self.assertEqual(body["code"], "QUOTA_EXCEEDED")
+        self.assertEqual(body["incoming_pages"], 50)
+
+    def test_preflight_allows_10_pages_when_1_remaining_with_warning(self):
+        """used=99, limit=100, incoming=10 → allowed as small overage with warning."""
+        self._use_client()
+        with patch.object(main.processor, "count_pdf_pages", return_value=10), \
+             patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(99, 100, incoming=10))), \
+             patch.object(main.db_mod, "get_user_by_id",
+                          new=AsyncMock(return_value={"email": "c@test.com"})), \
+             patch.object(main, "_submit_ingestion_job",
+                          new=AsyncMock(return_value=_fake_submission())), \
+             patch.object(main, "assert_vendor_access", new=AsyncMock()):
+            r = self.client.post(
+                "/ingest/ui",
+                files={"file": ("doc.pdf", b"%PDF-fake", "application/pdf")},
+                data={"vendor_id": "acme"},
+            )
+        self.assertNotEqual(r.status_code, 402)
+        body = r.json()
+        self.assertIn("usage_warning", body)
+        self.assertEqual(body["usage_warning"]["level"], "warning")
+
     # -- Soft-boundary: the doc that causes the overage is allowed -----------
 
     def test_allowed_one_page_below_limit(self):
-        """used=499, limit=500 → allowed. Next request will be blocked."""
+        """used=499, limit=500 → allowed."""
         self._use_client()
-        with patch.object(main.db_mod, "get_user_billable_pages",
-                          new=AsyncMock(return_value=_usage(499, 500))), \
-             patch.object(main.db_mod, "get_user_by_id",
-                          new=AsyncMock(return_value={"email": "c@test.com"})), \
+        with patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(499, 500))), \
              patch.object(main, "_submit_ingestion_job",
                           new=AsyncMock(return_value=_fake_submission())), \
              patch.object(main, "assert_vendor_access", new=AsyncMock()):
@@ -312,10 +390,8 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
     def test_allowed_well_under_limit(self):
         """used=200, limit=5000 → no quota block."""
         self._use_client()
-        with patch.object(main.db_mod, "get_user_billable_pages",
-                          new=AsyncMock(return_value=_usage(200, 5000))), \
-             patch.object(main.db_mod, "get_user_by_id",
-                          new=AsyncMock(return_value={"email": "c@test.com"})), \
+        with patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(200, 5000))), \
              patch.object(main, "_submit_ingestion_job",
                           new=AsyncMock(return_value=_fake_submission())), \
              patch.object(main, "assert_vendor_access", new=AsyncMock()):
@@ -330,8 +406,8 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
         """Client at 503/500 blocked. Admin raises to 1000. Client at 503/1000 → allowed."""
         self._use_client()
         # First: blocked at 503/500
-        with patch.object(main.db_mod, "get_user_billable_pages",
-                          new=AsyncMock(return_value=_usage(503, 500))), \
+        with patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(503, 500))), \
              patch.object(main.db_mod, "get_user_by_id",
                           new=AsyncMock(return_value={"email": "c@test.com"})):
             r = self.client.post(
@@ -341,10 +417,8 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
         self.assertEqual(r.status_code, 402)
 
         # After admin raises limit: allowed at 503/1000
-        with patch.object(main.db_mod, "get_user_billable_pages",
-                          new=AsyncMock(return_value=_usage(503, 1000))), \
-             patch.object(main.db_mod, "get_user_by_id",
-                          new=AsyncMock(return_value={"email": "c@test.com"})), \
+        with patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(503, 1000))), \
              patch.object(main, "_submit_ingestion_job",
                           new=AsyncMock(return_value=_fake_submission())), \
              patch.object(main, "assert_vendor_access", new=AsyncMock()):
@@ -360,8 +434,8 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
     def test_warning_included_in_response_at_threshold(self):
         """used/limit >= 90 % → request allowed, usage_warning present."""
         self._use_client()
-        with patch.object(main.db_mod, "get_user_billable_pages",
-                          new=AsyncMock(return_value=_usage(450, 500))), \
+        with patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(450, 500))), \
              patch.object(main.db_mod, "get_user_by_id",
                           new=AsyncMock(return_value={"email": "c@test.com"})), \
              patch.object(main, "_submit_ingestion_job",
@@ -380,10 +454,8 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
     def test_no_warning_well_below_threshold(self):
         """used/limit < 90 % → no usage_warning in response."""
         self._use_client()
-        with patch.object(main.db_mod, "get_user_billable_pages",
-                          new=AsyncMock(return_value=_usage(250, 500))), \
-             patch.object(main.db_mod, "get_user_by_id",
-                          new=AsyncMock(return_value={"email": "c@test.com"})), \
+        with patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(250, 500))), \
              patch.object(main, "_submit_ingestion_job",
                           new=AsyncMock(return_value=_fake_submission())), \
              patch.object(main, "assert_vendor_access", new=AsyncMock()):
@@ -401,8 +473,8 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
     def test_admin_bypasses_quota_check(self):
         """Admin users are never subject to quota checks."""
         self._use_admin()
-        with patch.object(main.db_mod, "get_user_billable_pages",
-                          new=AsyncMock(return_value=_usage(99999, 100))) as mock_check, \
+        with patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(99999, 100))) as mock_quota, \
              patch.object(main, "_submit_ingestion_job",
                           new=AsyncMock(return_value=_fake_submission())), \
              patch.object(main, "assert_vendor_access", new=AsyncMock()):
@@ -411,15 +483,15 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
                 files={"file": ("doc.pdf", b"%PDF-fake", "application/pdf")},
                 data={"vendor_id": "acme"},
             )
-        mock_check.assert_not_called()
+        mock_quota.assert_not_called()
         self.assertNotEqual(r.status_code, 402)
 
     # -- Quota check failure is now fail-closed (503) -------------------------
 
     def test_quota_check_db_failure_blocks_upload_with_503(self):
-        """If get_user_billable_pages raises, the upload is blocked with 503 (fail-closed)."""
+        """If reserve_quota raises, the upload is blocked with 503 (fail-closed)."""
         self._use_client()
-        with patch.object(main.db_mod, "get_user_billable_pages",
+        with patch.object(main.db_mod, "reserve_quota",
                           new=AsyncMock(side_effect=RuntimeError("db down"))), \
              patch.object(main, "assert_vendor_access", new=AsyncMock()):
             r = self.client.post(
@@ -556,6 +628,9 @@ class MultiClientIsolationTests(unittest.TestCase):
         )
         _sched.start()
         self.addCleanup(_sched.stop)
+        _pages = patch.object(main.processor, "count_pdf_pages", return_value=1)
+        _pages.start()
+        self.addCleanup(_pages.stop)
 
     def tearDown(self):
         main.app.dependency_overrides[get_current_user] = _admin_user
@@ -567,8 +642,8 @@ class MultiClientIsolationTests(unittest.TestCase):
 
         # Client A: blocked
         main.app.dependency_overrides[get_current_user] = lambda: _client_user(uid_a)
-        with patch.object(main.db_mod, "get_user_billable_pages",
-                          new=AsyncMock(return_value=_usage(100, 100))), \
+        with patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(100, 100))), \
              patch.object(main.db_mod, "get_user_by_id",
                           new=AsyncMock(return_value={"email": "a@test.com"})):
             r_a = self.client.post(
@@ -579,10 +654,8 @@ class MultiClientIsolationTests(unittest.TestCase):
 
         # Client B: allowed
         main.app.dependency_overrides[get_current_user] = lambda: _client_user(uid_b)
-        with patch.object(main.db_mod, "get_user_billable_pages",
-                          new=AsyncMock(return_value=_usage(200, 5000))), \
-             patch.object(main.db_mod, "get_user_by_id",
-                          new=AsyncMock(return_value={"email": "b@test.com"})), \
+        with patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(200, 5000))), \
              patch.object(main, "_submit_ingestion_job",
                           new=AsyncMock(return_value=_fake_submission())), \
              patch.object(main, "assert_vendor_access", new=AsyncMock()):

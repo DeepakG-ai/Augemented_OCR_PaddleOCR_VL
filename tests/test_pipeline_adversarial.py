@@ -4,7 +4,7 @@ import asyncio
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -122,6 +122,11 @@ class WorkerFailurePathTests(unittest.IsolatedAsyncioTestCase):
 
         conn_mock = AsyncMock()
         conn_mock.execute.return_value = "UPDATE 0"
+        # conn.transaction() in asyncpg returns a context manager, not a coroutine.
+        mock_txn = MagicMock()
+        mock_txn.__aenter__ = AsyncMock(return_value=None)
+        mock_txn.__aexit__ = AsyncMock(return_value=False)
+        conn_mock.transaction = MagicMock(return_value=mock_txn)
         ctx_mock = AsyncMock()
         ctx_mock.__aenter__.return_value = conn_mock
         pool_obj = type("Pool", (), {"close": AsyncMock(), "acquire": lambda self: ctx_mock})()

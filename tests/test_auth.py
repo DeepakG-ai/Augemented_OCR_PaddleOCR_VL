@@ -143,7 +143,7 @@ class CurrentUserAuthorityTests(unittest.IsolatedAsyncioTestCase):
         }
         credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
         with patch.object(auth_mod.db_mod, "get_user_by_id", new=AsyncMock(return_value=record)):
-            user = await get_current_user(Request(), credentials=credentials, token=None)
+            user = await get_current_user(Request(), credentials=credentials)
 
         self.assertEqual(user["role"], "client")
         self.assertEqual(user["email"], "client@example.com")

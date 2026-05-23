@@ -25,10 +25,10 @@ os.environ.setdefault("MLFLOW_ENABLED", "false")  # never emit real traces durin
 
 try:
     from backend import main as _main
-    from backend.auth import get_current_user, require_admin
+    from backend.auth import get_current_user, require_admin, get_current_user_sse, get_current_user_or_api_key
 except ImportError:
     import main as _main  # type: ignore[no-redef]
-    from auth import get_current_user, require_admin  # type: ignore[no-redef]
+    from auth import get_current_user, require_admin, get_current_user_sse, get_current_user_or_api_key  # type: ignore[no-redef]
 
 
 def _fake_admin():
@@ -37,3 +37,6 @@ def _fake_admin():
 
 _main.app.dependency_overrides[get_current_user] = _fake_admin
 _main.app.dependency_overrides[require_admin] = _fake_admin
+_main.app.dependency_overrides[get_current_user_sse] = _fake_admin
+_main.app.dependency_overrides[get_current_user_or_api_key] = _fake_admin
+

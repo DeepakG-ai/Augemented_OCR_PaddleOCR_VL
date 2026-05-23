@@ -527,8 +527,19 @@ async def init(pool: asyncpg.Pool) -> None:
         """)
         # Retroactively reset clients who got the legacy 1000 default limit back to 0
         await conn.execute("""
-            UPDATE users SET subscription_limit = 0 
+            UPDATE users SET subscription_limit = 0
             WHERE role = 'client' AND subscription_limit = 1000;
+        """)
+        # Migration: pending_pages tracks in-flight uploads for atomic quota enforcement
+        await conn.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'users' AND column_name = 'pending_pages'
+                ) THEN
+                    ALTER TABLE users ADD COLUMN pending_pages INT NOT NULL DEFAULT 0;
+                END IF;
+            END $$;
         """)
         # Migration: per-user runtime configuration (input/output folders, upload mode)
         await conn.execute("""
@@ -642,6 +653,22 @@ async def init(pool: asyncpg.Pool) -> None:
             CREATE INDEX IF NOT EXISTS field_mappings_vendor_idx
                 ON field_mappings (vendor_id);
         """)
+
+        # Migration: idempotency claims table for deduplication
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS idempotency_claims (
+                id              SERIAL PRIMARY KEY,
+                user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                idempotency_key TEXT NOT NULL,
+                file_sha256     TEXT NOT NULL,
+                extraction_id   INT  REFERENCES extractions(id) ON DELETE SET NULL,
+                document_id     INT  REFERENCES documents(id) ON DELETE SET NULL,
+                created_at      TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(user_id, idempotency_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_idempotency_claims_key ON idempotency_claims(user_id, idempotency_key);
+        """)
+
 
 
 # -- Helpers ---------------------------------------------------------------
@@ -2600,33 +2627,55 @@ async def recover_stale_jobs(pool: asyncpg.Pool, stage: str, stale_minutes: int 
     """Reset running jobs stuck longer than stale_minutes back to queued (or failed if exhausted).
 
     Called on worker startup and periodically in the poll loop to reclaim orphaned jobs
-    left in 'running' state by a crashed or killed worker process.
+    left in 'running' state by a crashed or killed worker process. Also purges expired idempotency claims.
     Returns the number of jobs recovered.
     """
     async with pool.acquire() as conn:
-        result = await conn.execute(
-            """
-            UPDATE jobs
-            SET status     = CASE
-                                 WHEN attempts >= max_attempts THEN 'failed'
-                                 ELSE 'queued'
-                             END,
-                locked_by  = NULL,
-                locked_at  = NULL,
-                error      = CASE
-                                 WHEN attempts >= max_attempts
-                                 THEN COALESCE(error, 'Worker crash — max attempts reached')
-                                 ELSE 'Worker crash — requeued'
-                             END,
-                updated_at = NOW()
-            WHERE job_type = $1
-              AND status   = 'running'
-              AND updated_at < NOW() - ($2 * INTERVAL '1 minute')
-            """,
-            stage,
-            stale_minutes,
-        )
-        return int(result.split()[-1]) if result else 0
+        # Purge expired idempotency claims older than 24 hours
+        try:
+            await conn.execute("DELETE FROM idempotency_claims WHERE created_at < NOW() - INTERVAL '24 hours'")
+        except Exception:
+            pass
+
+        async with conn.transaction():
+            rows = await conn.fetch(
+                """
+                UPDATE jobs
+                SET status     = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'queued' END,
+                    locked_by  = NULL,
+                    locked_at  = NULL,
+                    error      = CASE
+                                     WHEN attempts >= max_attempts
+                                     THEN COALESCE(error, 'Worker crash — max attempts reached')
+                                     ELSE 'Worker crash — requeued'
+                                 END,
+                    updated_at = NOW()
+                WHERE job_type = $1
+                  AND status   = 'running'
+                  AND updated_at < NOW() - ($2 * INTERVAL '1 minute')
+                RETURNING id, extraction_id, status
+                """,
+                stage, stale_minutes,
+            )
+            failed_ext_ids = [
+                r["extraction_id"] for r in rows
+                if r["status"] == "failed" and r["extraction_id"] is not None
+            ]
+            if failed_ext_ids:
+                await conn.execute(
+                    """
+                    UPDATE extractions
+                    SET status     = 'failed',
+                        error      = 'Worker crash — max attempts reached',
+                        progress   = '{"stage":"failed","message":"Worker crash — max attempts reached"}'::jsonb,
+                        updated_at = NOW()
+                    WHERE id = ANY($1::int[])
+                      AND status NOT IN ('done', 'failed', 'partial', 'cancelled')
+                    """,
+                    failed_ext_ids,
+                )
+            return len(rows)  # job count — matches what callers log
+
 
 
 async def cancel_jobs_for_extraction(pool: asyncpg.Pool, extraction_id: int) -> dict:
@@ -2840,6 +2889,102 @@ async def get_user_billable_pages(
         "subscription_limit": limit_val,
         "remaining": limit_val - used,
     }
+
+
+async def reserve_quota(
+    pool: asyncpg.Pool,
+    user_id: str,
+    incoming_pages: int,
+    grace_pages: int = 10,
+) -> dict:
+    """Atomically check quota and reserve pages for an in-flight upload.
+
+    Uses SELECT … FOR UPDATE to serialize concurrent uploads from the same user
+    so two simultaneous requests cannot both see the same usage snapshot.
+    If allowed, increments pending_pages by incoming_pages — this acts as a
+    reservation that future concurrent checks will see immediately.
+
+    Returns:
+        allowed  – True if the upload may proceed
+        reason   – "ok" | "grace" | "exceeded"
+        used     – current billable pages (does not include pending)
+        limit    – subscription limit
+        remaining – max(limit - used - pending, 0)
+        pending  – pages already reserved by other in-flight uploads
+    """
+    uid = _uuid_or_none(user_id)
+    if uid is None:
+        return {"allowed": False, "reason": "exceeded", "used": 0, "limit": 0, "remaining": 0, "pending": 0}
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COALESCE(u.subscription_limit, 0)  AS subscription_limit,
+                    COALESCE(u.pending_pages, 0)        AS pending_pages,
+                    (
+                        SELECT COUNT(DISTINCT (lu.extraction_id, lu.page_num))
+                        FROM llm_usage lu
+                        WHERE lu.user_id = $1
+                          AND lu.call_type = 'extraction'
+                          AND lu.page_num IS NOT NULL
+                    )::INT AS billable_pages
+                FROM users u
+                WHERE u.id = $1
+                FOR UPDATE
+                """,
+                uid,
+            )
+            if not row:
+                return {"allowed": False, "reason": "exceeded", "used": 0, "limit": 0, "remaining": 0, "pending": 0}
+
+            limit_val = int(row["subscription_limit"])
+            used = int(row["billable_pages"])
+            pending = int(row["pending_pages"])
+            committed = used + pending
+            remaining = max(limit_val - committed, 0)
+            would_exceed = (committed + incoming_pages) > limit_val
+
+            if not would_exceed:
+                reason, allowed = "ok", True
+            elif committed < limit_val and incoming_pages <= grace_pages:
+                reason, allowed = "grace", True
+            else:
+                reason, allowed = "exceeded", False
+
+            if allowed:
+                await conn.execute(
+                    "UPDATE users SET pending_pages = pending_pages + $1 WHERE id = $2",
+                    incoming_pages, uid,
+                )
+            return {
+                "allowed": allowed,
+                "reason": reason,
+                "used": used,
+                "limit": limit_val,
+                "remaining": remaining,
+                "pending": pending,
+            }
+
+
+async def release_quota_reservation(
+    pool: asyncpg.Pool,
+    user_id: str,
+    pages: int,
+) -> None:
+    """Decrement pending_pages after the normalize worker finishes (success or failure).
+
+    Uses GREATEST(0, …) so a double-release or stale reservation never drives
+    pending_pages negative.
+    """
+    uid = _uuid_or_none(user_id)
+    if uid is None:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET pending_pages = GREATEST(0, pending_pages - $1) WHERE id = $2",
+            pages, uid,
+        )
 
 
 async def update_user_subscription_limit(
@@ -3258,3 +3403,68 @@ async def delete_api_key(pool: asyncpg.Pool, key_id: int) -> bool:
             key_id,
         )
     return result == "DELETE 1"
+
+
+async def claim_idempotency(pool: asyncpg.Pool, user_id: str, idempotency_key: str, file_sha256: str) -> dict:
+    """Returns {"status": "claimed", "claim_id": int}
+              {"status": "duplicate", "extraction_id": int, "extraction_status": str}
+              {"status": "conflict"}
+    """
+    uid = _uuid_or_none(user_id)
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "INSERT INTO idempotency_claims (user_id, idempotency_key, file_sha256) "
+                "VALUES ($1, $2, $3) RETURNING id",
+                uid, idempotency_key, file_sha256,
+            )
+        return {"status": "claimed", "claim_id": row["id"]}
+    except asyncpg.UniqueViolationError:
+        async with pool.acquire() as conn:
+            existing = await conn.fetchrow(
+                """SELECT ic.id, ic.file_sha256, ic.extraction_id, e.status
+                   FROM idempotency_claims ic
+                   LEFT JOIN extractions e ON e.id = ic.extraction_id
+                   WHERE ic.user_id = $1 AND ic.idempotency_key = $2
+                     AND ic.created_at > NOW() - INTERVAL '24 hours'""",
+                uid, idempotency_key,
+            )
+        if not existing:
+            # Expired claim: delete old and insert new inside connection/transaction
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    await conn.execute(
+                        "DELETE FROM idempotency_claims WHERE user_id = $1 AND idempotency_key = $2",
+                        uid, idempotency_key,
+                    )
+                    row = await conn.fetchrow(
+                        "INSERT INTO idempotency_claims (user_id, idempotency_key, file_sha256) "
+                        "VALUES ($1, $2, $3) RETURNING id",
+                        uid, idempotency_key, file_sha256,
+                    )
+            return {"status": "claimed", "claim_id": row["id"]}
+
+        if existing["file_sha256"] != file_sha256:
+            return {"status": "conflict"}
+        return {
+            "status": "duplicate",
+            "extraction_id": existing["extraction_id"],
+            "extraction_status": existing["status"],
+        }
+
+
+async def bind_idempotency_claim(pool: asyncpg.Pool, claim_id: int, extraction_id: int, document_id: int) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE idempotency_claims SET extraction_id=$2, document_id=$3 WHERE id=$1",
+            claim_id, extraction_id, document_id,
+        )
+
+
+async def delete_idempotency_claim(pool: asyncpg.Pool, user_id: str, idempotency_key: str) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM idempotency_claims WHERE user_id=$1 AND idempotency_key=$2",
+            _uuid_or_none(user_id), idempotency_key,
+        )
+
