@@ -67,7 +67,12 @@ class ObjectStore:
             if not str(target).startswith(str(self._local_root.resolve())):
                 raise ValueError("object_key attempts to escape storage directory")
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
+            try:
+                target.write_bytes(data)
+            except OSError as exc:
+                raise OSError(
+                    f"Failed to write object key={object_key!r} to {target}: {exc}"
+                ) from exc
             return
         payload = io.BytesIO(data)
         self.client.put_object(
@@ -85,7 +90,16 @@ class ObjectStore:
             target = target.resolve()
             if not str(target).startswith(str(self._local_root.resolve())):
                 raise ValueError("object_key attempts to escape storage directory")
-            return target.read_bytes()
+            try:
+                return target.read_bytes()
+            except FileNotFoundError as exc:
+                raise FileNotFoundError(
+                    f"Object not found: key={object_key!r} bucket={bucket!r} path={target}"
+                ) from exc
+            except OSError as exc:
+                raise OSError(
+                    f"Failed to read object: key={object_key!r} bucket={bucket!r} path={target}: {exc}"
+                ) from exc
         response = self.client.get_object(bucket, object_key)
         try:
             return response.read()

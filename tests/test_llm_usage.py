@@ -136,25 +136,25 @@ class LlmResponseGuardTests(unittest.IsolatedAsyncioTestCase):
                 page_num=1, total_pages=1, pool=None,
             )
 
-    async def test_missing_choices_returns_empty_dict(self):
-        """LLM response with no 'choices' key must return {} without crashing."""
+    async def test_missing_choices_returns_error_sentinel(self):
+        """LLM response with no 'choices' key must return error sentinel, not {}."""
         result = await self._call({"error": "model overloaded"})
-        self.assertEqual(result, {})
+        self.assertEqual(result.get("_error"), "empty_choices")
 
-    async def test_empty_choices_list_returns_empty_dict(self):
-        """LLM response with choices=[] must return {} without crashing."""
+    async def test_empty_choices_list_returns_error_sentinel(self):
+        """LLM response with choices=[] must return error sentinel, not {}."""
         result = await self._call({"choices": []})
-        self.assertEqual(result, {})
+        self.assertEqual(result.get("_error"), "empty_choices")
 
-    async def test_choices_item_not_a_dict_returns_empty_dict(self):
-        """choices[0] being a non-dict (e.g. integer) must return {} without crashing."""
+    async def test_choices_item_not_a_dict_returns_error_sentinel(self):
+        """choices[0] being a non-dict (e.g. integer) must return error sentinel."""
         result = await self._call({"choices": [42]})
-        self.assertEqual(result, {})
+        self.assertEqual(result.get("_error"), "empty_choices")
 
-    async def test_choices_item_missing_message_returns_empty_dict(self):
-        """choices[0] present but lacking 'message' key must return {}."""
+    async def test_choices_item_missing_message_returns_error_sentinel(self):
+        """choices[0] present but lacking 'message' key must return error sentinel."""
         result = await self._call({"choices": [{"finish_reason": "stop"}]})
-        self.assertEqual(result, {})
+        self.assertEqual(result.get("_error"), "empty_choices")
 
 
 if __name__ == "__main__":

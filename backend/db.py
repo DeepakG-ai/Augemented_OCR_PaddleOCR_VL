@@ -736,26 +736,20 @@ async def record_llm_usage(
     request_id_str = str(request_id) if request_id is not None else None
 
     async with pool.acquire() as conn:
-        # Resolve user_id from vendor now so billing survives future vendor deletion.
-        # If billing_user_id is explicitly provided (e.g. admin acting as client),
-        # use it directly — this ensures admin uploads are billed to admin's account.
-        resolved_user_id: UUID | None = None
-        if billing_user_id:
-            resolved_user_id = _uuid_or_none(billing_user_id)
-        elif vendor_id:
-            row_uid = await conn.fetchval(
-                "SELECT user_id FROM vendors WHERE id = $1", vendor_id
-            )
-            if row_uid is not None:
-                resolved_user_id = row_uid if isinstance(row_uid, UUID) else _uuid_or_none(str(row_uid))
-
+        # Resolve user_id atomically inside the INSERT query.
+        # If billing_user_id is explicitly provided, we use it directly (via param $5).
+        # Otherwise, we fetch it atomically from the vendors table.
         row = await conn.fetchrow(
             """
             INSERT INTO llm_usage
                 (request_id, doc_id, extraction_id, vendor_id, user_id, page_num, total_pages,
                  call_type, model, prompt_tokens, completion_tokens, total_tokens,
                  duration_ms, llm_url, api_key_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            VALUES (
+                $1, $2, $3, $4, 
+                COALESCE($5::uuid, (SELECT user_id FROM vendors WHERE id = $4)), 
+                $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+            )
             RETURNING id, ts, request_id, doc_id, extraction_id, vendor_id, user_id,
                       page_num, total_pages, call_type, model, prompt_tokens,
                       completion_tokens, total_tokens, duration_ms, llm_url, api_key_id
@@ -764,7 +758,7 @@ async def record_llm_usage(
             resolved_doc_id_str,
             extraction_id,
             vendor_id,
-            resolved_user_id,
+            _uuid_or_none(billing_user_id),
             page_num,
             total_pages,
             call_type,
@@ -1299,7 +1293,7 @@ async def deactivate_user(pool: asyncpg.Pool, user_id: str) -> bool:
         result = await conn.execute(
             "UPDATE users SET is_active = FALSE WHERE id = $1", user_uuid,
         )
-        return result.endswith(" 1")
+        return result == "UPDATE 1"
 
 
 async def reactivate_user(pool: asyncpg.Pool, user_id: str) -> bool:
@@ -1310,7 +1304,7 @@ async def reactivate_user(pool: asyncpg.Pool, user_id: str) -> bool:
         result = await conn.execute(
             "UPDATE users SET is_active = TRUE WHERE id = $1", user_uuid,
         )
-        return result.endswith(" 1")
+        return result == "UPDATE 1"
 
 
 async def hard_delete_user(pool: asyncpg.Pool, user_id: str) -> bool:
@@ -1321,7 +1315,7 @@ async def hard_delete_user(pool: asyncpg.Pool, user_id: str) -> bool:
         result = await conn.execute(
             "DELETE FROM users WHERE id = $1", user_uuid,
         )
-        return result.endswith(" 1")
+        return result == "DELETE 1"
 
 
 async def reset_user_password(pool: asyncpg.Pool, user_id: str, hashed_pw: str) -> bool:
@@ -1332,7 +1326,7 @@ async def reset_user_password(pool: asyncpg.Pool, user_id: str, hashed_pw: str) 
         result = await conn.execute(
             "UPDATE users SET hashed_pw = $1 WHERE id = $2", hashed_pw, user_uuid,
         )
-        return result.endswith(" 1")
+        return result == "UPDATE 1"
 
 
 async def delete_vendor(pool: asyncpg.Pool, vendor_id: str) -> bool:
@@ -1369,7 +1363,7 @@ async def insert_vendor_alias(
             ON CONFLICT (vendor_id, pattern) DO NOTHING
             RETURNING id, vendor_id, pattern, weight, source, created_at
             """,
-            vendor_id, pattern.lower().strip(), weight, source,
+            vendor_id, pattern.strip(), weight, source,
         )
         return dict(row) if row else None
 
@@ -2121,7 +2115,6 @@ async def get_vendor_object_keys(pool: asyncpg.Pool, vendor_id: str) -> dict[str
         return {
             "documents": [r["object_key"] for r in document_rows if r.get("object_key")],
             "pages": [r["object_key"] for r in page_rows if r.get("object_key")],
-            "deliveries": [r["object_key"] for r in delivery_rows if r.get("object_key")],
             "exports": [r["export_object_key"] for r in export_rows if r.get("export_object_key")],
         }
 
@@ -2414,7 +2407,7 @@ async def delete_stale_qwen_layout_boxes(
                 "DELETE FROM qwen_layout_boxes WHERE vendor_id = $1 AND template_id = $2",
                 vendor_id, template_id,
             )
-        return int(result.split()[-1])
+        return int((result or "DELETE 0").split()[-1])
 
 
 async def delete_stale_spatial_memory(
@@ -2438,7 +2431,7 @@ async def delete_stale_spatial_memory(
                 "DELETE FROM spatial_memory WHERE vendor_id = $1",
                 vendor_id,
             )
-        return int(result.split()[-1])
+        return int((result or "DELETE 0").split()[-1])
 
 
 async def get_latest_gold_correction_fields(
@@ -2864,7 +2857,7 @@ async def update_user_subscription_limit(
             new_limit,
             uid,
         )
-        return result.endswith(" 1")
+        return result == "UPDATE 1"
 
 
 # -- User config -----------------------------------------------------------

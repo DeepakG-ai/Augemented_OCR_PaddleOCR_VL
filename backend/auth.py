@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import logging
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -23,6 +24,7 @@ from jose import JWTError, jwt
 
 from . import db as db_mod
 
+_sec = logging.getLogger("security")
 
 # -- Config ----------------------------------------------------------------
 
@@ -89,6 +91,7 @@ def decode_token(token: str) -> dict:
     try:
         return jwt.decode(token, _require_secret(), algorithms=[JWT_ALGORITHM])
     except JWTError as exc:
+        _sec.warning("auth.token_invalid  error=%s", str(exc))
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Invalid or expired token: {exc}",

@@ -84,6 +84,26 @@ def _field_location_count(field_locations) -> int:
     return 0
 
 
+def _strip_internal_keys(result):
+    """Remove underscore-prefixed internal keys (e.g. _page) from line items before DB save."""
+    if isinstance(result, list):
+        return [_strip_internal_keys(r) for r in result]
+    if not isinstance(result, dict):
+        return result
+    out = dict(result)
+    items = out.get("line_items")
+    if isinstance(items, list):
+        out["line_items"] = [
+            {k: v for k, v in item.items() if not k.startswith("_")}
+            if isinstance(item, dict) else item
+            for item in items
+        ]
+    # v3 format wraps fields in a nested dict
+    if isinstance(out.get("fields"), dict):
+        out["fields"] = _strip_internal_keys(out["fields"])
+    return out
+
+
 def _result_summary(result) -> dict:
     if isinstance(result, list):
         return {"record_count": len(result)}
@@ -152,6 +172,9 @@ async def _maybe_enqueue_postprocess(
     await db_mod.ensure_job(pool, extraction_id, document_id, "postprocess", payload)
 
 
+# dynamic qwen_ocr module helper removed
+
+
 async def _process_normalize(pool, job: dict) -> None:
     store = get_store()
     extraction_id = job["extraction_id"]
@@ -201,6 +224,12 @@ async def _process_normalize(pool, job: dict) -> None:
                 for p in rendered_pages[:5]  # first 5 for brevity
             ],
         }
+
+    if not rendered_pages:
+        raise ValueError(
+            f"Document '{document.get('filename')}' produced 0 renderable pages — "
+            "file may be corrupt, password-protected, or contain only unrenderable content."
+        )
 
     # ── Compute per-page unified geometry (digital vs scanned) ──
     with trace_span(
@@ -613,6 +642,8 @@ async def _process_llm(pool, job: dict) -> None:
             format_type=req_format,
         )
         with plog.timed("extraction") as t:
+            _raw_epr = job.get("payload", {}).get("existing_page_results")
+            # Standard fallback
             output = await extractor.extract_document(
                 pages=pages,
                 header_fields=req_header,
@@ -624,7 +655,7 @@ async def _process_llm(pool, job: dict) -> None:
                 on_page_done=on_page_done,
                 cancel_event=cancel_event,
                 start_from_page=job.get("payload", {}).get("start_from_page", 1),
-                existing_page_results=job.get("payload", {}).get("existing_page_results"),
+                existing_page_results=_raw_epr if isinstance(_raw_epr, list) else None,
                 pipeline_context=base,
                 pool=pool,
                 system_prompt_page1=system_prompt_page1,
@@ -682,6 +713,7 @@ async def _process_llm(pool, job: dict) -> None:
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     _pr = output.get("page_results") or []
     if output.get("cancelled"):
+        # batch_had_failure also sets cancelled=True; all-page failures land here
         status = "partial" if _pr else "cancelled"
     else:
         # Don't set "done" here — postprocess worker sets the final status

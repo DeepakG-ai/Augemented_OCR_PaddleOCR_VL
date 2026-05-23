@@ -33,13 +33,13 @@ class ReviewApiTests(unittest.TestCase):
             response = self.client.get("/extractions/123/ocr")
 
         self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.json()["detail"], "No OCR data found for this extraction")
+        self.assertEqual(response.json()["error"]["message"], "No OCR data found for this extraction")
 
     def test_save_corrections_requires_corrected_result(self) -> None:
         response = self.client.put("/extractions/123/corrections", json={"field_locations": {}})
 
         self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.json()["detail"], "corrected_result is required")
+        self.assertEqual(response.json()["error"]["message"], "corrected_result is required")
 
     def test_save_corrections_returns_404_for_missing_extraction(self) -> None:
         with patch.object(main.db_mod, "get_extraction", new=AsyncMock(return_value=None)):
@@ -49,7 +49,7 @@ class ReviewApiTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.json()["detail"], "Extraction 123 not found")
+        self.assertEqual(response.json()["error"]["message"], "Extraction 123 not found")
 
     def test_save_corrections_returns_200_on_success(self) -> None:
         extraction = {

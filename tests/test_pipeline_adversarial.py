@@ -72,7 +72,7 @@ class ExtractorAdversarialTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(output["last_completed_page"], 0)
         self.assertEqual([pr["_page"] for pr in output["page_results"]], [1])
         self.assertIn("_error", output["page_results"][0])
-        self.assertEqual(output["result"], {})
+        self.assertTrue(output["result"].get("_all_pages_failed"))
 
     async def test_extract_document_handles_zero_page_input(self) -> None:
         output = await extractor.extract_document(

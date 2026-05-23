@@ -6,6 +6,7 @@ Never raises — billing log failures must not crash the pipeline.
 """
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import threading
@@ -13,11 +14,11 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-_LOG_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)),
-    "logs", "page_usage", "log.txt",
+_LOG_PATH = os.environ.get(
+    "PAGE_USAGE_LOG_PATH",
+    os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs", "page_usage", "log.txt"),
 )
-_lock = threading.Lock()
+# Shared process locking and dynamic file-append handles for cross-process compatibility
 
 
 def _fmt_value(value) -> str:
@@ -89,20 +90,41 @@ def append_log(record: dict) -> None:
         record.setdefault("ts", datetime.now(timezone.utc).isoformat())
         line = _format_record(record, prefix="PAGE_USAGE") + "\n"
         os.makedirs(os.path.dirname(_LOG_PATH), exist_ok=True)
-        with _lock:
-            with open(_LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(line)
+        with open(_LOG_PATH, "a", encoding="utf-8") as f:
+            try:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            except ImportError:
+                try:
+                    import msvcrt
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                except (ImportError, OSError):
+                    pass
+            
+            f.write(line)
+            f.flush()
+            
+            try:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except ImportError:
+                try:
+                    import msvcrt
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                except (ImportError, OSError):
+                    pass
     except Exception as exc:
         logger.warning("page_logger: failed to write usage log: %s", exc)
 
 
 # -- Subscription alerts log -----------------------------------------------
 
-_ALERTS_LOG_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)),
-    "logs", "page_usage", "alerts.log",
+_ALERTS_LOG_PATH = os.environ.get(
+    "PAGE_ALERTS_LOG_PATH",
+    os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs", "page_usage", "alerts.log"),
 )
-_alerts_lock = threading.Lock()
 
 
 def log_limit_alert(
@@ -142,9 +164,32 @@ def log_limit_alert(
         if extraction_id is not None:
             record["extraction_id"] = extraction_id
         line = _format_record(record, prefix="LIMIT_ALERT") + "\n"
+        
         os.makedirs(os.path.dirname(_ALERTS_LOG_PATH), exist_ok=True)
-        with _alerts_lock:
-            with open(_ALERTS_LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(line)
+        with open(_ALERTS_LOG_PATH, "a", encoding="utf-8") as f:
+            try:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            except ImportError:
+                try:
+                    import msvcrt
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                except (ImportError, OSError):
+                    pass
+            
+            f.write(line)
+            f.flush()
+            
+            try:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except ImportError:
+                try:
+                    import msvcrt
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                except (ImportError, OSError):
+                    pass
     except Exception as exc:
         logger.warning("page_logger: failed to write limit alert: %s", exc)

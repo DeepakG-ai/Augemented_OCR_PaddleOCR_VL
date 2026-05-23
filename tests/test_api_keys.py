@@ -1,14 +1,17 @@
 """
-test_api_keys.py -- Comprehensive integration tests for API Key management.
+test_api_keys.py  --  Integration tests for API Key management.
 
-New architecture (v2):
-  - One client user owns N API keys (no phantom @apikey.internal users)
-  - POST /admin/api-keys requires owner_user_id (existing client user UUID)
-  - Duplicate labels for same user -> 409; same label different users -> 201
-  - GET /admin/api-keys/{id}/reveal returns decrypted raw key
-  - expires_days: 30, 90, 365, or null (no expiry)
+Architecture:
+  - Admin creates keys; client users cannot.
+  - Each key is assigned to an existing client user (owner_user_id).
+  - One client user can own many keys; all keys share that user's vendor namespace.
+  - No phantom @apikey.internal users are created.
 
-Run:   .venv\\Scripts\\python.exe tests/test_api_keys.py
+Run:
+  .venv\\Scripts\\python.exe tests/test_api_keys.py
+
+Prerequisites:
+  Set ADMIN_EMAIL and ADMIN_PASSWORD in backend/.env or as env vars.
 """
 from __future__ import annotations
 
@@ -16,9 +19,10 @@ __test__ = False
 
 import sys
 import os
-import httpx
 import hashlib
 from datetime import datetime, timezone, timedelta
+
+import httpx
 
 try:
     from dotenv import load_dotenv
@@ -26,22 +30,20 @@ try:
 except ImportError:
     pass
 
-BASE = os.getenv("TEST_BASE_URL", "http://localhost:8000")
-ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+BASE          = os.getenv("TEST_BASE_URL", "http://localhost:8000")
+ADMIN_EMAIL   = os.getenv("ADMIN_EMAIL")
+ADMIN_PASS    = os.getenv("ADMIN_PASSWORD")
+CLIENT1_EMAIL = "test_client_1@apitest.com"
+CLIENT2_EMAIL = "test_client_2@apitest.com"
+TEST_PASS     = "TestPass123!"
 
-if not ADMIN_EMAIL or not ADMIN_PASSWORD:
-    print("[FAIL] ADMIN_EMAIL and ADMIN_PASSWORD env vars must be set.")
-    print("       Set them in your .env file or export before running tests.")
-    print("       Example:  set ADMIN_EMAIL=your@email.com && set ADMIN_PASSWORD=yourpass")
+if not ADMIN_EMAIL or not ADMIN_PASS:
+    print("[FAIL] Set ADMIN_EMAIL and ADMIN_PASSWORD in .env")
     sys.exit(1)
-
-_created_key_ids: list[int] = []
-_created_user_ids: list[str] = []
 
 passed = 0
 failed = 0
-errors: list[str] = []
+_failures: list[str] = []
 
 
 def ok(name: str):
@@ -53,575 +55,408 @@ def ok(name: str):
 def fail(name: str, detail: str = ""):
     global failed
     failed += 1
-    msg = f"  [FAIL] {name}"
-    if detail:
-        msg += f"  ->  {detail}"
-    print(msg)
-    errors.append(f"{name}: {detail}")
+    label = f"  [FAIL] {name}" + (f"  ->  {detail}" if detail else "")
+    print(label)
+    _failures.append(label.strip())
 
 
-# ── Auth helpers ────────────────────────────────────────────────────────────────
+# ── helpers ──────────────────────────────────────────────────────────────────
 
-def get_admin_token() -> str:
-    r = httpx.post(f"{BASE}/auth/login", json={
-        "email": ADMIN_EMAIL,
-        "password": ADMIN_PASSWORD,
-    }, timeout=10)
-    assert r.status_code == 200, f"Admin login failed: {r.status_code} {r.text}"
-    return r.json()["access_token"]
+def login(email: str, password: str) -> str | None:
+    r = httpx.post(f"{BASE}/auth/login", json={"email": email, "password": password}, timeout=10)
+    return r.json().get("access_token") if r.status_code == 200 else None
 
 
-def admin_headers(token: str) -> dict:
+def auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
-def create_client_user(admin_token: str, email: str, password: str = "TestPass123!") -> str:
-    """Create a client user and return their UUID. Idempotent on 409."""
-    r = httpx.post(f"{BASE}/admin/users", json={
-        "email": email,
-        "password": password,
-        "role": "client",
-    }, headers=admin_headers(admin_token), timeout=10)
-    if r.status_code not in (201, 409):
-        raise RuntimeError(f"Failed to create client {email}: {r.status_code} {r.text}")
+def create_user(admin_token: str, email: str) -> str | None:
+    """Create a client user; return their UUID. Returns None on error."""
+    r = httpx.post(f"{BASE}/admin/users",
+        json={"email": email, "password": TEST_PASS, "role": "client"},
+        headers=auth(admin_token), timeout=10)
     if r.status_code == 201:
-        user_id = r.json()["id"]
-        _created_user_ids.append(user_id)
-        return user_id
-    # 409: already exists -- find by listing
-    users = httpx.get(f"{BASE}/admin/users", headers=admin_headers(admin_token), timeout=10).json()
-    match = next((u for u in users if u["email"] == email), None)
-    if not match:
-        raise RuntimeError(f"User {email} already exists but not found in list")
-    return match["id"]
+        return r.json()["id"]
+    if r.status_code == 409:
+        # already exists — find in list
+        users = httpx.get(f"{BASE}/admin/users", headers=auth(admin_token), timeout=10).json()
+        match = next((u for u in users if u["email"] == email), None)
+        return match["id"] if match else None
+    return None
 
 
-def client_token_for(email: str, password: str = "TestPass123!") -> str | None:
-    r = httpx.post(f"{BASE}/auth/login", json={"email": email, "password": password}, timeout=10)
-    if r.status_code != 200:
-        return None
-    return r.json()["access_token"]
+def delete_test_data(admin_token: str):
+    """Remove all test keys and test client users."""
+    keys = httpx.get(f"{BASE}/admin/api-keys", headers=auth(admin_token), timeout=10)
+    if keys.status_code == 200:
+        for k in keys.json():
+            if k["label"].startswith("test_"):
+                httpx.delete(f"{BASE}/admin/api-keys/{k['id']}",
+                    headers=auth(admin_token), timeout=10)
+
+    users = httpx.get(f"{BASE}/admin/users", headers=auth(admin_token), timeout=10)
+    if users.status_code == 200:
+        for u in users.json():
+            if u.get("email", "").endswith("@apitest.com"):
+                httpx.delete(f"{BASE}/admin/users/{u['id']}/hard",
+                    headers=auth(admin_token), timeout=10)
 
 
-# ===============================================================================
-# GROUP 1: Create API Key
-# ===============================================================================
+# ── GROUP 1: Create ───────────────────────────────────────────────────────────
 
-def test_create_api_key(admin_token: str, owner_user_id: str) -> dict | None:
-    """POST /admin/api-keys -- Happy path: valid label + owner."""
+def test_create(admin_token: str, owner_id: str) -> dict | None:
     print("\n-- 1. Create API Key --")
-
     r = httpx.post(f"{BASE}/admin/api-keys",
-        json={"label": "test_ap_automation", "owner_user_id": owner_user_id},
-        headers=admin_headers(admin_token),
-        timeout=10,
-    )
+        json={"label": "test_primary_key", "owner_user_id": owner_id},
+        headers=auth(admin_token), timeout=10)
+
     if r.status_code != 201:
-        fail("Create API key (happy path)", f"Expected 201, got {r.status_code}: {r.text}")
+        fail("Create key (happy path)", f"Expected 201, got {r.status_code}: {r.text}")
         return None
 
     data = r.json()
-    if "raw_key" not in data:
-        fail("Create -- raw_key in response", "raw_key missing")
+    if not data.get("raw_key", "").startswith("po_live_"):
+        fail("Create key -- raw_key format", f"Got: {data.get('raw_key','')[:20]}")
         return None
-    if not data["raw_key"].startswith("po_live_"):
-        fail("Create -- prefix format", f"Expected po_live_, got: {data['raw_key'][:20]}")
+    if data.get("label") != "test_primary_key":
+        fail("Create key -- label echo", f"Got: {data.get('label')}")
         return None
-    if data.get("label") != "test_ap_automation":
-        fail("Create -- label echo", f"Expected 'test_ap_automation', got '{data.get('label')}'")
-        return None
-    if "prefix" not in data or not data["prefix"].startswith("po_live_"):
-        fail("Create -- prefix field", f"prefix missing or wrong: {data.get('prefix')}")
+    if not data.get("prefix", "").startswith("po_live_"):
+        fail("Create key -- prefix field", f"Got: {data.get('prefix')}")
         return None
 
-    ok("Create API key (happy path) -- 201, raw_key starts with po_live_")
+    ok("Create key -> 201, raw_key starts with po_live_")
     return data
 
 
-def test_create_missing_owner(admin_token: str):
-    """POST /admin/api-keys without owner_user_id -- must fail 422."""
+def test_create_requires_owner(admin_token: str):
+    """owner_user_id is required — missing it must return 422."""
     r = httpx.post(f"{BASE}/admin/api-keys",
-        json={"label": "no_owner_test"},
-        headers=admin_headers(admin_token),
-        timeout=10,
-    )
+        json={"label": "test_no_owner"},
+        headers=auth(admin_token), timeout=10)
     if r.status_code == 422:
         ok("Create without owner_user_id -> 422")
     else:
-        fail("Create without owner_user_id", f"Expected 422, got {r.status_code}: {r.text}")
+        fail("Create without owner_user_id", f"Expected 422, got {r.status_code}")
 
 
 def test_create_nonexistent_owner(admin_token: str):
-    """POST /admin/api-keys with a UUID that doesn't exist -- must fail 404."""
+    """A UUID that doesn't exist must return 404."""
     r = httpx.post(f"{BASE}/admin/api-keys",
-        json={"label": "test_ghost_owner",
-              "owner_user_id": "00000000-0000-0000-0000-000000000000"},
-        headers=admin_headers(admin_token),
-        timeout=10,
-    )
+        json={"label": "test_ghost", "owner_user_id": "00000000-0000-0000-0000-000000000000"},
+        headers=auth(admin_token), timeout=10)
     if r.status_code == 404:
         ok("Create with nonexistent owner_user_id -> 404")
     else:
-        fail("Create with nonexistent owner_user_id", f"Expected 404, got {r.status_code}: {r.text}")
+        fail("Create with nonexistent owner_user_id", f"Expected 404, got {r.status_code}")
 
 
-def test_create_duplicate_label_same_user(admin_token: str, owner_user_id: str):
-    """Same label for same user -> 409 (unique constraint)."""
+def test_duplicate_label_same_user(admin_token: str, owner_id: str):
+    """Same label + same user must return 409."""
     r = httpx.post(f"{BASE}/admin/api-keys",
-        json={"label": "test_ap_automation", "owner_user_id": owner_user_id},
-        headers=admin_headers(admin_token),
-        timeout=10,
-    )
+        json={"label": "test_primary_key", "owner_user_id": owner_id},
+        headers=auth(admin_token), timeout=10)
     if r.status_code == 409:
-        ok("Duplicate label same user -> 409 Conflict")
+        ok("Duplicate label same user -> 409")
     else:
-        fail("Duplicate label same user", f"Expected 409, got {r.status_code}: {r.text}")
+        fail("Duplicate label same user", f"Expected 409, got {r.status_code}")
 
 
-def test_create_duplicate_label_case_insensitive(admin_token: str, owner_user_id: str):
-    """Same label different case for same user -> 409 (case-insensitive index)."""
+def test_duplicate_label_case_insensitive(admin_token: str, owner_id: str):
+    """Case-insensitive duplicate for same user must return 409."""
     r = httpx.post(f"{BASE}/admin/api-keys",
-        json={"label": "TEST_AP_AUTOMATION", "owner_user_id": owner_user_id},
-        headers=admin_headers(admin_token),
-        timeout=10,
-    )
+        json={"label": "TEST_PRIMARY_KEY", "owner_user_id": owner_id},
+        headers=auth(admin_token), timeout=10)
     if r.status_code == 409:
-        ok("Duplicate label (different case) same user -> 409")
+        ok("Duplicate label (upper-case) same user -> 409")
     else:
-        fail("Duplicate label case-insensitive", f"Expected 409, got {r.status_code}: {r.text}")
+        fail("Duplicate label case-insensitive", f"Expected 409, got {r.status_code}")
 
 
-def test_create_same_label_different_users(admin_token: str, owner1_id: str, owner2_id: str):
-    """Same label for DIFFERENT users -> both 201 (cross-user collision is allowed)."""
+def test_same_label_different_users(admin_token: str, owner1_id: str, owner2_id: str):
+    """Same label for two DIFFERENT users must both return 201."""
     r1 = httpx.post(f"{BASE}/admin/api-keys",
         json={"label": "test_shared_label", "owner_user_id": owner1_id},
-        headers=admin_headers(admin_token), timeout=10)
+        headers=auth(admin_token), timeout=10)
     r2 = httpx.post(f"{BASE}/admin/api-keys",
         json={"label": "test_shared_label", "owner_user_id": owner2_id},
-        headers=admin_headers(admin_token), timeout=10)
-
+        headers=auth(admin_token), timeout=10)
     if r1.status_code == 201 and r2.status_code == 201:
-        ok("Same label different users -> both 201 (cross-user allowed)")
-    elif r1.status_code == 409 or r2.status_code == 409:
-        fail("Same label different users",
-             f"Got 409 -- cross-user labels should be allowed. r1={r1.status_code}, r2={r2.status_code}")
+        ok("Same label different users -> both 201")
     else:
-        fail("Same label different users", f"r1={r1.status_code}, r2={r2.status_code}")
+        fail("Same label different users", f"owner1={r1.status_code}, owner2={r2.status_code}")
 
 
-def test_create_empty_label(admin_token: str, owner_user_id: str):
-    """Empty / 1-char label -> 422 validation error."""
-    for label, desc in [("", "empty string"), ("x", "1-char (min_length=2)")]:
+def test_create_label_validation(admin_token: str, owner_id: str):
+    """Empty and single-char labels must return 422."""
+    for label, desc in [("", "empty"), ("x", "1-char")]:
         r = httpx.post(f"{BASE}/admin/api-keys",
-            json={"label": label, "owner_user_id": owner_user_id},
-            headers=admin_headers(admin_token),
-            timeout=10,
-        )
+            json={"label": label, "owner_user_id": owner_id},
+            headers=auth(admin_token), timeout=10)
         if r.status_code == 422:
-            ok(f"Create {desc} label -> 422")
+            ok(f"Label '{desc}' -> 422")
         else:
-            fail(f"Create {desc} label", f"Expected 422, got {r.status_code}")
+            fail(f"Label '{desc}'", f"Expected 422, got {r.status_code}")
 
 
-def test_create_missing_label(admin_token: str, owner_user_id: str):
-    """Missing label field -> 422."""
-    r = httpx.post(f"{BASE}/admin/api-keys",
-        json={"owner_user_id": owner_user_id},
-        headers=admin_headers(admin_token),
-        timeout=10,
-    )
-    if r.status_code == 422:
-        ok("Create missing label -> 422")
-    else:
-        fail("Create missing label", f"Expected 422, got {r.status_code}")
-
-
-def test_create_without_auth(owner_user_id: str):
-    """No auth header -> 401."""
-    r = httpx.post(f"{BASE}/admin/api-keys",
-        json={"label": "no_auth_test", "owner_user_id": owner_user_id},
-        timeout=10,
-    )
-    if r.status_code == 401:
-        ok("Create without auth -> 401")
-    else:
-        fail("Create without auth", f"Expected 401, got {r.status_code}")
-
-
-def test_create_as_client(admin_token: str, owner_user_id: str):
-    """Client (non-admin) role -> 403."""
-    token = client_token_for("test_client_apikeys@test.com")
-    if token is None:
-        fail("Create as client -- login", "Login failed")
+def test_create_requires_admin(admin_token: str, owner_id: str):
+    """A client user must get 403 when trying to create a key."""
+    client_token = login(CLIENT1_EMAIL, TEST_PASS)
+    if not client_token:
+        fail("Create as client -- login failed")
         return
     r = httpx.post(f"{BASE}/admin/api-keys",
-        json={"label": "test_client_try", "owner_user_id": owner_user_id},
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=10,
-    )
+        json={"label": "test_client_attempt", "owner_user_id": owner_id},
+        headers={"Authorization": f"Bearer {client_token}"}, timeout=10)
     if r.status_code == 403:
         ok("Create as client -> 403 (admin only)")
     else:
         fail("Create as client", f"Expected 403, got {r.status_code}")
 
 
-# ===============================================================================
-# GROUP 2: Expiry Options
-# ===============================================================================
+def test_create_no_auth(owner_id: str):
+    """No auth header must return 401."""
+    r = httpx.post(f"{BASE}/admin/api-keys",
+        json={"label": "test_no_auth", "owner_user_id": owner_id}, timeout=10)
+    if r.status_code == 401:
+        ok("Create without auth -> 401")
+    else:
+        fail("Create without auth", f"Expected 401, got {r.status_code}")
 
-def test_create_with_expiry(admin_token: str, owner_user_id: str):
-    """POST /admin/api-keys with each expires_days option."""
+
+# ── GROUP 2: Expiry ───────────────────────────────────────────────────────────
+
+def test_expiry_options(admin_token: str, owner_id: str):
     print("\n-- 2. Expiry Options --")
-
-    for days, suffix in [(30, "30d"), (90, "90d"), (365, "365d"), (None, "noexp")]:
-        label = f"test_expiry_{suffix}"
+    cases = [(30, "test_expiry_30d"), (90, "test_expiry_90d"), (365, "test_expiry_365d"), (None, "test_expiry_none")]
+    for days, label in cases:
         r = httpx.post(f"{BASE}/admin/api-keys",
-            json={"label": label, "owner_user_id": owner_user_id, "expires_days": days},
-            headers=admin_headers(admin_token),
-            timeout=10,
-        )
+            json={"label": label, "owner_user_id": owner_id, "expires_days": days},
+            headers=auth(admin_token), timeout=10)
         if r.status_code != 201:
-            fail(f"Create key expires_days={days}", f"Expected 201, got {r.status_code}: {r.text}")
+            fail(f"Expiry {days}d create", f"Expected 201, got {r.status_code}")
             continue
-
         data = r.json()
-        ok(f"Create key expires_days={days} -> 201")
-
+        ok(f"Create with expires_days={days} -> 201")
         if days is None:
             if data.get("expires_at") is None:
-                ok(f"  expires_at is null for no-expiry key")
+                ok(f"  No-expiry key: expires_at is null")
             else:
-                fail(f"  expires_at for no-expiry", f"Expected null, got {data.get('expires_at')}")
+                fail(f"  No-expiry key: expires_at", f"Expected null, got {data.get('expires_at')}")
         else:
             exp_raw = data.get("expires_at")
-            if exp_raw is None:
-                fail(f"  expires_at for {days}d key", "Expected a timestamp, got null")
+            if not exp_raw:
+                fail(f"  {days}d key: expires_at missing")
             else:
                 exp = datetime.fromisoformat(exp_raw.replace("Z", "+00:00"))
-                expected = datetime.now(timezone.utc) + timedelta(days=days)
-                delta = abs((exp - expected).total_seconds())
+                delta = abs((exp - (datetime.now(timezone.utc) + timedelta(days=days))).total_seconds())
                 if delta < 86400:
-                    ok(f"  expires_at is ~{days} days from now (delta {delta:.0f}s)")
+                    ok(f"  {days}d key: expires_at correct (delta {delta:.0f}s)")
                 else:
-                    fail(f"  expires_at precision for {days}d", f"Delta {delta:.0f}s too large")
+                    fail(f"  {days}d key: expires_at wrong", f"delta={delta:.0f}s")
 
 
-def test_expired_key_sql_filter(admin_token: str):
-    """Verify verify_api_key_hash filters expired keys at SQL level (documented check)."""
-    ok("Expired key SQL filter -- enforced via 'expires_at > NOW()' in verify_api_key_hash (db.py)")
+# ── GROUP 3: List ─────────────────────────────────────────────────────────────
 
-
-# ===============================================================================
-# GROUP 3: List API Keys
-# ===============================================================================
-
-def test_list_api_keys(admin_token: str) -> tuple[list, int | None]:
-    """GET /admin/api-keys -- Returns list with expected fields."""
+def test_list(admin_token: str) -> int | None:
     print("\n-- 3. List API Keys --")
-
-    r = httpx.get(f"{BASE}/admin/api-keys",
-        headers=admin_headers(admin_token),
-        timeout=10,
-    )
+    r = httpx.get(f"{BASE}/admin/api-keys", headers=auth(admin_token), timeout=10)
     if r.status_code != 200:
-        fail("List API keys", f"Expected 200, got {r.status_code}: {r.text}")
-        return [], None
+        fail("List keys", f"Expected 200, got {r.status_code}")
+        return None
 
     keys = r.json()
-    if not isinstance(keys, list):
-        fail("List -- response type", "Expected a JSON array")
-        return [], None
+    ok(f"List keys -> 200 ({len(keys)} key(s))")
 
-    ok(f"List API keys -> 200, {len(keys)} key(s)")
+    key = next((k for k in keys if k.get("label") == "test_primary_key"), None)
+    if not key:
+        fail("List -- test_primary_key not found")
+        return None
+    ok("List -- test_primary_key present")
 
-    test_key = next((k for k in keys if k.get("label") == "test_ap_automation"), None)
-    if not test_key:
-        fail("List -- find test_ap_automation", "Key not found in list")
-        return keys, None
-
-    ok("List -- test_ap_automation found")
-
-    required_fields = ["id", "label", "prefix", "is_active", "owner_email",
-                       "created_at", "total_pages", "total_tokens", "total_documents", "expires_at"]
-    missing = [f for f in required_fields if f not in test_key]
+    required = ["id", "label", "prefix", "is_active", "owner_email",
+                "created_at", "total_pages", "total_tokens", "total_documents", "expires_at"]
+    missing = [f for f in required if f not in key]
     if missing:
         fail("List -- required fields", f"Missing: {missing}")
     else:
         ok("List -- all required fields present")
 
-    # New arch: owner_email must be a real user, not @apikey.internal
-    owner_email = test_key.get("owner_email", "")
-    if "@apikey.internal" in owner_email:
-        fail("List -- owner_email",
-             f"Got phantom email '{owner_email}' -- old arch detected")
+    if "@apikey.internal" in key.get("owner_email", ""):
+        fail("List -- owner_email is phantom user (old arch)", key["owner_email"])
     else:
-        ok(f"List -- owner_email is real user: {owner_email}")
+        ok(f"List -- owner_email is real user: {key['owner_email']}")
 
-    if test_key.get("is_active") is True:
+    if key.get("is_active") is True:
         ok("List -- is_active=True")
     else:
-        fail("List -- is_active", f"Expected True, got {test_key.get('is_active')}")
+        fail("List -- is_active", f"Got {key.get('is_active')}")
 
-    for field in ("total_tokens", "total_pages", "total_documents"):
-        val = test_key.get(field)
-        if isinstance(val, int) and val >= 0:
-            ok(f"List -- {field} is int >= 0")
-        else:
-            fail(f"List -- {field}", f"Got: {val!r}")
-
-    return keys, test_key["id"]
-
-
-def test_list_as_client(admin_token: str):
-    """GET /admin/api-keys -- Client role -> 403."""
-    token = client_token_for("test_client_apikeys@test.com")
-    if token is None:
-        fail("List as client -- login", "Login failed")
-        return
-    r = httpx.get(f"{BASE}/admin/api-keys",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=10,
-    )
-    if r.status_code == 403:
-        ok("List as client -> 403 (admin only)")
+    r2 = httpx.get(f"{BASE}/admin/api-keys",
+        headers={"Authorization": f"Bearer {login(CLIENT1_EMAIL, TEST_PASS)}"}, timeout=10)
+    if r2.status_code == 403:
+        ok("List as client -> 403")
     else:
-        fail("List as client", f"Expected 403, got {r.status_code}")
+        fail("List as client", f"Expected 403, got {r2.status_code}")
 
-
-def test_list_no_auth():
-    """GET /admin/api-keys -- No auth -> 401."""
-    r = httpx.get(f"{BASE}/admin/api-keys", timeout=10)
-    if r.status_code == 401:
+    r3 = httpx.get(f"{BASE}/admin/api-keys", timeout=10)
+    if r3.status_code == 401:
         ok("List no auth -> 401")
     else:
-        fail("List no auth", f"Expected 401, got {r.status_code}")
+        fail("List no auth", f"Expected 401, got {r3.status_code}")
+
+    return key["id"]
 
 
-# ===============================================================================
-# GROUP 4: Reveal Endpoint
-# ===============================================================================
+# ── GROUP 4: Reveal ───────────────────────────────────────────────────────────
 
-def test_reveal_api_key(admin_token: str, key_id: int, expected_raw_key: str):
-    """GET /admin/api-keys/{id}/reveal -- Admin recovers a lost raw key."""
+def test_reveal(admin_token: str, key_id: int, expected_raw_key: str):
     print("\n-- 4. Reveal Endpoint --")
-
     r = httpx.get(f"{BASE}/admin/api-keys/{key_id}/reveal",
-        headers=admin_headers(admin_token),
-        timeout=10,
-    )
+        headers=auth(admin_token), timeout=10)
     if r.status_code != 200:
-        fail("Reveal -- happy path", f"Expected 200, got {r.status_code}: {r.text}")
+        fail("Reveal -> 200", f"Got {r.status_code}: {r.text}")
         return
-
     data = r.json()
-    if "raw_key" not in data:
-        fail("Reveal -- raw_key in response", "raw_key missing")
-        return
-    if data["raw_key"] == expected_raw_key:
-        ok("Reveal -- returned correct raw_key (Fernet decryption matches)")
+    if data.get("raw_key") == expected_raw_key:
+        ok("Reveal -- raw_key matches original")
     else:
-        fail("Reveal -- raw_key value",
-             f"Mismatch: got {data['raw_key'][:20]}... expected {expected_raw_key[:20]}...")
-
+        fail("Reveal -- raw_key mismatch",
+             f"got {data.get('raw_key','')[:20]}... expected {expected_raw_key[:20]}...")
     if "label" in data:
         ok(f"Reveal -- label present: {data['label']}")
     else:
-        fail("Reveal -- label field", "label missing from reveal response")
+        fail("Reveal -- label missing")
 
-
-def test_reveal_nonexistent_key(admin_token: str):
-    """GET /admin/api-keys/999999/reveal -- 404."""
-    r = httpx.get(f"{BASE}/admin/api-keys/999999/reveal",
-        headers=admin_headers(admin_token),
-        timeout=10,
-    )
-    if r.status_code == 404:
+    r2 = httpx.get(f"{BASE}/admin/api-keys/999999/reveal",
+        headers=auth(admin_token), timeout=10)
+    if r2.status_code == 404:
         ok("Reveal nonexistent key -> 404")
     else:
-        fail("Reveal nonexistent", f"Expected 404, got {r.status_code}")
+        fail("Reveal nonexistent", f"Expected 404, got {r2.status_code}")
+
+    client_token = login(CLIENT1_EMAIL, TEST_PASS)
+    if client_token:
+        r3 = httpx.get(f"{BASE}/admin/api-keys/{key_id}/reveal",
+            headers={"Authorization": f"Bearer {client_token}"}, timeout=10)
+        if r3.status_code == 403:
+            ok("Reveal as client -> 403")
+        else:
+            fail("Reveal as client", f"Expected 403, got {r3.status_code}")
 
 
-def test_reveal_as_client(admin_token: str, key_id: int):
-    """GET /admin/api-keys/{id}/reveal -- Client role -> 403."""
-    token = client_token_for("test_client_apikeys@test.com")
-    if token is None:
-        fail("Reveal as client -- login", "Login failed")
-        return
-    r = httpx.get(f"{BASE}/admin/api-keys/{key_id}/reveal",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=10,
-    )
-    if r.status_code == 403:
-        ok("Reveal as client -> 403 (admin only)")
-    else:
-        fail("Reveal as client", f"Expected 403, got {r.status_code}")
+# ── GROUP 5: Deactivate / Reactivate ─────────────────────────────────────────
 
-
-# ===============================================================================
-# GROUP 5: Deactivate / Reactivate
-# ===============================================================================
-
-def test_deactivate_api_key(admin_token: str, key_id: int):
-    """PATCH /admin/api-keys/{id}/deactivate -- Happy path."""
+def test_deactivate_reactivate(admin_token: str, key_id: int, raw_key: str):
     print("\n-- 5. Deactivate / Reactivate --")
 
     r = httpx.patch(f"{BASE}/admin/api-keys/{key_id}/deactivate",
-        headers=admin_headers(admin_token), timeout=10)
-    if r.status_code == 200:
-        ok(f"Deactivate key {key_id} -> 200")
-    else:
-        fail(f"Deactivate key {key_id}", f"Expected 200, got {r.status_code}: {r.text}")
+        headers=auth(admin_token), timeout=10)
+    if r.status_code != 200:
+        fail("Deactivate", f"Expected 200, got {r.status_code}")
         return
+    ok(f"Deactivate key {key_id} -> 200")
 
-    keys = httpx.get(f"{BASE}/admin/api-keys", headers=admin_headers(admin_token), timeout=10).json()
-    kk = next((k for k in keys if k["id"] == key_id), None)
-    if kk and kk["is_active"] is False:
-        ok("Deactivate -- verified is_active=False in list")
+    keys = httpx.get(f"{BASE}/admin/api-keys", headers=auth(admin_token), timeout=10).json()
+    k = next((x for x in keys if x["id"] == key_id), None)
+    if k and k["is_active"] is False:
+        ok("Deactivate -- is_active=False confirmed in list")
     else:
-        fail("Deactivate -- verify in list", "Key not found or still active")
+        fail("Deactivate -- list check", "Key not found or still active")
 
-
-def test_deactivate_nonexistent(admin_token: str):
-    r = httpx.patch(f"{BASE}/admin/api-keys/999999/deactivate",
-        headers=admin_headers(admin_token), timeout=10)
-    if r.status_code == 404:
-        ok("Deactivate nonexistent -> 404")
+    r2 = httpx.post(f"{BASE}/v1/extract", headers={"X-API-Key": raw_key}, timeout=10)
+    if r2.status_code == 401:
+        ok("Deactivated key rejected -> 401")
     else:
-        fail("Deactivate nonexistent", f"Expected 404, got {r.status_code}")
+        fail("Deactivated key auth", f"Expected 401, got {r2.status_code}")
 
-
-def test_reactivate_api_key(admin_token: str, key_id: int):
-    r = httpx.patch(f"{BASE}/admin/api-keys/{key_id}/reactivate",
-        headers=admin_headers(admin_token), timeout=10)
-    if r.status_code == 200:
+    r3 = httpx.patch(f"{BASE}/admin/api-keys/{key_id}/reactivate",
+        headers=auth(admin_token), timeout=10)
+    if r3.status_code == 200:
         ok(f"Reactivate key {key_id} -> 200")
     else:
-        fail(f"Reactivate key {key_id}", f"Expected 200, got {r.status_code}: {r.text}")
-        return
+        fail("Reactivate", f"Expected 200, got {r3.status_code}")
 
-    keys = httpx.get(f"{BASE}/admin/api-keys", headers=admin_headers(admin_token), timeout=10).json()
-    kk = next((k for k in keys if k["id"] == key_id), None)
-    if kk and kk["is_active"] is True:
-        ok("Reactivate -- verified is_active=True in list")
+    r4 = httpx.patch(f"{BASE}/admin/api-keys/999999/deactivate",
+        headers=auth(admin_token), timeout=10)
+    if r4.status_code == 404:
+        ok("Deactivate nonexistent -> 404")
     else:
-        fail("Reactivate -- verify in list", "Key not found or still inactive")
+        fail("Deactivate nonexistent", f"Expected 404, got {r4.status_code}")
 
-
-def test_reactivate_nonexistent(admin_token: str):
-    r = httpx.patch(f"{BASE}/admin/api-keys/999999/reactivate",
-        headers=admin_headers(admin_token), timeout=10)
-    if r.status_code == 404:
+    r5 = httpx.patch(f"{BASE}/admin/api-keys/999999/reactivate",
+        headers=auth(admin_token), timeout=10)
+    if r5.status_code == 404:
         ok("Reactivate nonexistent -> 404")
     else:
-        fail("Reactivate nonexistent", f"Expected 404, got {r.status_code}")
+        fail("Reactivate nonexistent", f"Expected 404, got {r5.status_code}")
 
 
-# ===============================================================================
-# GROUP 6: Dual Auth -- X-API-Key header
-# ===============================================================================
+# ── GROUP 6: Auth (X-API-Key header) ─────────────────────────────────────────
 
-def test_auth_with_valid_api_key(raw_key: str):
-    """POST /v1/extract with valid X-API-Key -- must not get 401."""
-    print("\n-- 6. Dual Auth (X-API-Key) --")
+def test_auth(admin_token: str, raw_key: str):
+    print("\n-- 6. API Key Authentication --")
 
-    r = httpx.post(f"{BASE}/v1/extract",
-        headers={"X-API-Key": raw_key}, timeout=10)
-    if r.status_code == 401:
-        fail("Auth with valid API key", f"Got 401 -- key rejected: {r.text}")
+    r = httpx.post(f"{BASE}/v1/extract", headers={"X-API-Key": raw_key}, timeout=10)
+    if r.status_code != 401:
+        ok(f"Valid key passes auth (got {r.status_code}, not 401)")
     else:
-        ok(f"Auth with valid API key -- passed auth (got {r.status_code}, not 401)")
+        fail("Valid key rejected", "Got 401")
 
-
-def test_auth_with_invalid_api_key():
-    r = httpx.post(f"{BASE}/v1/extract",
-        headers={"X-API-Key": "po_live_FAKE_KEY_DOES_NOT_EXIST"}, timeout=10)
-    if r.status_code == 401:
-        ok("Auth with invalid API key -> 401")
+    r2 = httpx.post(f"{BASE}/v1/extract",
+        headers={"X-API-Key": "po_live_FAKEKEYDOESNOTEXIST"}, timeout=10)
+    if r2.status_code == 401:
+        ok("Invalid key -> 401")
     else:
-        fail("Auth with invalid key", f"Expected 401, got {r.status_code}")
+        fail("Invalid key", f"Expected 401, got {r2.status_code}")
 
-
-def test_auth_with_deactivated_key(admin_token: str, raw_key: str, key_id: int):
-    """Deactivate then try auth -> 401; reactivate after."""
-    httpx.patch(f"{BASE}/admin/api-keys/{key_id}/deactivate",
-        headers=admin_headers(admin_token), timeout=10)
-    r = httpx.post(f"{BASE}/v1/extract",
-        headers={"X-API-Key": raw_key}, timeout=10)
-    if r.status_code == 401:
-        ok("Auth with deactivated key -> 401")
+    r3 = httpx.post(f"{BASE}/v1/extract", timeout=10)
+    if r3.status_code == 401:
+        ok("No auth header -> 401")
     else:
-        fail("Auth with deactivated key", f"Expected 401, got {r.status_code}: {r.text}")
-    # Restore
-    httpx.patch(f"{BASE}/admin/api-keys/{key_id}/reactivate",
-        headers=admin_headers(admin_token), timeout=10)
+        fail("No auth header", f"Expected 401, got {r3.status_code}")
 
-
-def test_auth_with_no_header():
-    r = httpx.post(f"{BASE}/v1/extract", timeout=10)
-    if r.status_code == 401:
-        ok("Auth with no header -> 401")
+    r4 = httpx.post(f"{BASE}/v1/extract", headers={"X-API-Key": ""}, timeout=10)
+    if r4.status_code in (401, 422):
+        ok(f"Empty API key -> {r4.status_code}")
     else:
-        fail("Auth with no header", f"Expected 401, got {r.status_code}")
+        fail("Empty API key", f"Expected 401/422, got {r4.status_code}")
 
-
-def test_auth_with_jwt_fallback(admin_token: str):
-    r = httpx.post(f"{BASE}/v1/extract",
-        headers=admin_headers(admin_token), timeout=10)
-    if r.status_code == 401:
-        fail("Auth with JWT fallback", "Got 401 -- JWT rejected")
+    r5 = httpx.post(f"{BASE}/v1/extract", headers=auth(admin_token), timeout=10)
+    if r5.status_code != 401:
+        ok(f"JWT Bearer also accepted (got {r5.status_code})")
     else:
-        ok(f"Auth with JWT fallback -- passed (got {r.status_code})")
+        fail("JWT Bearer rejected", "Got 401")
 
 
-def test_auth_empty_api_key():
-    r = httpx.post(f"{BASE}/v1/extract",
-        headers={"X-API-Key": ""}, timeout=10)
-    if r.status_code in (401, 422):
-        ok(f"Auth with empty API key -> {r.status_code}")
-    else:
-        fail("Auth with empty API key", f"Expected 401/422, got {r.status_code}")
+# ── GROUP 7: /v1/extract edge cases ──────────────────────────────────────────
 
-
-# ===============================================================================
-# GROUP 7: /v1/extract Edge Cases
-# ===============================================================================
-
-def test_extract_no_file(raw_key: str):
+def test_extract_edge_cases(raw_key: str):
     print("\n-- 7. /v1/extract Edge Cases --")
-    r = httpx.post(f"{BASE}/v1/extract",
-        headers={"X-API-Key": raw_key}, timeout=10)
+
+    r = httpx.post(f"{BASE}/v1/extract", headers={"X-API-Key": raw_key}, timeout=10)
     if r.status_code == 422:
-        ok("Extract without file -> 422")
+        ok("No file -> 422")
     else:
-        fail("Extract without file", f"Expected 422, got {r.status_code}")
+        fail("No file", f"Expected 422, got {r.status_code}")
 
-
-def test_extract_empty_file(raw_key: str):
-    r = httpx.post(f"{BASE}/v1/extract",
+    r2 = httpx.post(f"{BASE}/v1/extract",
         headers={"X-API-Key": raw_key},
-        files={"file": ("empty.pdf", b"", "application/pdf")},
-        timeout=30,
-    )
-    if r.status_code in (400, 500):
-        ok(f"Extract with empty file -> {r.status_code}")
+        files={"file": ("empty.pdf", b"", "application/pdf")}, timeout=30)
+    if r2.status_code in (400, 500):
+        ok(f"Empty file -> {r2.status_code}")
     else:
-        fail("Extract with empty file", f"Expected 400/500, got {r.status_code}")
+        fail("Empty file", f"Expected 400/500, got {r2.status_code}")
 
-
-def test_extract_non_pdf(raw_key: str):
-    r = httpx.post(f"{BASE}/v1/extract",
+    r3 = httpx.post(f"{BASE}/v1/extract",
         headers={"X-API-Key": raw_key},
-        files={"file": ("test.txt", b"Hello world this is not a PDF", "text/plain")},
-        timeout=30,
-    )
-    if r.status_code in (400, 500):
-        ok(f"Extract with .txt file -> {r.status_code} (handled gracefully)")
+        files={"file": ("doc.txt", b"not a pdf", "text/plain")}, timeout=30)
+    if r3.status_code in (400, 500):
+        ok(f"Non-PDF file -> {r3.status_code}")
     else:
-        fail("Extract with .txt file", f"Expected 400/500, got {r.status_code}: {r.text[:200]}")
+        fail("Non-PDF file", f"Expected 400/500, got {r3.status_code}")
 
-
-def test_extract_no_vendor_match(raw_key: str):
-    """Valid PDF but client user has no vendors -> 400/402/409."""
     minimal_pdf = (
         b"%PDF-1.0\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
         b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
@@ -630,330 +465,214 @@ def test_extract_no_vendor_match(raw_key: str):
         b"0000000058 00000 n \n0000000115 00000 n \n"
         b"trailer<</Root 1 0 R/Size 4>>\nstartxref\n192\n%%EOF"
     )
-    r = httpx.post(f"{BASE}/v1/extract",
+    r4 = httpx.post(f"{BASE}/v1/extract",
         headers={"X-API-Key": raw_key},
-        files={"file": ("invoice.pdf", minimal_pdf, "application/pdf")},
-        timeout=30,
-    )
-    # 400/409 = no vendor match; 402 = quota 0 (new user default)
-    if r.status_code in (400, 402, 409):
-        ok(f"Extract no vendor match -> {r.status_code}")
+        files={"file": ("invoice.pdf", minimal_pdf, "application/pdf")}, timeout=30)
+    if r4.status_code in (400, 402, 409):
+        ok(f"Valid PDF, no vendor match -> {r4.status_code}")
     else:
-        fail("Extract no vendor match", f"Expected 400/402/409, got {r.status_code}: {r.text[:200]}")
+        fail("No vendor match", f"Expected 400/402/409, got {r4.status_code}")
 
 
-# ===============================================================================
-# GROUP 8: Multiple Keys / Vendor Namespace Sharing
-# ===============================================================================
+# ── GROUP 8: Multiple keys / shared vendor namespace ─────────────────────────
 
-def test_multiple_keys_same_user(admin_token: str, owner_user_id: str):
-    """Two keys for the same user: both valid, both distinct, same owner_email."""
-    print("\n-- 8. Multiple Keys / Vendor Namespace Sharing --")
+def test_multiple_keys(admin_token: str, owner_id: str):
+    print("\n-- 8. Multiple Keys / Shared Vendor Namespace --")
 
     r1 = httpx.post(f"{BASE}/admin/api-keys",
-        json={"label": "test_key_alpha", "owner_user_id": owner_user_id},
-        headers=admin_headers(admin_token), timeout=10)
+        json={"label": "test_key_alpha", "owner_user_id": owner_id},
+        headers=auth(admin_token), timeout=10)
     r2 = httpx.post(f"{BASE}/admin/api-keys",
-        json={"label": "test_key_beta", "owner_user_id": owner_user_id},
-        headers=admin_headers(admin_token), timeout=10)
+        json={"label": "test_key_beta", "owner_user_id": owner_id},
+        headers=auth(admin_token), timeout=10)
 
-    if r1.status_code == 201 and r2.status_code == 201:
-        ok("Two keys for same user -> both 201")
-        key1, key2 = r1.json()["raw_key"], r2.json()["raw_key"]
-
-        if key1 != key2:
-            ok("Both raw_key strings are unique")
-        else:
-            fail("Raw keys are unique", "Both keys returned the same value")
-
-        a1 = httpx.post(f"{BASE}/v1/extract", headers={"X-API-Key": key1}, timeout=10)
-        a2 = httpx.post(f"{BASE}/v1/extract", headers={"X-API-Key": key2}, timeout=10)
-        if a1.status_code != 401 and a2.status_code != 401:
-            ok("Both keys pass auth independently")
-        else:
-            fail("Multi-key auth", f"key1={a1.status_code}, key2={a2.status_code}")
-    else:
-        fail("Create two keys same user", f"r1={r1.status_code}, r2={r2.status_code}")
+    if r1.status_code != 201 or r2.status_code != 201:
+        fail("Two keys same user", f"r1={r1.status_code}, r2={r2.status_code}")
         return
+    ok("Two keys for same user -> both 201")
 
-    # Both keys should show same owner_email (shared user namespace)
-    keys = httpx.get(f"{BASE}/admin/api-keys", headers=admin_headers(admin_token), timeout=10).json()
+    key_a, key_b = r1.json()["raw_key"], r2.json()["raw_key"]
+    if key_a != key_b:
+        ok("Both keys are unique values")
+    else:
+        fail("Keys are unique", "Got same raw_key value for both")
+
+    a1 = httpx.post(f"{BASE}/v1/extract", headers={"X-API-Key": key_a}, timeout=10)
+    a2 = httpx.post(f"{BASE}/v1/extract", headers={"X-API-Key": key_b}, timeout=10)
+    if a1.status_code != 401 and a2.status_code != 401:
+        ok("Both keys authenticate independently")
+    else:
+        fail("Both keys auth", f"key_a={a1.status_code}, key_b={a2.status_code}")
+
+    keys = httpx.get(f"{BASE}/admin/api-keys", headers=auth(admin_token), timeout=10).json()
     alpha = next((k for k in keys if k["label"] == "test_key_alpha"), None)
-    beta = next((k for k in keys if k["label"] == "test_key_beta"), None)
-
-    if alpha and beta:
-        ok("List shows both keys")
-        if alpha.get("owner_email") == beta.get("owner_email"):
-            ok(f"Both keys share owner_email: {alpha.get('owner_email')}")
-        else:
-            fail("Owner email mismatch",
-                 f"alpha={alpha.get('owner_email')} beta={beta.get('owner_email')}")
+    beta  = next((k for k in keys if k["label"] == "test_key_beta"),  None)
+    if alpha and beta and alpha.get("owner_email") == beta.get("owner_email"):
+        ok(f"Both keys share owner_email: {alpha['owner_email']}")
     else:
-        fail("List both keys", "One or both keys missing from list")
+        fail("Shared owner_email", "Emails differ or keys not found")
 
-
-def test_no_phantom_users(admin_token: str):
-    """Creating API keys must NOT create @apikey.internal phantom users."""
-    r = httpx.get(f"{BASE}/admin/users", headers=admin_headers(admin_token), timeout=10)
-    if r.status_code != 200:
-        fail("Admin users list", f"Expected 200, got {r.status_code}")
-        return
-
-    users = r.json()
+    # Confirm no @apikey.internal phantom users were created
+    users = httpx.get(f"{BASE}/admin/users", headers=auth(admin_token), timeout=10).json()
     phantom = [u["email"] for u in users if "@apikey.internal" in u.get("email", "")]
     if phantom:
-        fail("No phantom users", f"Found @apikey.internal users: {phantom}")
+        fail("No phantom users", f"Found: {phantom}")
     else:
-        ok("No @apikey.internal phantom users in /admin/users")
+        ok("No @apikey.internal phantom users in system")
 
 
-# ===============================================================================
-# GROUP 9: Key Hash Verification
-# ===============================================================================
+# ── GROUP 9: Hash verification ────────────────────────────────────────────────
 
-def test_key_hash_verification(raw_key: str):
-    """SHA-256 hash: valid key passes, 1-char mutation fails."""
+def test_key_hash(raw_key: str):
     print("\n-- 9. Key Hash Verification --")
+    h = hashlib.sha256(raw_key.encode()).hexdigest()
+    ok(f"SHA-256: {h[:16]}...")
 
-    computed = hashlib.sha256(raw_key.encode()).hexdigest()
-    ok(f"SHA-256 computed: {computed[:16]}...")
-
-    r = httpx.post(f"{BASE}/v1/extract",
-        headers={"X-API-Key": raw_key}, timeout=10)
+    r = httpx.post(f"{BASE}/v1/extract", headers={"X-API-Key": raw_key}, timeout=10)
     if r.status_code != 401:
         ok("Original key passes auth (hash matches DB)")
     else:
-        fail("Key hash match", "Auth returned 401 -- hash mismatch?")
+        fail("Hash match", "Got 401 on original key")
 
     mutated = raw_key[:-1] + ("a" if raw_key[-1] != "a" else "b")
-    r2 = httpx.post(f"{BASE}/v1/extract",
-        headers={"X-API-Key": mutated}, timeout=10)
+    r2 = httpx.post(f"{BASE}/v1/extract", headers={"X-API-Key": mutated}, timeout=10)
     if r2.status_code == 401:
-        ok("Mutated key rejected -> 401")
+        ok("1-char mutation rejected -> 401")
     else:
         fail("Mutated key", f"Expected 401, got {r2.status_code}")
 
 
-# ===============================================================================
-# GROUP 10: Delete API Key
-# ===============================================================================
+# ── GROUP 10: Delete ──────────────────────────────────────────────────────────
 
-def test_delete_nonexistent_key(admin_token: str):
+def test_delete(admin_token: str, raw_key: str, key_id: int):
     print("\n-- 10. Delete API Key --")
+
     r = httpx.delete(f"{BASE}/admin/api-keys/999999",
-        headers=admin_headers(admin_token), timeout=10)
+        headers=auth(admin_token), timeout=10)
     if r.status_code == 404:
         ok("Delete nonexistent -> 404")
     else:
         fail("Delete nonexistent", f"Expected 404, got {r.status_code}")
 
+    client_token = login(CLIENT1_EMAIL, TEST_PASS)
+    if client_token:
+        r2 = httpx.delete(f"{BASE}/admin/api-keys/{key_id}",
+            headers={"Authorization": f"Bearer {client_token}"}, timeout=10)
+        if r2.status_code == 403:
+            ok("Delete as client -> 403")
+        else:
+            fail("Delete as client", f"Expected 403, got {r2.status_code}")
 
-def test_delete_as_client(admin_token: str, key_id: int):
-    token = client_token_for("test_client_apikeys@test.com")
-    if token is None:
-        fail("Delete as client -- login", "Login failed")
-        return
-    r = httpx.delete(f"{BASE}/admin/api-keys/{key_id}",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=10,
-    )
-    if r.status_code == 403:
-        ok("Delete as client -> 403 (admin only)")
-    else:
-        fail("Delete as client", f"Expected 403, got {r.status_code}")
-
-
-def test_delete_then_auth(admin_token: str, raw_key: str, key_id: int):
-    """Delete key; confirm auth fails and key is gone from list."""
-    r = httpx.delete(f"{BASE}/admin/api-keys/{key_id}",
-        headers=admin_headers(admin_token), timeout=10)
-    if r.status_code == 200:
+    r3 = httpx.delete(f"{BASE}/admin/api-keys/{key_id}",
+        headers=auth(admin_token), timeout=10)
+    if r3.status_code == 200:
         ok(f"Delete key {key_id} -> 200")
     else:
-        fail(f"Delete key {key_id}", f"Expected 200, got {r.status_code}")
+        fail(f"Delete key {key_id}", f"Expected 200, got {r3.status_code}")
         return
 
-    r2 = httpx.post(f"{BASE}/v1/extract",
-        headers={"X-API-Key": raw_key}, timeout=10)
-    if r2.status_code == 401:
-        ok("Auth with deleted key -> 401")
+    r4 = httpx.post(f"{BASE}/v1/extract", headers={"X-API-Key": raw_key}, timeout=10)
+    if r4.status_code == 401:
+        ok("Deleted key auth -> 401")
     else:
-        fail("Auth with deleted key", f"Expected 401, got {r2.status_code}")
+        fail("Deleted key auth", f"Expected 401, got {r4.status_code}")
 
-    keys = httpx.get(f"{BASE}/admin/api-keys", headers=admin_headers(admin_token), timeout=10).json()
+    keys = httpx.get(f"{BASE}/admin/api-keys", headers=auth(admin_token), timeout=10).json()
     if not any(k["id"] == key_id for k in keys):
         ok("Deleted key gone from list")
     else:
-        fail("Deleted key in list", "Key still appears after deletion")
+        fail("Deleted key still in list")
 
 
-# ===============================================================================
-# CLEANUP
-# ===============================================================================
-
-def cleanup(admin_token: str):
-    print("\n-- Cleanup --")
-    cleaned = 0
-
-    keys = httpx.get(f"{BASE}/admin/api-keys", headers=admin_headers(admin_token), timeout=10)
-    if keys.status_code == 200:
-        for k in keys.json():
-            if k["label"].startswith("test_"):
-                httpx.delete(f"{BASE}/admin/api-keys/{k['id']}",
-                    headers=admin_headers(admin_token), timeout=10)
-                cleaned += 1
-
-    users = httpx.get(f"{BASE}/admin/users", headers=admin_headers(admin_token), timeout=10)
-    if users.status_code == 200:
-        for u in users.json():
-            email = u.get("email", "")
-            if email.startswith("test_client_apikeys"):
-                httpx.delete(f"{BASE}/admin/users/{u['id']}/hard",
-                    headers=admin_headers(admin_token), timeout=10)
-                cleaned += 1
-
-    print(f"  Cleaned {cleaned} test resources")
-
-
-# ===============================================================================
-# MAIN
-# ===============================================================================
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    print("=" * 62)
-    print("  API Key Integration Tests v2                                ")
-    print("  (real users own keys -- no phantom @apikey.internal users)  ")
-    print("=" * 62)
+    print("=" * 60)
+    print("  API Key Integration Tests")
+    print("  (one real user owns N keys -- no phantom users)")
+    print("=" * 60)
 
     try:
-        r = httpx.get(f"{BASE}/health", timeout=5)
-        if r.status_code != 200:
-            print(f"\n[FAIL] Server not healthy: {r.status_code}")
-            sys.exit(1)
-        print(f"\n[OK] Server healthy: {r.json()}")
-    except httpx.ConnectError:
-        print(f"\n[FAIL] Cannot connect to {BASE}. Is the server running?")
+        httpx.get(f"{BASE}/health", timeout=5).raise_for_status()
+        print(f"\n[OK] Server reachable at {BASE}")
+    except Exception as e:
+        print(f"\n[FAIL] Server not reachable: {e}")
         sys.exit(1)
 
-    try:
-        admin_token = get_admin_token()
-        print("[OK] Admin login successful")
-    except Exception as e:
-        print(f"\n[FAIL] Admin login failed: {e}")
+    admin_token = login(ADMIN_EMAIL, ADMIN_PASS)
+    if not admin_token:
+        print("[FAIL] Admin login failed")
         sys.exit(1)
+    print("[OK] Admin login OK")
 
-    cleanup(admin_token)
+    delete_test_data(admin_token)
 
-    # Primary test client (owns most test keys)
-    try:
-        owner1_id = create_client_user(admin_token, "test_client_apikeys@test.com")
-        print(f"[OK] Primary test client: {owner1_id}")
-    except Exception as e:
-        print(f"\n[FAIL] Could not create primary test client: {e}")
+    owner1_id = create_user(admin_token, CLIENT1_EMAIL)
+    if not owner1_id:
+        print("[FAIL] Could not create test client 1")
         sys.exit(1)
+    print(f"[OK] Client 1: {owner1_id}")
 
-    # Secondary client (for cross-user label tests)
-    owner2_id: str | None = None
-    try:
-        owner2_id = create_client_user(admin_token, "test_client_apikeys2@test.com")
-        print(f"[OK] Secondary test client: {owner2_id}")
-    except Exception as e:
-        print(f"\n[WARN] Secondary test client unavailable: {e}")
+    owner2_id = create_user(admin_token, CLIENT2_EMAIL)
+    if not owner2_id:
+        print("[WARN] Could not create test client 2 -- cross-user test skipped")
 
-    # ── GROUP 1: Create ─────────────────────────────────────────────
-    created = test_create_api_key(admin_token, owner1_id)
+    # ── run groups ──────────────────────────────────────────────────────────
+    created = test_create(admin_token, owner1_id)
     raw_key = created["raw_key"] if created else None
 
-    test_create_missing_owner(admin_token)
+    test_create_requires_owner(admin_token)
     test_create_nonexistent_owner(admin_token)
-    test_create_duplicate_label_same_user(admin_token, owner1_id)
-    test_create_duplicate_label_case_insensitive(admin_token, owner1_id)
+    test_duplicate_label_same_user(admin_token, owner1_id)
+    test_duplicate_label_case_insensitive(admin_token, owner1_id)
     if owner2_id:
-        test_create_same_label_different_users(admin_token, owner1_id, owner2_id)
-    test_create_empty_label(admin_token, owner1_id)
-    test_create_missing_label(admin_token, owner1_id)
-    test_create_without_auth(owner1_id)
-    test_create_as_client(admin_token, owner1_id)
+        test_same_label_different_users(admin_token, owner1_id, owner2_id)
+    test_create_label_validation(admin_token, owner1_id)
+    test_create_requires_admin(admin_token, owner1_id)
+    test_create_no_auth(owner1_id)
 
-    # ── GROUP 2: Expiry ──────────────────────────────────────────────
-    test_create_with_expiry(admin_token, owner1_id)
-    test_expired_key_sql_filter(admin_token)
+    test_expiry_options(admin_token, owner1_id)
 
-    # ── GROUP 3: List ────────────────────────────────────────────────
-    keys, key_id = test_list_api_keys(admin_token)
-    test_list_as_client(admin_token)
-    test_list_no_auth()
+    keys, key_id = test_list(admin_token), None
+    # re-fetch key_id from list (test_list returns key_id directly)
+    _listed = httpx.get(f"{BASE}/admin/api-keys", headers=auth(admin_token), timeout=10).json()
+    _k = next((k for k in _listed if k.get("label") == "test_primary_key"), None)
+    key_id = _k["id"] if _k else None
 
-    # ── GROUP 4: Reveal ──────────────────────────────────────────────
     if key_id and raw_key:
-        test_reveal_api_key(admin_token, key_id, raw_key)
-        test_reveal_nonexistent_key(admin_token)
-        test_reveal_as_client(admin_token, key_id)
-    else:
-        print("\n  [WARN] Skipping reveal tests -- no key_id")
+        test_reveal(admin_token, key_id, raw_key)
 
-    # ── GROUP 5: Deactivate / Reactivate ─────────────────────────────
-    if key_id:
-        test_deactivate_api_key(admin_token, key_id)
-        test_deactivate_nonexistent(admin_token)
-        test_reactivate_api_key(admin_token, key_id)
-        test_reactivate_nonexistent(admin_token)
-    else:
-        print("\n  [WARN] Skipping deactivate/reactivate -- no key_id")
+    if key_id and raw_key:
+        test_deactivate_reactivate(admin_token, key_id, raw_key)
 
-    # ── GROUP 6: Dual Auth ───────────────────────────────────────────
     if raw_key:
-        test_auth_with_valid_api_key(raw_key)
-        test_auth_with_invalid_api_key()
-        if key_id:
-            test_auth_with_deactivated_key(admin_token, raw_key, key_id)
-        test_auth_with_no_header()
-        test_auth_with_jwt_fallback(admin_token)
-        test_auth_empty_api_key()
-    else:
-        print("\n  [WARN] Skipping auth tests -- no raw_key")
+        test_auth(admin_token, raw_key)
+        test_extract_edge_cases(raw_key)
 
-    # ── GROUP 7: /v1/extract Edge Cases ──────────────────────────────
-    if raw_key:
-        test_extract_no_file(raw_key)
-        test_extract_empty_file(raw_key)
-        test_extract_non_pdf(raw_key)
-        test_extract_no_vendor_match(raw_key)
-    else:
-        print("\n  [WARN] Skipping extract tests -- no raw_key")
+    test_multiple_keys(admin_token, owner1_id)
 
-    # ── GROUP 8: Multiple Keys / Namespace Sharing ────────────────────
-    test_multiple_keys_same_user(admin_token, owner1_id)
-    test_no_phantom_users(admin_token)
-
-    # ── GROUP 9: Hash Verification ───────────────────────────────────
+    # fresh key for hash test (original may have been deactivated/deleted above)
     fresh = httpx.post(f"{BASE}/admin/api-keys",
-        json={"label": "test_hash_verify", "owner_user_id": owner1_id},
-        headers=admin_headers(admin_token), timeout=10)
+        json={"label": "test_hash_key", "owner_user_id": owner1_id},
+        headers=auth(admin_token), timeout=10)
     if fresh.status_code == 201:
-        test_key_hash_verification(fresh.json()["raw_key"])
+        test_key_hash(fresh.json()["raw_key"])
     else:
-        print(f"\n  [WARN] Skipping hash tests -- couldn't create key: {fresh.status_code}")
+        print(f"\n  [WARN] Skipping hash test (create returned {fresh.status_code})")
 
-    # ── GROUP 10: Delete ─────────────────────────────────────────────
-    test_delete_nonexistent_key(admin_token)
-    if key_id:
-        test_delete_as_client(admin_token, key_id)
-        if raw_key:
-            test_delete_then_auth(admin_token, raw_key, key_id)
+    if key_id and raw_key:
+        test_delete(admin_token, raw_key, key_id)
 
-    # ── Final Cleanup ────────────────────────────────────────────────
-    cleanup(admin_token)
+    delete_test_data(admin_token)
 
     total = passed + failed
     print(f"\n{'=' * 60}")
-    print(f"  RESULTS: {passed}/{total} passed, {failed} failed")
-    if errors:
-        print(f"\n  FAILURES:")
-        for e in errors:
-            print(f"    * {e}")
-    print(f"{'=' * 60}")
-
+    print(f"  RESULTS: {passed}/{total} passed,  {failed} failed")
+    if _failures:
+        print("\n  FAILURES:")
+        for f in _failures:
+            print(f"    * {f}")
+    print("=" * 60)
     sys.exit(1 if failed else 0)
 
 

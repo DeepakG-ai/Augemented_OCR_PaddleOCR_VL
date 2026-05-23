@@ -224,7 +224,7 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
                 files={"file": ("doc.pdf", b"%PDF-fake", "application/pdf")},
             )
         self.assertEqual(r.status_code, 402)
-        self.assertEqual(r.json()["detail"]["code"], "QUOTA_EXCEEDED")
+        self.assertEqual(r.json()["error"]["code"], "QUOTA_EXCEEDED")
 
     # -- Blocked scenarios ---------------------------------------------------
 
@@ -241,13 +241,13 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
             )
         self.assertEqual(r.status_code, 402)
         body = r.json()
-        self.assertEqual(body["detail"]["code"], "QUOTA_EXCEEDED")
-        self.assertEqual(body["detail"]["total_extracted_pages"], 500)
-        self.assertEqual(body["detail"]["subscription_limit"], 500)
-        self.assertEqual(body["detail"]["overage"], 0)  # exactly at limit
+        self.assertEqual(body["error"]["code"], "QUOTA_EXCEEDED")
+        self.assertEqual(body["error"]["total_extracted_pages"], 500)
+        self.assertEqual(body["error"]["subscription_limit"], 500)
+        self.assertEqual(body["error"]["overage"], 0)  # exactly at limit
 
-    def test_402_detail_has_negative_overage_when_over(self):
-        """used > limit → overage is negative in the 402 detail."""
+    def test_402_detail_has_positive_overage_when_over(self):
+        """used > limit → overage is positive (used - limit) in the 402 detail."""
         self._use_client()
         with patch.object(main.db_mod, "get_user_billable_pages",
                           new=AsyncMock(return_value=_usage(1003, 1000))), \
@@ -259,9 +259,9 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
             )
         self.assertEqual(r.status_code, 402)
         body = r.json()
-        self.assertEqual(body["detail"]["total_extracted_pages"], 1003)
-        self.assertEqual(body["detail"]["subscription_limit"], 1000)
-        self.assertEqual(body["detail"]["overage"], -3)
+        self.assertEqual(body["error"]["total_extracted_pages"], 1003)
+        self.assertEqual(body["error"]["subscription_limit"], 1000)
+        self.assertEqual(body["error"]["overage"], 3)
 
     def test_blocked_when_already_over_limit(self):
         """used > limit (previous doc caused overage) → 402."""
@@ -287,7 +287,7 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
                 "/ingest/ui",
                 files={"file": ("doc.pdf", b"%PDF-fake", "application/pdf")},
             )
-        msg = r.json()["detail"]["message"].lower()
+        msg = r.json()["error"]["message"].lower()
         self.assertIn("administrator", msg)
 
     # -- Soft-boundary: the doc that causes the overage is allowed -----------
@@ -636,8 +636,8 @@ class ResumeQuotaEnforcementTests(unittest.TestCase):
             r = self.client.post("/jobs/extractions/1/resume")
         self.assertEqual(r.status_code, 402)
         body = r.json()
-        self.assertEqual(body["detail"]["code"], "QUOTA_EXCEEDED")
-        self.assertEqual(body["detail"]["overage"], -3)
+        self.assertEqual(body["error"]["code"], "QUOTA_EXCEEDED")
+        self.assertEqual(body["error"]["overage"], 3)
 
     def test_resume_blocked_at_exact_limit(self):
         """Client exactly at limit (overage=0) cannot resume — quota exhausted."""

@@ -76,11 +76,18 @@ def sync_job(row: dict) -> None:
         logger.warning("scheduler: invalid cron_expr=%r schedule_id=%s", row.get("cron_expr"), row["id"])
         return
 
-    trigger = CronTrigger(
-        minute=parts[0], hour=parts[1], day=parts[2],
-        month=parts[3], day_of_week=parts[4],
-        timezone=tz,
-    )
+    try:
+        trigger = CronTrigger(
+            minute=parts[0], hour=parts[1], day=parts[2],
+            month=parts[3], day_of_week=parts[4],
+            timezone=tz,
+        )
+    except Exception as exc:
+        logger.error(
+            "scheduler: invalid cron expression %r for schedule_id=%s — job not registered: %s",
+            row.get("cron_expr"), row["id"], exc,
+        )
+        return
     _scheduler.add_job(
         _run_schedule,
         trigger=trigger,
@@ -191,8 +198,12 @@ async def _run_schedule(schedule_id: int, user_id: str) -> None:
         try:
             from . import db as db_mod
             await db_mod.set_schedule_executing(pool, schedule_id, False)
-        except Exception:
-            pass
+        except Exception as unlock_exc:
+            logger.error(
+                "scheduler: CRITICAL — failed to release is_executing lock for schedule_id=%s: %s. "
+                "Schedule is permanently locked until manual DB reset.",
+                schedule_id, unlock_exc,
+            )
 
 
 async def reload_all_schedules(pool) -> None:

@@ -102,6 +102,12 @@ def _normalize_box(
     else:
         return None
 
+    # Normalise inverted boxes drawn right-to-left or bottom-to-top
+    if x0 > x1:
+        x0, x1 = x1, x0
+    if y0 > y1:
+        y0, y1 = y1, y0
+
     return {
         "x0": round(x0 / page_width, 6),
         "y0": round(y0 / page_height, 6),
@@ -125,16 +131,16 @@ def _denormalize_box(
 
 
 def _words_in_box(words: list[dict], box: list[int]) -> list[dict]:
-    """Find words whose center falls inside the given [x0,y0,x1,y1] box."""
+    """Find words that overlap (even partially) with the given [x0,y0,x1,y1] box."""
     x0, y0, x1, y1 = box
     matched = []
     for w in words:
         wb = w.get("box", [])
         if len(wb) != 4:
             continue
-        cx = (wb[0] + wb[2]) / 2
-        cy = (wb[1] + wb[3]) / 2
-        if x0 <= cx <= x1 and y0 <= cy <= y1:
+        wx0, wy0, wx1, wy1 = wb
+        # Overlap check: word and box intersect on both axes
+        if wx1 >= x0 and wx0 <= x1 and wy1 >= y0 and wy0 <= y1:
             matched.append(w)
     return matched
 
@@ -235,6 +241,27 @@ async def save_from_corrections(
 
         if not box:
             continue
+
+        # Coordinate bounds validation and normalization (x0 < x1, y0 < y1)
+        if isinstance(box, list) and len(box) == 4:
+            raw_x0, raw_y0, raw_x1, raw_y1 = box
+            box = [
+                min(raw_x0, raw_x1),
+                min(raw_y0, raw_y1),
+                max(raw_x0, raw_x1),
+                max(raw_y0, raw_y1)
+            ]
+        elif isinstance(box, dict):
+            raw_x0 = box.get("x0", box.get("left", 0))
+            raw_y0 = box.get("y0", box.get("top", 0))
+            raw_x1 = box.get("x1", box.get("right", 0))
+            raw_y1 = box.get("y1", box.get("bottom", 0))
+            box = {
+                "x0": min(raw_x0, raw_x1),
+                "y0": min(raw_y0, raw_y1),
+                "x1": max(raw_x0, raw_x1),
+                "y1": max(raw_y0, raw_y1)
+            }
 
         dims = page_dims.get(page_num)
         if not dims or dims[0] <= 0 or dims[1] <= 0:

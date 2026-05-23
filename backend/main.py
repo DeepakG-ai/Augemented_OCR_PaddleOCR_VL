@@ -120,6 +120,18 @@ class ScheduleUpdate(BaseModel):
 configure_logging()
 logger = logging.getLogger(__name__)
 
+
+async def render_page_1_for_detection(file_bytes: bytes, filename: str) -> list[dict]:
+    """
+    Renders the first page of the file for vendor detection.
+    """
+    filename_lower = filename.lower()
+    if filename_lower.endswith(".pdf"):
+        return await processor.pdf_to_images(file_bytes, max_pages=1)
+    else:
+        return await processor.image_file_to_b64(file_bytes)
+
+
 # -- Config SSE state -------------------------------------------------------
 # Per-user list of open SSE queues for live config-change push.
 _config_sse_queues: dict[str, list[asyncio.Queue]] = {}
@@ -156,7 +168,7 @@ async def _folder_ingest_callback(user_id: str, pdf_path: str) -> None:
         from . import ocr_runner as ocr_mod
 
         # Render page 1 for vendor detection.
-        rendered = await processor.pdf_to_images(file_bytes, max_pages=1)
+        rendered = await render_page_1_for_detection(file_bytes, filename)
         if not rendered:
             logger.warning("folder_ingest: no pages rendered path=%s", pdf_path)
             return
@@ -266,7 +278,11 @@ class MaxUploadSizeMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         # Fast path: reject if Content-Length header already exceeds limit
         content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > MAX_UPLOAD_BYTES:
+        try:
+            _cl_int = int(content_length) if content_length else 0
+        except ValueError:
+            _cl_int = 0
+        if _cl_int > MAX_UPLOAD_BYTES:
             return Response(
                 content=json.dumps({"error": {"code": "FILE_TOO_LARGE", "message": f"Upload exceeds {MAX_UPLOAD_BYTES // (1024*1024)} MB limit"}}),
                 status_code=413,
@@ -358,6 +374,8 @@ async def lifespan(app: FastAPI):
     if getattr(app.state, "watcher_mgr", None):
         app.state.watcher_mgr.stop_all()
     await app.state.pool.close()
+    from .logging_config import shutdown_logging
+    shutdown_logging()
 
 
 def _guess_mime_type(filename: str) -> str:
@@ -683,12 +701,25 @@ async def health(request: Request):
 @limiter.limit("20/minute")
 async def login(request: Request, body: LoginRequest):
     pool = request.app.state.pool
+    _sec = logging.getLogger("security")
     user = await db_mod.get_user_by_email(pool, body.email)
     if not user or not user.get("is_active", True):
+        _sec.warning(
+            "login.failed  email=%s  ip=%s  reason=%s",
+            body.email, request.client.host, "user_not_found",
+        )
         raise HTTPException(status_code=401, detail="Invalid credentials")
     if not verify_password(body.password, user["hashed_pw"]):
+        _sec.warning(
+            "login.failed  email=%s  ip=%s  reason=%s",
+            body.email, request.client.host, "bad_password",
+        )
         raise HTTPException(status_code=401, detail="Invalid credentials")
     token = create_access_token(str(user["id"]), user["role"], user["email"])
+    _sec.info(
+        "login.success  user=%s  role=%s  ip=%s",
+        user["email"], user["role"], request.client.host,
+    )
     return TokenOut(
         access_token=token,
         user=UserOut(
@@ -1164,10 +1195,7 @@ async def detect_vendor_endpoint(
     filename = (file.filename or "unknown").lower()
 
     # Render page 1 only
-    if filename.endswith(".pdf"):
-        rendered = await processor.pdf_to_images(file_bytes, max_pages=1)
-    else:
-        rendered = await processor.image_file_to_b64(file_bytes)
+    rendered = await render_page_1_for_detection(file_bytes, filename)
 
     if not rendered:
         raise HTTPException(400, detail="Could not render any pages from the uploaded file")
@@ -1663,8 +1691,11 @@ async def ingest_document(
     file_bytes = await file.read()
     filename = file.filename or "unknown"
     detected_vendor = None
-    req_header = json.loads(header_fields) if header_fields else []
-    req_items = json.loads(line_item_fields) if line_item_fields else []
+    try:
+        req_header = json.loads(header_fields) if header_fields else []
+        req_items = json.loads(line_item_fields) if line_item_fields else []
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_JSON_FIELD", "message": f"header_fields or line_item_fields is not valid JSON: {exc}"}) from exc
 
     # -- Subscription quota check (soft limit) ---------------------------------
     # Soft-limit model: the request that pushed usage to/past the limit was
@@ -1688,7 +1719,7 @@ async def ingest_document(
                     alert_type="exceeded",
                     filename=filename,
                 )
-                overage = u_limit - u_used  # negative number, e.g. -3
+                overage = u_used - u_limit
                 raise HTTPException(
                     status_code=402,
                     detail={
@@ -1761,10 +1792,7 @@ async def ingest_document(
 
                 # Render page 1 only for detection
                 with plog.timed("render_p1") as t:
-                    if filename.lower().endswith(".pdf"):
-                        rendered = await processor.pdf_to_images(file_bytes, max_pages=1)
-                    else:
-                        rendered = await processor.image_file_to_b64(file_bytes)
+                    rendered = await render_page_1_for_detection(file_bytes, filename)
                 logger.info("Rendered page-1 for vendor detection (%d pages, %.0fms)", len(rendered), t["ms"])
 
                 if not rendered:
@@ -1968,9 +1996,12 @@ async def stream_job_status_sse(
     })
 
     def _serialize(obj):
-        """JSON serializer for datetime and other non-serializable types."""
+        """JSON serializer for datetime, Decimal, and other non-serializable types."""
         if hasattr(obj, "isoformat"):
             return obj.isoformat()
+        from decimal import Decimal
+        if isinstance(obj, Decimal):
+            return float(obj)
         return str(obj)
 
     def _slim(ext):
@@ -2105,7 +2136,7 @@ async def queue_resume_extraction(
                     alert_type="exceeded",
                     filename=extraction.get("filename"),
                 )
-                overage = u_limit - u_used
+                overage = u_used - u_limit
                 raise HTTPException(
                     status_code=402,
                     detail={
@@ -3488,10 +3519,7 @@ async def extract_via_api_key(
         from . import ocr_runner as _ocr
 
         # Render page 1 only for detection
-        if filename.lower().endswith(".pdf"):
-            rendered = await processor.pdf_to_images(file_bytes, max_pages=1)
-        else:
-            rendered = await processor.image_file_to_b64(file_bytes)
+        rendered = await render_page_1_for_detection(file_bytes, filename)
 
         if not rendered:
             raise HTTPException(400, detail="Could not render any pages from the uploaded file")

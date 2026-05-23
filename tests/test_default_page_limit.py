@@ -147,7 +147,7 @@ class AdminCreateUserDefaultLimitTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class ApiKeyCreationDefaultLimitTests(unittest.TestCase):
-    """Auto-created internal user for API key gets subscription_limit=0."""
+    """API key creation requires an existing owner_user_id (new architecture)."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -155,83 +155,22 @@ class ApiKeyCreationDefaultLimitTests(unittest.TestCase):
         from fastapi.testclient import TestClient
         cls.client = TestClient(main.app, raise_server_exceptions=False)
 
-    def test_api_key_user_gets_zero_limit(self) -> None:
-        """The internal @apikey.internal user must have subscription_limit=0."""
-        created_user = _created_user_row(
-            uid="apikey-user-uuid",
-            email="test_label@apikey.internal",
-            role="client",
-            subscription_limit=0,
-        )
-        api_key_row = {
-            "id": 42,
-            "user_id": "apikey-user-uuid",
-            "label": "test_label",
-            "key_hash": "abc123",
-            "prefix": "po_live_xxxxxxxx...",
-            "is_active": True,
-            "created_at": "2026-01-01T00:00:00+00:00",
-            "last_used_at": None,
-        }
-        mock_create_user = AsyncMock(return_value=created_user)
+    def test_api_key_requires_owner_user_id(self) -> None:
+        """POST /admin/api-keys without owner_user_id → 422 validation error."""
+        r = self.client.post("/admin/api-keys", json={"label": "test_label"})
+        self.assertEqual(r.status_code, 422)
+        body = r.json()
+        self.assertIn("error", body)
 
-        with patch.object(main.db_mod, "get_user_by_email",
-                          new=AsyncMock(return_value=None)), \
-             patch.object(main.db_mod, "create_user", new=mock_create_user), \
-             patch("backend.main.generate_api_key",
-                   return_value=("po_live_rawkey123", "hash123", "po_live_rawkey1...")), \
-             patch("backend.auth.encrypt_api_key", return_value="encrypted_placeholder"), \
-             patch.object(main.db_mod, "create_api_key",
-                          new=AsyncMock(return_value=api_key_row)):
-            r = self.client.post("/admin/api-keys", json={"label": "test_label"})
-
-        self.assertEqual(r.status_code, 201)
-
-        # Verify create_user was called — subscription_limit kwarg must be
-        # absent (defaults to 0 inside db.py) or explicitly 0.
-        mock_create_user.assert_awaited_once()
-        _args, _kwargs = mock_create_user.call_args
-        # Positional: pool, email, hashed_pw
-        # Keyword: role="client" — no subscription_limit passed
-        self.assertEqual(_kwargs.get("role", _args[3] if len(_args) > 3 else None), "client")
-        # subscription_limit must NOT be passed as 1000
-        if "subscription_limit" in _kwargs:
-            self.assertEqual(_kwargs["subscription_limit"], 0,
-                             "API key creation passed subscription_limit != 0 to create_user")
-
-    def test_api_key_user_not_getting_1000(self) -> None:
-        """Regression: auto-created API key user must never get 1000."""
-        created_user = _created_user_row(
-            uid="regress-uuid",
-            email="regress_key@apikey.internal",
-            role="client",
-            subscription_limit=0,  # This is what db.py returns after our fix
-        )
-        api_key_row = {
-            "id": 99,
-            "user_id": "regress-uuid",
-            "label": "regress_key",
-            "key_hash": "xyz",
-            "prefix": "po_live_xyz...",
-            "is_active": True,
-            "created_at": None,
-            "last_used_at": None,
-        }
-
-        with patch.object(main.db_mod, "get_user_by_email",
-                          new=AsyncMock(return_value=None)), \
-             patch.object(main.db_mod, "create_user",
-                          new=AsyncMock(return_value=created_user)), \
-             patch("backend.main.generate_api_key",
-                   return_value=("po_live_xxx", "hashxxx", "po_live_xxx...")), \
-             patch("backend.auth.encrypt_api_key", return_value="enc"), \
-             patch.object(main.db_mod, "create_api_key",
-                          new=AsyncMock(return_value=api_key_row)):
-            r = self.client.post("/admin/api-keys", json={"label": "regress_key"})
-
-        self.assertEqual(r.status_code, 201)
-        # The returned user row (internal) should carry 0, never 1000.
-        self.assertEqual(created_user["subscription_limit"], 0)
+    def test_api_key_nonexistent_owner_returns_404(self) -> None:
+        """POST /admin/api-keys with unknown owner_user_id → 404."""
+        with patch.object(main.db_mod, "get_user_by_id",
+                          new=AsyncMock(return_value=None)):
+            r = self.client.post("/admin/api-keys", json={
+                "label": "test_label",
+                "owner_user_id": "00000000-0000-0000-0000-000000000000",
+            })
+        self.assertEqual(r.status_code, 404)
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +283,7 @@ class ZeroLimitUserBlockedTests(unittest.TestCase):
                 files={"file": ("doc.pdf", b"%PDF-fake", "application/pdf")},
             )
         self.assertEqual(r.status_code, 402, f"Expected 402, got {r.status_code}")
-        self.assertEqual(r.json()["detail"]["code"], "QUOTA_EXCEEDED")
+        self.assertEqual(r.json()["error"]["code"], "QUOTA_EXCEEDED")
 
     def test_resume_blocked_for_zero_limit_user(self) -> None:
         """POST /jobs/extractions/{id}/resume → 402 for zero-limit user."""
@@ -360,7 +299,7 @@ class ZeroLimitUserBlockedTests(unittest.TestCase):
                           new=AsyncMock(return_value={"email": "fresh@test.com"})):
             r = self.client.post("/jobs/extractions/1/resume")
         self.assertEqual(r.status_code, 402, f"Expected 402, got {r.status_code}")
-        self.assertEqual(r.json()["detail"]["code"], "QUOTA_EXCEEDED")
+        self.assertEqual(r.json()["error"]["code"], "QUOTA_EXCEEDED")
 
     def test_402_detail_says_limit_zero(self) -> None:
         """The 402 body must show subscription_limit=0, not 1000."""
@@ -373,7 +312,7 @@ class ZeroLimitUserBlockedTests(unittest.TestCase):
                 "/ingest/ui",
                 files={"file": ("doc.pdf", b"%PDF-fake", "application/pdf")},
             )
-        body = r.json()["detail"]
+        body = r.json()["error"]
         self.assertEqual(body["subscription_limit"], 0,
                          f"402 detail shows subscription_limit={body['subscription_limit']}, expected 0")
         self.assertEqual(body["total_extracted_pages"], 0)

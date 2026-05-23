@@ -53,6 +53,40 @@ function _rvCurrentPayload() {
     return payload;
 }
 
+function _rvExportResult(result) {
+    if (Array.isArray(result)) return result.map(r => _rvExportResult(r));
+    if (!result || typeof result !== 'object') return result;
+    const out = { ...result };
+    if (Array.isArray(out.line_items)) {
+        out.line_items = out.line_items.map(item =>
+            item && typeof item === 'object'
+                ? Object.fromEntries(Object.entries(item).filter(([k]) => k !== '_page'))
+                : item
+        );
+    }
+    return out;
+}
+
+function _rvAnnotateLineItemPages(lineItems, pageResults) {
+    if (!Array.isArray(lineItems) || !Array.isArray(pageResults) || !pageResults.length) return;
+    if (lineItems.every(item => item && item._page != null)) return;
+    const sorted = [...pageResults]
+        .filter(pr => !pr._error)
+        .sort((a, b) => (a._page || 0) - (b._page || 0));
+    let offset = 0;
+    for (const pr of sorted) {
+        const items = (pr.fields || pr).line_items;
+        if (!Array.isArray(items)) continue;
+        for (let i = 0; i < items.length; i++) {
+            const row = lineItems[offset + i];
+            if (row && typeof row === 'object' && row._page == null) {
+                row._page = pr._page || 1;
+            }
+        }
+        offset += items.length;
+    }
+}
+
 function _rvRecordIndexForPage(pageNumber) {
     if (!_rvAllResults.length) return 0;
     return Math.max(0, Math.min(_rvAllResults.length - 1, pageNumber - 1));
@@ -191,6 +225,8 @@ async function renderReviewPage(app, extractionId) {
         } else {
             _rvSingleResult = _cloneJson(_normalizeReviewRecord(effectiveResult));
             _rvSingleOriginalResult = _cloneJson(_normalizeReviewRecord(origResult));
+            _rvAnnotateLineItemPages(_rvSingleResult.line_items, data.page_results);
+            _rvAnnotateLineItemPages(_rvSingleOriginalResult.line_items, data.page_results);
             _rvAllResults = [];
             _rvAllOriginalResults = [];
             _rvAllFieldLocs = [];
@@ -299,7 +335,7 @@ async function renderReviewPage(app, extractionId) {
     </main>
     <aside class="right-panel review-json-panel">
         <div class="section-title">JSON Output</div>
-        <pre class="review-json-pre" id="rvJsonPre">${JSON.stringify(_rvResult, null, 2)}</pre>
+        <pre class="review-json-pre" id="rvJsonPre">${JSON.stringify(_rvExportResult(_rvResult), null, 2)}</pre>
     </aside>
     <div class="bottom-bar">
         <div class="review-stats">
@@ -482,7 +518,7 @@ function rvOnFieldEdit(input) {
 function rvUpdateJSON() {
     const pre = document.getElementById('rvJsonPre');
     if (pre) {
-        pre.textContent = JSON.stringify(_rvResult, null, 2);
+        pre.textContent = JSON.stringify(_rvExportResult(_rvResult), null, 2);
     }
 }
 
@@ -1355,13 +1391,13 @@ function rvApplyZoom() {
 // ── Review: Actions ──────────────────────────────────────────────────
 
 function rvCopyJSON() {
-    navigator.clipboard.writeText(JSON.stringify(_rvCurrentPayload(), null, 2));
+    navigator.clipboard.writeText(JSON.stringify(_rvExportResult(_rvCurrentPayload()), null, 2));
     showToast('JSON copied to clipboard');
 }
 
 function rvDownloadJSON() {
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([JSON.stringify(_rvCurrentPayload(), null, 2)], { type: 'application/json' }));
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(_rvExportResult(_rvCurrentPayload()), null, 2)], { type: 'application/json' }));
     a.download = `review_${_rvExtractionId || Date.now()}.json`;
     a.click();
 }
@@ -1393,7 +1429,7 @@ async function rvConfirm() {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    corrected_result: payload,
+                    corrected_result: _rvExportResult(payload),
                     field_locations: finalFieldLocs,
                     reason_code: 'manual_review',
                     note: combinedNote,

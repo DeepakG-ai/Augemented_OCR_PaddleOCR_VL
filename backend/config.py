@@ -14,6 +14,31 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(
+            f"Environment variable {name!r} must be an integer, got: {raw!r}"
+        )
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        raise ValueError(
+            f"Environment variable {name!r} must be a number, got: {raw!r}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
@@ -24,34 +49,33 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://augocr:augocr@localhost:5
 # ---------------------------------------------------------------------------
 LLM_URL              = os.getenv("LLM_URL",   "http://localhost:8001/v1/chat/completions")
 LLM_MODEL            = os.getenv("LLM_MODEL", "qwen3vl")
-LLM_TEMPERATURE      = float(os.getenv("LLM_TEMPERATURE",      "0.6"))
-LLM_TOP_P            = float(os.getenv("LLM_TOP_P",            "0.95"))
-LLM_PRESENCE_PENALTY = float(os.getenv("LLM_PRESENCE_PENALTY", "1.0"))
-LLM_MAX_TOKENS_FIELDS = int(os.getenv("LLM_MAX_TOKENS_FIELDS", "6000"))
-LLM_MAX_TOKENS_BBOX   = int(os.getenv("LLM_MAX_TOKENS_BBOX",   "1500"))
-LLM_TIMEOUT           = float(os.getenv("LLM_TIMEOUT",          "300"))
+LLM_TEMPERATURE      = _env_float("LLM_TEMPERATURE",      0.7)
+LLM_TOP_P            = _env_float("LLM_TOP_P",            0.8)
+LLM_PRESENCE_PENALTY = _env_float("LLM_PRESENCE_PENALTY", 1.5)
+LLM_MAX_TOKENS_FIELDS = _env_int("LLM_MAX_TOKENS_FIELDS", 8192)
+LLM_TIMEOUT           = _env_float("LLM_TIMEOUT",          300.0)
 
 # ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
-WORKER_POLL_SECONDS = float(os.getenv("WORKER_POLL_SECONDS", "1.0"))
+WORKER_POLL_SECONDS = _env_float("WORKER_POLL_SECONDS", 1.0)
 
 # ---------------------------------------------------------------------------
 # HTTP / API
 # ---------------------------------------------------------------------------
 RATE_LIMIT_PER_MINUTE = os.getenv("RATE_LIMIT_PER_MINUTE", "30")
-MAX_UPLOAD_MB         = int(os.getenv("MAX_UPLOAD_MB", "50"))
+MAX_UPLOAD_MB         = _env_int("MAX_UPLOAD_MB", 50)
 MAX_UPLOAD_BYTES      = MAX_UPLOAD_MB * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # PDF / image processing
 # ---------------------------------------------------------------------------
-MAX_LONG_SIDE_PX = int(os.getenv("MAX_LONG_SIDE_PX", "960"))
-MAX_PIXELS       = int(os.getenv("MAX_PIXELS",       str(960 * 720)))   # 691,200 px
-JPEG_QUALITY     = int(os.getenv("JPEG_QUALITY",     "92"))
-DPI_FLOOR        = int(os.getenv("DPI_FLOOR",        "96"))
-DPI_DEFAULT      = int(os.getenv("DPI_DEFAULT",      "120"))
-PDF_WORKERS      = int(os.getenv("PDF_WORKERS",      "2"))
+MAX_LONG_SIDE_PX = _env_int("MAX_LONG_SIDE_PX", 1536)
+MAX_PIXELS       = _env_int("MAX_PIXELS",       1536 * 1120)   # 1,720,320 px
+JPEG_QUALITY     = _env_int("JPEG_QUALITY",     92)
+DPI_FLOOR        = _env_int("DPI_FLOOR",        96)
+DPI_DEFAULT      = _env_int("DPI_DEFAULT",      128)
+PDF_WORKERS      = _env_int("PDF_WORKERS",      2)
 
 # ---------------------------------------------------------------------------
 # Object store (MinIO + local fallback)
@@ -79,8 +103,8 @@ PIPELINE_LOG_DIR = Path(os.getenv("PIPELINE_LOG_DIR", "logs/pipeline"))
 # ---------------------------------------------------------------------------
 # Subscription / page limits
 # ---------------------------------------------------------------------------
-DEFAULT_SUBSCRIPTION_LIMIT    = int(os.getenv("DEFAULT_SUBSCRIPTION_LIMIT", "0"))
-SUBSCRIPTION_WARNING_THRESHOLD = float(os.getenv("SUBSCRIPTION_WARNING_THRESHOLD", "0.9"))  # 90%
+DEFAULT_SUBSCRIPTION_LIMIT     = _env_int("DEFAULT_SUBSCRIPTION_LIMIT", 0)
+SUBSCRIPTION_WARNING_THRESHOLD = _env_float("SUBSCRIPTION_WARNING_THRESHOLD", 0.9)  # 90%
 
 # ---------------------------------------------------------------------------
 # Debug toggles

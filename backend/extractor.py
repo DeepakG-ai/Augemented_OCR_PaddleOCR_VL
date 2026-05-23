@@ -150,6 +150,7 @@ Count the number of rows in the line items table FIRST, then extract that exact 
 - Extract ONLY what is explicitly visible in the document image.
 - Never guess or fabricate data.
 - STRICTLY return ONLY valid JSON. No markdown fences, no explanation, no extra text.
+- Treat each field independently. A missing field gets null; all other visible fields must still be extracted. Do not return all fields as null because one field is absent.
 - Use null for missing fields, never omit them.
 - For line_items, return an array even if only one item exists.
 - Dates should be in the format they appear in the document.
@@ -455,7 +456,7 @@ async def call_llm(
             logger=__name__,
             raw=str(resp_json)[:200],
         )
-        return {}
+        return {"_error": "empty_choices", "_page": page_num, "_raw": str(resp_json)[:200]}
     raw: str = (_choices[0].get("message") or {}).get("content", "").strip()
     raw = _JSON_FENCE_RE.sub("", raw)
     raw = _FENCE_END_RE.sub("", raw)
@@ -488,6 +489,7 @@ async def call_llm(
             repaired = repair_json(raw, return_objects=True)
             if isinstance(repaired, dict):
                 logger.warning("LLM JSON recovered via json_repair (page %d)", page_num)
+                repaired["_repaired"] = True
                 await _record_usage_if_needed()
                 return _strip_newlines(repaired)
         except ImportError:
@@ -699,7 +701,8 @@ async def extract_document(
                     if k not in ("line_items", "_format", "boxes")
                 ])
 
-    final = normalize_header_values(final)
+    if not (isinstance(final, dict) and final.get("_all_pages_failed")):
+        final = normalize_header_values(final)
 
     return {
         "result": final,
@@ -775,7 +778,8 @@ def merge_results(
     """
     valid_pages = [pr for pr in page_results if "_error" not in pr]
     if not valid_pages:
-        return {}
+        errors = [pr.get("_error", "unknown") for pr in page_results]
+        return {"_all_pages_failed": True, "errors": errors}
 
     _meta_keys = {"_page", "_total_pages", "_error", "line_items", "fields", "boxes"}
 
@@ -797,7 +801,8 @@ def merge_results(
                 if key != "line_items":
                     merged_fields[key] = val
 
-        # Line items from all pages
+        # Line items from all pages — tag each item with _page so the review UI
+        # can show only the current page's rows while displaying the full merged result.
         all_items: list[dict] = []
         for pr in valid_pages:
             pr_fields = pr.get("fields", {})

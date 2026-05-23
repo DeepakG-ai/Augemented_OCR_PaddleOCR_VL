@@ -95,6 +95,11 @@ def compute_pdf_geometry(
     try:
         for i, meta in enumerate(page_sizes):
             if i >= len(pdf):
+                logger.warning(
+                    "geometry: page_sizes has %d entries but PDF only has %d pages — "
+                    "stopping early (index %d)",
+                    len(page_sizes), len(pdf), i,
+                )
                 break
             try:
                 words, char_count, is_digital = _digital_words_for_page(

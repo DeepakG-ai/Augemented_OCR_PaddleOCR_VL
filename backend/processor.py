@@ -86,7 +86,12 @@ def _render_pdf_sync(file_bytes: bytes, dpi: int = DPI_DEFAULT, max_pages: int |
     """
     results: list[dict] = []
 
-    pdf = pdfium.PdfDocument(file_bytes)
+    pdf = None
+    try:
+        pdf = pdfium.PdfDocument(file_bytes)
+    except Exception as exc:
+        raise ValueError(f"PDF could not be opened (corrupt or unsupported format): {exc}") from exc
+
     total_pages = len(pdf)
     render_count = min(total_pages, max_pages) if max_pages else total_pages
 
@@ -157,7 +162,8 @@ def _render_pdf_sync(file_bytes: bytes, dpi: int = DPI_DEFAULT, max_pages: int |
                 logger.warning("Skipping page %d — render error: %s", page_num, page_err)
 
     finally:
-        pdf.close()  # always release PDFium document resources
+        if pdf is not None:
+            pdf.close()  # always release PDFium document resources
 
     logger.info("PDF render complete — %d/%d pages OK", len(results), total_pages)
     return results
