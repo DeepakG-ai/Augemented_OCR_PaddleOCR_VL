@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Augmented OCR — Production Architecture</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #f7f6f2; --surface: #ffffff; --surface-2: #f3f0ec;
+      --text: #1f2937; --muted: #6b7280; --border: #e5e0d9;
+      --primary: #0f766e; --shadow: 0 8px 28px rgba(15,23,42,0.08);
+      --radius: 16px; --success: #166534; --danger: #9f1239; --warning: #b45309;
+    }
+    [data-theme="dark"] {
+      --bg: #0f172a; --surface: #1e293b; --surface-2: #273349;
+      --text: #f1f5f9; --muted: #94a3b8; --border: #334155;
+      --primary: #2dd4bf; --shadow: 0 8px 28px rgba(0,0,0,0.3);
+      --success: #22c55e; --danger: #fb7185; --warning: #fbbf24;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: Inter, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; }
+    .wrap { max-width: 1360px; margin: 0 auto; padding: 32px 24px; }
+    header { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; margin-bottom: 28px; flex-wrap: wrap; }
+    header h1 { font-size: clamp(1.6rem, 3vw, 2.4rem); font-weight: 800; }
+    header p { color: var(--muted); margin-top: 6px; max-width: 780px; }
+    .toggle-btn { padding: 10px 16px; border-radius: 12px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font-family: Inter, sans-serif; font-weight: 600; cursor: pointer; white-space: nowrap; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); padding: 24px; }
+    .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; margin-bottom: 18px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; margin-bottom: 18px; }
+    .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 18px; }
+    h2 { font-size: 1.15rem; font-weight: 700; margin-bottom: 12px; }
+    h3 { font-size: 0.95rem; font-weight: 600; margin-bottom: 8px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .sec-title { font-size: 1.35rem; font-weight: 700; margin: 28px 0 14px; }
+    ul { padding-left: 18px; } li { margin: 5px 0; }
+    code, .mono { font-family: 'IBM Plex Mono', monospace; font-size: 0.88rem; background: var(--surface-2); padding: 1px 5px; border-radius: 5px; }
+    .kpi { background: var(--surface-2); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
+    .kpi strong { display: block; font-size: 1.6rem; font-weight: 800; margin-bottom: 4px; color: var(--primary); }
+    .badge { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 0.78rem; font-weight: 700; border: 1px solid var(--border); background: var(--surface-2); margin: 3px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+    th, td { padding: 11px 14px; border-bottom: 1px solid var(--border); text-align: left; font-size: 0.92rem; }
+    th { background: var(--surface-2); font-weight: 600; }
+    .mermaid-box { background: #0b1220; border-radius: var(--radius); padding: 20px; overflow-x: auto; margin-bottom: 18px; }
+    .mermaid { min-width: 860px; }
+    .flow-states { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+    .state { background: var(--surface-2); border: 1px solid var(--border); border-radius: 999px; padding: 6px 14px; font-size: 0.85rem; font-family: 'IBM Plex Mono', monospace; }
+    .arrow { color: var(--muted); font-size: 1.2rem; }
+    .state.fail { color: var(--danger); border-color: var(--danger); }
+    .state.ok { color: var(--success); border-color: var(--success); }
+    .tag { display: inline-block; padding: 3px 10px; border-radius: 6px; font-size: 0.78rem; font-weight: 700; margin-right: 6px; }
+    .tag.high { background: rgba(239,68,68,0.12); color: var(--danger); }
+    .tag.normal { background: rgba(59,130,246,0.12); color: #3b82f6; }
+    .tag.low { background: rgba(107,114,128,0.12); color: var(--muted); }
+    .phase { border-left: 3px solid var(--primary); padding-left: 16px; margin-bottom: 16px; }
+    .phase h2 { color: var(--primary); }
+    pre.code-block { background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px; padding: 16px; overflow-x: auto; font-family: 'IBM Plex Mono', monospace; font-size: 0.85rem; line-height: 1.7; white-space: pre; }
+    @media(max-width:1000px) { .grid-2,.grid-3,.grid-4 { grid-template-columns: 1fr; } }
+    @media(max-width:640px) { .wrap { padding: 16px; } }
+  </style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div>
+      <h1>Augmented OCR — Production Architecture</h1>
+      <p>Blueprint for converting the current working codebase into a production-grade, multi-tenant, queue-driven, observable document extraction platform.</p>
+    </div>
+    <button class="toggle-btn" onclick="toggleTheme()">Toggle theme</button>
+  </header>
+
+  <!-- KPIs -->
+  <div class="grid-4" style="margin-bottom:24px">
+    <div class="kpi"><strong>Multi-tenant</strong>Full client isolation at DB, API, queue and storage layers.</div>
+    <div class="kpi"><strong>Vendor-aware</strong>First-page detection resolves vendor + template before extraction.</div>
+    <div class="kpi"><strong>Metered</strong>Per-page tokens, latency, retries, cost estimates all recorded.</div>
+    <div class="kpi"><strong>Concurrent</strong>Client A and Client B at 10 PM both run — no blocking.</div>
+  </div>
+
+  <!-- Workflow diagram -->
+  <div class="sec-title">End-to-end workflow</div>
+  <div class="mermaid-box">
+    <div class="mermaid">
+flowchart LR
+  A["📄 Upload PDF / Folder"] --> B["API Gateway"]
+  B --> C["Object Storage"]
+  B --> D["Document + Job Record (DB)"]
+  D --> E["Queue: preprocessing"]
+  E --> F["Render First Page"]
+  F --> G["Vendor Detection Service"]
+  G --> H{"Vendor found?"}
+  H -- Yes --> I["Queue: extraction"]
+  H -- No --> J["Manual Review Queue"]
+  I --> K["Qwen Extraction Per Page"]
+  K --> L["Validation + Normalization"]
+  L --> M["Results + Page Lineage Stored"]
+  M --> N["Usage Events Stored"]
+  M --> O["Export / Webhook / UI"]
+  N --> P["Admin + Client Dashboards"]
+  J --> P
+    </div>
+  </div>
+
+  <!-- State machine -->
+  <div class="sec-title">Document state machine</div>
+  <div class="card" style="margin-bottom:18px">
+    <div class="flow-states">
+      <span class="state">uploaded</span><span class="arrow">→</span>
+      <span class="state">stored</span><span class="arrow">→</span>
+      <span class="state">preprocessed</span><span class="arrow">→</span>
+      <span class="state">vendor_detected</span><span class="arrow">→</span>
+      <span class="state">extracting</span><span class="arrow">→</span>
+      <span class="state">validating</span><span class="arrow">→</span>
+      <span class="state ok">completed</span>
+    </div>
+    <div class="flow-states" style="margin-top:12px">
+      <span class="state fail">failed_retryable</span><span class="arrow">→</span>
+      <span class="state">retried</span>
+      &nbsp;&nbsp;&nbsp;
+      <span class="state fail">failed_terminal</span><span class="arrow">→</span>
+      <span class="state">manual_review</span>
+    </div>
+  </div>
+
+  <!-- Tenant isolation + Scheduler -->
+  <div class="grid-2">
+    <div class="card">
+      <h2>Tenant isolation rules</h2>
+      <ul>
+        <li>Every tenant-owned table carries <code>tenant_id</code>.</li>
+        <li>Every storage key is prefixed: <code>tenants/{id}/docs/{doc_id}/</code></li>
+        <li>Every queue payload includes <code>tenant_id</code>, <code>job_id</code>, <code>document_id</code>.</li>
+        <li>Every log + trace span carries tenant context.</li>
+        <li>Admin bypasses tenant filter explicitly — clients never can.</li>
+        <li>PostgreSQL row-level security strongly recommended.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h2>Scheduler — Client A &amp; B at 10 PM</h2>
+      <ul>
+        <li>Scheduler only <strong>enqueues</strong> due work into durable queue.</li>
+        <li>Both clients get independent <code>batch_run</code> records.</li>
+        <li>Worker pool processes both concurrently.</li>
+        <li>Per-tenant fairness limit: max 5 active docs at once.</li>
+        <li>Global GPU workers: 20. Per-doc parallel pages: 4.</li>
+        <li>Use Celery+Redis, Dramatiq, or RQ — not in-process cron.</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- Folder structure -->
+  <div class="sec-title">Recommended backend structure</div>
+  <div class="card" style="margin-bottom:18px">
+    <pre class="code-block">backend/
+  src/
+    app/
+      api/v1/
+        admin/        ← platform admin endpoints
+        auth/         ← login, JWT, refresh
+        tenants/      ← tenant CRUD
+        vendors/      ← vendor + template management
+        documents/    ← upload, status, results
+        jobs/         ← job status and retries
+        schedules/    ← schedule definitions
+        exports/      ← JSON/CSV export
+        usage/        ← token/page/cost summaries
+      core/
+        config.py     ← settings + env
+        security.py   ← auth, JWT, RBAC
+        tenancy.py    ← tenant context middleware
+        logging.py    ← structured logging setup
+        tracing.py    ← Phoenix / OTEL tracing
+        exceptions.py ← domain exceptions
+      domain/
+        tenants/ vendors/ documents/ extraction/ scheduling/ billing/ audits/
+      services/
+        ingestion/ preprocessing/ vendor_detection/ extraction/ validation/ exporting/
+      workers/
+        queue_app.py document_tasks.py page_tasks.py export_tasks.py schedule_tasks.py
+      infrastructure/
+        db/ (models/ repositories/ migrations/)
+        object_store/ cache/ queue/ model_gateway/ observability/
+      schemas/
+      tests/
+        unit/ integration/ contract/ e2e/</pre>
+  </div>
+
+  <!-- Refactor map -->
+  <div class="sec-title">Current → target refactor map</div>
+  <div class="card" style="margin-bottom:18px">
+    <table>
+      <thead><tr><th>Current file</th><th>Problem</th><th>Target direction</th></tr></thead>
+      <tbody>
+        <tr><td><code>main.py</code></td><td>Mixes routes, logic, orchestration</td><td>Routers + service layer + startup wiring</td></tr>
+        <tr><td><code>db.py</code></td><td>All DB logic centralized in one giant file</td><td>Models + repositories + migrations</td></tr>
+        <tr><td><code>worker.py</code></td><td>Coupled workflow, hard to scale independently</td><td>Queue tasks + orchestration services</td></tr>
+        <tr><td><code>vendor_detector.py</code></td><td>Needs explicit contract and versioning</td><td>Vendor-detection service with eval set</td></tr>
+        <tr><td><code>extractor.py</code>, <code>ocr_runner.py</code></td><td>Missing validation + observability layers</td><td>Preprocessing + inference + post-processing separation</td></tr>
+        <tr><td><code>text_matcher.py</code>, <code>spatial_memory.py</code></td><td>Good logic buried in large files</td><td>Grounding module under extraction/ with focused tests</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Queue design -->
+  <div class="sec-title">Queue design</div>
+  <div class="card" style="margin-bottom:18px">
+    <table>
+      <thead><tr><th>Queue</th><th>Priority</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>vendor-detection</code></td><td><span class="tag high">High</span></td><td>Fast first-page classification</td></tr>
+        <tr><td><code>extraction-high</code></td><td><span class="tag high">High</span></td><td>Priority extraction jobs</td></tr>
+        <tr><td><code>extraction-default</code></td><td><span class="tag normal">Normal</span></td><td>Standard extraction jobs</td></tr>
+        <tr><td><code>preprocessing</code></td><td><span class="tag normal">Normal</span></td><td>PDF split and page rendering</td></tr>
+        <tr><td><code>validation</code></td><td><span class="tag normal">Normal</span></td><td>Post-extraction schema validation</td></tr>
+        <tr><td><code>export</code></td><td><span class="tag low">Low</span></td><td>JSON/CSV export generation</td></tr>
+        <tr><td><code>webhook</code></td><td><span class="tag low">Low</span></td><td>ERP/webhook delivery</td></tr>
+        <tr><td><code>dead-letter</code></td><td>—</td><td>Failed jobs after all retries exhausted</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Hallucination + Metrics -->
+  <div class="grid-2">
+    <div class="card">
+      <h2>Hallucination controls for Qwen</h2>
+      <ul>
+        <li>Strict JSON schema per vendor template.</li>
+        <li>Prompt versioning — immutable template history.</li>
+        <li>Vendor-specific contracts, not one generic prompt.</li>
+        <li>OCR/bbox grounding for extracted field values.</li>
+        <li>Confidence scoring per field.</li>
+        <li>Reject/review rules: impossible totals, missing IDs, invalid dates.</li>
+        <li>Store raw model response separately from normalized output.</li>
+        <li>Track hallucination rate per template + model version.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h2>Metrics per page / document</h2>
+      <h3>Per page</h3>
+      <ul>
+        <li><code>render_latency_ms</code>, <code>ocr_latency_ms</code>, <code>qwen_latency_ms</code></li>
+        <li><code>input_tokens</code>, <code>output_tokens</code>, <code>total_tokens</code></li>
+        <li><code>prompt_version</code>, <code>model_version</code>, <code>retry_count</code></li>
+      </ul>
+      <h3 style="margin-top:10px">Per document</h3>
+      <ul>
+        <li><code>tenant_id</code>, <code>vendor_id</code>, <code>template_id</code></li>
+        <li><code>end_to_end_latency_ms</code>, <code>cost_estimate</code></li>
+        <li><code>failure_reason</code>, <code>started_at</code>, <code>finished_at</code></li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- Edge cases -->
+  <div class="sec-title">Edge cases to handle</div>
+  <div class="grid-3">
+    <div class="card">
+      <h2>File issues</h2>
+      <ul>
+        <li>Corrupted or password-protected PDF</li>
+        <li>Empty PDF</li>
+        <li>Scanned image with no readable text</li>
+        <li>Page rotation or severe skew</li>
+        <li>Duplicate upload detection</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h2>Vendor detection issues</h2>
+      <ul>
+        <li>First page is a cover/title page</li>
+        <li>Vendor not in registered list</li>
+        <li>Mixed-vendor pages in one PDF</li>
+        <li>Low confidence score — needs review threshold</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h2>Extraction + system issues</h2>
+        <ul>
+        <li>Malformed JSON from Qwen</li>
+        <li>Model timeout mid-document</li>
+        <li>Same schedule triggered twice (idempotency)</li>
+        <li>Client hits quota limit mid-job</li>
+        <li>Tenant accesses another tenant's document ID</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- Scaling -->
+  <div class="sec-title">Scaling plan</div>
+  <div class="grid-3">
+    <div class="phase">
+      <h2>Phase 1 — Now</h2>
+      <ul>
+        <li>Modular monolith</li>
+        <li>Single API + separate worker service</li>
+        <li>PostgreSQL + Redis + object storage</li>
+        <li>Solid isolation and observability</li>
+      </ul>
+    </div>
+    <div class="phase">
+      <h2>Phase 2 — Scale out</h2>
+      <ul>
+        <li>Dedicated worker pools per stage</li>
+        <li>Horizontal autoscaling</li>
+        <li>GPU-aware routing</li>
+        <li>Per-tenant throttling policies</li>
+      </ul>
+    </div>
+    <div class="phase">
+      <h2>Phase 3 — Platform</h2>
+      <ul>
+        <li>Independent model gateway service</li>
+        <li>Usage analytics warehouse</li>
+        <li>Multi-region storage + DR</li>
+        <li>Billing and quota enforcement</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- Roadmap -->
+  <div class="sec-title">Immediate refactor priorities</div>
+  <div class="card">
+    <table>
+      <thead><tr><th>#</th><th>Action</th><th>Outcome</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Freeze features, write this architecture into repo</td><td>Shared clarity for all future work</td></tr>
+        <tr><td>2</td><td>Split <code>main.py</code>, <code>db.py</code>, <code>worker.py</code></td><td>Clear module ownership</td></tr>
+        <tr><td>3</td><td>Tenant-aware repositories + service boundaries</td><td>Hard isolation guarantees</td></tr>
+        <tr><td>4</td><td>Replace cron with durable queue scheduler</td><td>Concurrent, reliable multi-tenant runs</td></tr>
+        <tr><td>5</td><td>Add usage events, validation, manual review flow</td><td>Trustworthy production extraction</td></tr>
+        <tr><td>6</td><td>Add regression test suite per top vendor template</td><td>Catch hallucinations early</td></tr>
+        <tr><td>7</td><td>Admin + client dashboards with live metrics</td><td>Full observability</td></tr>
+        <tr><td>8</td><td>Resume feature building on clean foundation</td><td>Sustainable velocity</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p style="margin-top:24px; color:var(--muted); font-size:0.88rem">Generated for DeepakG-ai/Augemented_OCR_PaddleOCR_VL · May 2026 · Treat this as a living document.</p>
+</div>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+<script>
+  function toggleTheme() {
+    const root = document.documentElement;
+    root.setAttribute('data-theme', root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
+  }
+</script>
+</body>
+</html>
