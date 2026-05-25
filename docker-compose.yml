@@ -124,6 +124,7 @@ services:
       MINIO_SECURE: "false"
       MLFLOW_TRACKING_URI: http://mlflow:5000
       LLM_URL: http://host.docker.internal:8001/v1/chat/completions
+      LLM_PAGE_BATCH_SIZE: ${LLM_PAGE_BATCH_SIZE:-1}
     depends_on:
       postgres:
         condition: service_healthy

@@ -34,13 +34,13 @@ class ApplyMappingTests(unittest.TestCase):
         for target in field_mapper.HEADER_TARGETS:
             self.assertIn(target, mapped)
         self.assertIsNone(mapped["invoice_total"])
-        # Line items are renamed under "items".
-        self.assertEqual(len(mapped["items"]), 2)
-        self.assertEqual(mapped["items"][0]["item"], "GHO-5035")
-        self.assertEqual(mapped["items"][0]["unit_price"], 70)
-        self.assertIsNone(mapped["items"][0]["line_total"])
+        # Line items are renamed under "line_items".
+        self.assertEqual(len(mapped["line_items"]), 2)
+        self.assertEqual(mapped["line_items"][0]["item"], "GHO-5035")
+        self.assertEqual(mapped["line_items"][0]["unit_price"], 70)
+        self.assertIsNone(mapped["line_items"][0]["line_total"])
         # Source-only fields (qty) are dropped — not a canonical target.
-        self.assertNotIn("qty", mapped["items"][0])
+        self.assertNotIn("qty", mapped["line_items"][0])
 
     def test_list_result_maps_each_document(self):
         result = [
@@ -52,9 +52,9 @@ class ApplyMappingTests(unittest.TestCase):
 
         self.assertIsInstance(mapped, list)
         self.assertEqual(mapped[0]["po_number"], "A-1")
-        self.assertEqual(mapped[0]["items"][0]["item"], "X1")
+        self.assertEqual(mapped[0]["line_items"][0]["item"], "X1")
         self.assertEqual(mapped[1]["po_number"], "A-2")
-        self.assertEqual(mapped[1]["items"], [])
+        self.assertEqual(mapped[1]["line_items"], [])
 
     def test_unknown_target_in_map_is_ignored(self):
         result = {"po_no": "P-9", "line_items": []}
@@ -65,9 +65,9 @@ class ApplyMappingTests(unittest.TestCase):
     def test_empty_mapping_yields_canonical_skeleton(self):
         result = {"po_no": "P-1", "line_items": [{"part_number": "X"}]}
         mapped = field_mapper.apply_mapping(result, {})
-        self.assertEqual(set(mapped) - {"items"}, set(field_mapper.HEADER_TARGETS))
+        self.assertEqual(set(mapped) - {"line_items"}, set(field_mapper.HEADER_TARGETS))
         self.assertTrue(all(mapped[t] is None for t in field_mapper.HEADER_TARGETS))
-        self.assertEqual(mapped["items"], [{t: None for t in field_mapper.LINE_TARGETS}])
+        self.assertEqual(mapped["line_items"], [{t: None for t in field_mapper.LINE_TARGETS}])
 
     def test_non_dict_result_returned_unchanged(self):
         self.assertIsNone(field_mapper.apply_mapping(None, {"header_map": {}, "line_map": {}}))
@@ -77,8 +77,8 @@ class ApplyMappingTests(unittest.TestCase):
         result = {"line_items": [{"part_number": "X1"}, "garbage", None]}
         mapping = {"header_map": {}, "line_map": {"part_number": "item"}}
         mapped = field_mapper.apply_mapping(result, mapping)
-        self.assertEqual(len(mapped["items"]), 1)
-        self.assertEqual(mapped["items"][0]["item"], "X1")
+        self.assertEqual(len(mapped["line_items"]), 1)
+        self.assertEqual(mapped["line_items"][0]["item"], "X1")
 
     def test_missing_source_field_maps_to_none(self):
         result = {"po_no": "P-7", "line_items": []}

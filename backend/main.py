@@ -1380,6 +1380,31 @@ async def get_vendor_gold_corrections(
     return {"vendor_id": vendor_id, "fields": fields}
 
 
+@app.delete("/vendors/{vendor_id}/gold-corrections/{field_key}")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def delete_vendor_gold_correction_field(
+    request: Request, vendor_id: str, field_key: str, user: dict = Depends(get_current_user),
+):
+    """Delete saved prompt correction examples for one vendor field."""
+    pool = request.app.state.pool
+    await assert_vendor_access(pool, vendor_id, user)
+    deleted_count = await db_mod.delete_gold_correction_field(pool, vendor_id, field_key)
+    plog.info(
+        "gold_correction_field_deleted",
+        vendor_id=vendor_id,
+        field_key=field_key,
+        deleted_count=deleted_count,
+        deleted_by=user.get("sub"),
+        role=user.get("role"),
+    )
+    return {
+        "status": "deleted",
+        "vendor_id": vendor_id,
+        "field_key": field_key,
+        "gold_correction_fields_deleted": deleted_count,
+    }
+
+
 @app.get("/extractions/{extraction_id}/spatial-memory-fields")
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def get_spatial_memory_fields(
@@ -2815,6 +2840,91 @@ async def get_extraction_reviews(
     if not extraction:
         raise HTTPException(404, detail="Extraction not found")
     return {"extraction_id": extraction_id, "reviews": await db_mod.list_review_events(pool, extraction_id)}
+
+
+@app.get("/vendors/{vendor_id}/spatial-memory")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def list_vendor_spatial_memory(
+    request: Request, vendor_id: str, user: dict = Depends(get_current_user),
+):
+    """List all active spatial memory (manual corrections) for a vendor."""
+    pool = request.app.state.pool
+    await assert_vendor_access(pool, vendor_id, user)
+    entries = await db_mod.list_spatial_memory_for_vendor(pool, vendor_id)
+    plog.info(
+        "spatial_memory_listed",
+        vendor_id=vendor_id,
+        count=len(entries),
+        user_id=user.get("sub"),
+    )
+    return {"vendor_id": vendor_id, "entries": entries, "count": len(entries)}
+
+
+@app.delete("/spatial-memory/{sm_id}")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def delete_spatial_memory_entry(
+    request: Request, sm_id: int, user: dict = Depends(get_current_user),
+):
+    """Delete a specific spatial memory entry. User must have access to its vendor."""
+    pool = request.app.state.pool
+    entry = await db_mod.get_spatial_memory_by_id(pool, sm_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Spatial memory entry not found")
+
+    # Admins may delete any entry; non-admins must own the vendor.
+    if user.get("role") != "admin":
+        await assert_vendor_access(pool, entry["vendor_id"], user)
+
+    deleted = await db_mod.delete_spatial_memory_by_id(
+        pool,
+        sm_id,
+        delete_gold_correction=True,
+    )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Spatial memory entry not found")
+    gold_deleted = int(deleted.get("gold_correction_fields_deleted") or 0)
+
+    plog.info(
+        "spatial_memory_deleted",
+        sm_id=sm_id,
+        vendor_id=entry["vendor_id"],
+        layout_key=entry.get("layout_key"),
+        field_key=entry.get("field_key"),
+        page_number=entry.get("page_number"),
+        gold_correction_fields_deleted=gold_deleted,
+        deleted_by=user.get("sub"),
+        role=user.get("role"),
+    )
+    return {
+        "status": "deleted",
+        "sm_id": sm_id,
+        "vendor_id": entry["vendor_id"],
+        "field_key": entry.get("field_key"),
+        "gold_correction_fields_deleted": gold_deleted,
+    }
+
+
+@app.get("/admin/spatial-memory")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_list_spatial_memory(
+    request: Request,
+    limit: int = 500,
+    offset: int = 0,
+    _user: dict = Depends(require_admin),
+):
+    """Admin: list all active spatial memory entries across all vendors."""
+    pool = request.app.state.pool
+    entries = await db_mod.list_spatial_memory_all(pool, limit=limit, offset=offset)
+    total = await db_mod.count_spatial_memory_all(pool)
+    plog.info(
+        "admin_spatial_memory_listed",
+        count=len(entries),
+        total=total,
+        limit=limit,
+        offset=offset,
+        admin_id=_user.get("sub"),
+    )
+    return {"entries": entries, "count": len(entries), "total": total, "limit": limit, "offset": offset}
 
 
 @app.get("/extractions/{extraction_id}/trace")

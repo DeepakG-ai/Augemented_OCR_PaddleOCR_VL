@@ -144,10 +144,14 @@ function _renderApiKeyCard(k) {
 
         <!-- Label + meta -->
         <div style="flex:1;min-width:0">
-            <div style="font-size:13px;font-weight:600;color:var(--text);margin-bottom:4px;
-                        overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
-                ${escapeHtml(k.label)}
-                <span style="font-size:9px;font-weight:700;letter-spacing:0.12em;color:var(--blue);background:var(--blue-bg,rgba(97,175,239,.1));border:1px solid var(--blue);border-radius:2px;padding:2px 7px;margin-left:8px">API KEY</span>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+                <span style="font-size:13px;font-weight:600;color:var(--text);
+                             overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0">
+                    ${escapeHtml(k.label)}
+                </span>
+                <span style="flex-shrink:0;font-size:9px;font-weight:700;letter-spacing:0.12em;
+                             color:var(--blue);background:var(--blue-bg,rgba(97,175,239,.1));
+                             border:1px solid var(--blue);border-radius:2px;padding:2px 7px">API KEY</span>
             </div>
             <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
                 <span style="font-size:10px;font-family:var(--mono);color:var(--text-dim);letter-spacing:0.04em">${escapeHtml(k.prefix)}</span>

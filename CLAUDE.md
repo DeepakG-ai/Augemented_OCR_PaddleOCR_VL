@@ -174,5 +174,6 @@ Qwen returns two shapes depending on `format_type`:
 | `LLM_MODEL` | `qwen3vl` | model name sent in API requests |
 | `MINIO_ENDPOINT` | `localhost:9000` | object storage |
 | `WORKER_POLL_SECONDS` | `1.0` | worker poll interval |
+| `LLM_PAGE_BATCH_SIZE` | `1` | Pages 2-N processed per concurrent batch; match `--parallel N` on llama-server |
 | `MAX_UPLOAD_MB` | `50` | upload size guard |
 | `RATE_LIMIT_PER_MINUTE` | `30` | slowapi default limit |

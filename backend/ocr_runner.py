@@ -49,6 +49,7 @@ def _get_ocr_engine():
     if not hasattr(_ocr_local, "engine"):
         logger.info("Initializing PaddleOCR engine...")
         t0 = time.perf_counter()
+        from .config import OCR_DEVICE
         from paddleocr import PaddleOCR
         _ocr_local.engine = PaddleOCR(
             text_detection_model_name="PP-OCRv5_mobile_det",
@@ -56,8 +57,8 @@ def _get_ocr_engine():
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
-            device="cpu",
-            enable_mkldnn=True,
+            device=OCR_DEVICE,
+            enable_mkldnn=(OCR_DEVICE == "cpu"),
             cpu_threads=4,
             return_word_box=True,
         )

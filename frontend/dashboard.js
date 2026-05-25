@@ -237,8 +237,8 @@ function _renderClientTable(clients) {
             <tr style="border-bottom:1px solid var(--border);color:var(--text-dim);letter-spacing:0.08em">
                 <th style="text-align:left;padding:8px 12px;font-weight:500">CLIENT</th>
                 <th style="text-align:left;padding:8px 12px;font-weight:500">ROLE</th>
-                <th style="text-align:right;padding:8px 12px;font-weight:500">EXTRACTIONS</th>
-                <th style="text-align:right;padding:8px 12px;font-weight:500">PAGES</th>
+                <th style="text-align:right;padding:8px 12px;font-weight:500">HISTORY</th>
+                <th style="text-align:right;padding:8px 12px;font-weight:500">PAGES USED</th>
                 <th style="text-align:right;padding:8px 12px;font-weight:500">INPUT</th>
                 <th style="text-align:right;padding:8px 12px;font-weight:500">OUTPUT</th>
                 <th style="text-align:right;padding:8px 12px;font-weight:500">TOTAL</th>
@@ -263,7 +263,7 @@ function _renderClientRow(c) {
         <td style="padding:9px 12px;font-weight:500">${escapeHtml(c.email)}</td>
         <td style="padding:9px 12px">${roleBadge}</td>
         <td style="padding:9px 12px;text-align:right;color:var(--text-mid)">${fmtNum(c.total_extractions)}</td>
-        <td style="padding:9px 12px;text-align:right;color:var(--text-mid)">${fmtNum(c.total_pages)}</td>
+        <td style="padding:9px 12px;text-align:right;color:var(--text-mid)">${fmtNum(c.billable_pages)}</td>
         <td style="padding:9px 12px;text-align:right;color:var(--blue)">${fmtTokens(c.total_input_tokens)}</td>
         <td style="padding:9px 12px;text-align:right;color:var(--green)">${fmtTokens(c.total_output_tokens)}</td>
         <td style="padding:9px 12px;text-align:right;font-weight:500">${fmtTokens(c.grand_total)}</td>
@@ -479,11 +479,12 @@ async function renderDashboardPage(app) {
 
     // Admin sees system-wide stats; clients see their own
     const statsEndpoint = isAdmin ? '/admin/stats' : '/user/stats';
-    let stats = {}, days = [];
+    let stats = {}, days = [], subscription = null;
     try {
         const data = await apiJSON(statsEndpoint);
         stats = data.stats || {};
         days  = data.days  || [];
+        subscription = data.subscription || null;
     } catch (e) {
         console.warn('Dashboard fetch error:', e);
     }
@@ -505,19 +506,41 @@ async function renderDashboardPage(app) {
     const totalOutput = Number(stats.total_output_tokens || 0);
     const grandTotal  = totalInput + totalOutput;
 
+    // Subscription quota bar (client only)
+    const subLimit = subscription ? Number(subscription.subscription_limit || 0) : 0;
+    const subUsed  = subscription ? Number(subscription.billable_pages || 0) : 0;
+    const subPct   = subLimit > 0 ? Math.min(100, Math.round(subUsed / subLimit * 100)) : 0;
+    const subColor = subPct >= 90 ? 'var(--red,#e06c75)' : subPct >= 70 ? 'var(--amber)' : 'var(--green)';
+
     app.innerHTML = headerHTML() + `
     <div class="page-content">
         <div class="page-title">Dashboard${isAdmin ? '' : ' — My Usage'}</div>
 
         <!-- KPI strip -->
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:24px">
-            ${_kpiCard('TOTAL PAGES', fmtNum(stats.total_pages), 'var(--blue)', 'pages processed')}
-            ${_kpiCard('EXTRACTIONS', fmtNum(stats.total_extractions), 'var(--green)', 'completed')}
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:${(!isAdmin && subLimit > 0) ? '14px' : '24px'}">
+            ${_kpiCard('PAGES USED', fmtNum(stats.billable_pages), 'var(--blue)', 'lifetime pages (billing)')}
+            ${_kpiCard('HISTORY ITEMS', fmtNum(stats.total_extractions), 'var(--green)', 'visible extractions')}
             ${_kpiCard('INPUT TOKENS', fmtTokens(totalInput), 'var(--blue)', 'prompt tokens')}
             ${_kpiCard('OUTPUT TOKENS', fmtTokens(totalOutput), 'var(--green)', 'completion tokens')}
             ${_kpiCard('GRAND TOTAL', fmtTokens(grandTotal), 'var(--amber)', 'all tokens')}
             ${_kpiCard('LLM CALLS', fmtNum(stats.total_llm_calls), 'var(--text-mid)', 'model invocations')}
         </div>
+
+        <!-- Subscription quota bar (client users with a limit set) -->
+        ${!isAdmin && subLimit > 0 ? `
+        <div style="margin-bottom:24px;background:var(--bg1);border:1px solid var(--border);border-radius:4px;padding:12px 18px">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                <span style="font-size:9px;letter-spacing:0.12em;color:var(--text-dim)">SUBSCRIPTION QUOTA</span>
+                <span style="font-size:10px;color:var(--text-mid)">${fmtNum(subUsed)} / ${fmtNum(subLimit)} pages</span>
+            </div>
+            <div style="height:6px;background:var(--bg2,#2a2a2a);border-radius:3px;overflow:hidden">
+                <div style="height:100%;background:${subColor};width:${subPct}%;transition:width 0.3s"></div>
+            </div>
+            <div style="display:flex;justify-content:space-between;margin-top:5px">
+                <span style="font-size:9px;color:var(--text-dim)">${fmtNum(Math.max(0, subLimit - subUsed))} pages remaining</span>
+                <span style="font-size:9px;color:var(--text-dim)">${subPct}% used</span>
+            </div>
+        </div>` : ''}
 
         <!-- Charts row -->
         <div style="display:grid;grid-template-columns:1fr 260px;gap:16px;align-items:start">

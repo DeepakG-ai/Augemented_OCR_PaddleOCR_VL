@@ -266,8 +266,8 @@ class WriteOutputTests(unittest.TestCase):
             )
             data = json.loads((Path(tmp) / "a.json").read_text())
             extraction = data["extraction"]
-            self.assertEqual(list(extraction.keys()), ["po_number", "items"])
-            self.assertEqual(extraction["items"], [{"item": "Glue"}])
+            self.assertEqual(list(extraction.keys()), ["po_number", "line_items"])
+            self.assertEqual(extraction["line_items"], [{"item": "Glue"}])
 
     def test_missing_output_folder_does_not_raise(self):
         # Should log a warning and return — no exception

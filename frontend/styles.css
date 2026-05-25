@@ -112,7 +112,7 @@ html, body {
     color: var(--text-dim); cursor: pointer;
     border-bottom: 2px solid transparent;
     font-family: var(--mono); text-transform: uppercase;
-    text-decoration: none;
+    text-decoration: none; white-space: nowrap;
 }
 .nav-tab:hover { color: var(--text-mid); }
 .nav-tab.active { color: var(--blue); border-bottom-color: var(--blue); }

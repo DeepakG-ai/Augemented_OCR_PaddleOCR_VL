@@ -184,6 +184,9 @@ async function renderReviewPage(app, extractionId) {
     _rvDirty = false;
     _rvSelectionField = null;
     _rvSelecting = false;
+    _rvSavedRegionsOpen = false;
+    _rvSavedRegions = [];
+    _rvGoldCorrections = {};
 
     // Clean up any prior SVG overlay
     const oldSvg = document.getElementById('rvMappingSvg');
@@ -315,6 +318,12 @@ async function renderReviewPage(app, extractionId) {
         <div id="rvFieldsList"></div>
         <div class="section-title" style="margin-top:0">Line Items</div>
         <div id="rvLineItemsWrap" style="overflow-x:auto;padding:0 4px"></div>
+        <div class="section-title" style="margin-top:0;display:flex;align-items:center;justify-content:space-between;cursor:pointer"
+             onclick="rvToggleSavedRegions()">
+            <span>Saved Corrections</span>
+            <span id="rvSavedRegionsToggle" style="font-size:9px;color:var(--text-dim)">▼ SHOW</span>
+        </div>
+        <div id="rvSavedRegionsPanel" style="display:none"></div>
     </aside>
     <main class="viewer">
         <div id="rvViewer" style="display:flex;flex-direction:column;width:100%;height:100%">
@@ -1467,3 +1476,171 @@ document.addEventListener('keydown', (e) => {
         }
     }
 });
+
+// ── Saved Regions (Spatial Memory) management ─────────────────────────
+
+let _rvSavedRegionsOpen = false;
+let _rvSavedRegions = [];
+let _rvGoldCorrections = {}; // { field_key: correction_diff }
+
+function rvToggleSavedRegions() {
+    _rvSavedRegionsOpen = !_rvSavedRegionsOpen;
+    const panel = document.getElementById('rvSavedRegionsPanel');
+    const toggle = document.getElementById('rvSavedRegionsToggle');
+    if (!panel || !toggle) return;
+    if (_rvSavedRegionsOpen) {
+        toggle.textContent = '▲ HIDE';
+        panel.style.display = 'block';
+        rvLoadSavedRegions();
+    } else {
+        toggle.textContent = '▼ SHOW';
+        panel.style.display = 'none';
+    }
+}
+
+async function rvLoadSavedRegions() {
+    const panel = document.getElementById('rvSavedRegionsPanel');
+    if (!panel || !_rvVendorId) return;
+    panel.innerHTML = '<div style="padding:8px 4px;font-size:10px;color:var(--text-dim)">Loading…</div>';
+    try {
+        const vid = encodeURIComponent(_rvVendorId);
+        const [smResp, gcResp] = await Promise.all([
+            apiJSON(`/vendors/${vid}/spatial-memory`),
+            apiJSON(`/vendors/${vid}/gold-corrections`),
+        ]);
+        _rvSavedRegions   = smResp.entries || [];
+        _rvGoldCorrections = gcResp.fields  || {};
+        rvRenderSavedRegions(_rvSavedRegions, _rvGoldCorrections);
+    } catch (e) {
+        panel.innerHTML = `<div style="padding:8px 4px;font-size:10px;color:var(--red)">Failed: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function rvRenderSavedRegions(entries, goldCorrections) {
+    const panel = document.getElementById('rvSavedRegionsPanel');
+    if (!panel) return;
+
+    // Spatial memory field keys (have a saved bounding box)
+    const smFieldKeys = new Set(entries.map(e => e.field_key));
+
+    // Gold-only = fields in goldCorrections that have NO matching spatial memory entry
+    const goldOnly = Object.keys(goldCorrections || {}).filter(fk => !smFieldKeys.has(fk));
+
+    const hasAnything = entries.length > 0 || goldOnly.length > 0;
+    if (!hasAnything) {
+        panel.innerHTML = '<div style="padding:8px 4px;font-size:10px;color:var(--text-dim)">No saved corrections for this vendor.</div>';
+        return;
+    }
+
+    // ── badge helper (hex, hexBg) ─────────────────────────────────────────
+    // color = CSS var expression for text; hexBg = plain hex for rgba bg/border
+    const badge = (label, cssColor, hexRaw) =>
+        `<span style="font-size:8px;font-weight:700;letter-spacing:0.08em;padding:1px 5px;
+                border-radius:2px;
+                background:rgba(${hexRaw},0.12);
+                color:${cssColor};
+                border:1px solid rgba(${hexRaw},0.35)">
+            ${label}
+        </span>`;
+
+    // ── DEL button helper ─────────────────────────────────────────────────
+    const delBtn = (onclick) =>
+        `<button onclick="${onclick}"
+            style="background:none;border:1px solid var(--red,#e06c75);color:var(--red,#e06c75);
+                   cursor:pointer;padding:2px 6px;font-size:9px;font-family:var(--mono);
+                   border-radius:2px;letter-spacing:0.06em;white-space:nowrap;transition:opacity .15s"
+            onmouseover="this.style.opacity='.7'" onmouseout="this.style.opacity='1'">DEL</button>`;
+
+    // ── row wrapper ───────────────────────────────────────────────────────
+    const rowWrap = (id, inner) =>
+        `<div id="${id}" style="display:grid;grid-template-columns:1fr auto;align-items:center;
+            padding:5px 4px;border-bottom:1px solid var(--border);gap:6px">${inner}</div>`;
+
+    // ── Section 1: Spatial Memory (BOX + PROMPT) ──────────────────────────
+    let html = '';
+    if (entries.length > 0) {
+        html += `<div style="font-size:9px;color:var(--text-dim);padding:6px 4px 2px;letter-spacing:0.07em;
+                     border-bottom:1px solid var(--border);display:flex;align-items:center;gap:6px">
+                   <span>SPATIAL MEMORY</span>
+                   ${badge('BOX + PROMPT', 'var(--green,#22c55e)', '34,197,94')}
+                 </div>`;
+        html += entries.map(e => {
+            const ts  = e.last_verified_at ? new Date(e.last_verified_at).toLocaleDateString() : '—';
+            const src = (e.source_engine || '').replace('paddleocr', 'OCR').replace('pypdfium', 'PDF');
+            const info = `<div>
+                <div style="font-size:10px;font-weight:600;color:var(--text);letter-spacing:0.04em">
+                    ${escapeHtml(e.field_key)}
+                </div>
+                <div style="font-size:9px;color:var(--text-dim);margin-top:1px">
+                    p.${e.page_number} · ${src} · ${ts}
+                </div>
+            </div>`;
+            return rowWrap(`rv-sm-row-${e.id}`,
+                info + delBtn(`rvDeleteSavedRegion(${e.id}, '${escapeJsString(e.field_key)}')`));
+        }).join('');
+    }
+
+    // ── Section 2: Gold-only (PROMPT ONLY) ───────────────────────────────
+    if (goldOnly.length > 0) {
+        html += `<div style="font-size:9px;color:var(--text-dim);padding:6px 4px 2px;letter-spacing:0.07em;
+                     border-bottom:1px solid var(--border);display:flex;align-items:center;gap:6px">
+                   <span>PROMPT EXAMPLES</span>
+                   ${badge('PROMPT ONLY', 'var(--amber,#f59e0b)', '245,158,11')}
+                 </div>`;
+        html += goldOnly.map(fk => {
+            // correction_diff value shape: { original: "...", corrected: "..." }
+            const diff = goldCorrections[fk] || {};
+            const preview = diff.original !== undefined
+                ? `"${escapeHtml(String(diff.original ?? ''))}" → "${escapeHtml(String(diff.corrected ?? ''))}"`
+                : 'correction stored';
+            const info = `<div>
+                <div style="font-size:10px;font-weight:600;color:var(--text);letter-spacing:0.04em">
+                    ${escapeHtml(fk)}
+                </div>
+                <div style="font-size:9px;color:var(--text-dim);margin-top:1px;max-width:160px;
+                            overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+                     title="${escapeHtml(preview)}">
+                    ${preview}
+                </div>
+            </div>`;
+            return rowWrap(`rv-gc-row-${escapeHtml(fk)}`,
+                info + delBtn(`rvDeleteGoldOnlyCorrection('${escapeJsString(fk)}')`));
+        }).join('');
+    }
+
+    panel.innerHTML = html;
+}
+
+async function rvDeleteSavedRegion(smId, fieldKey) {
+    if (!confirm(`Delete saved correction for "${fieldKey}"?\n\nThis removes the saved box region and the prompt correction example for this field.`)) return;
+    try {
+        const resp = await apiJSON(`/spatial-memory/${smId}`, { method: 'DELETE' });
+        _rvSavedRegions = _rvSavedRegions.filter(e => e.id !== smId);
+        // Also remove from gold corrections state (cascade deletes it)
+        delete _rvGoldCorrections[fieldKey];
+        rvRenderSavedRegions(_rvSavedRegions, _rvGoldCorrections);
+        // Remove local warning markers so this field no longer appears as a saved correction.
+        if (_rvExistingSpatialFields) delete _rvExistingSpatialFields[fieldKey];
+        if (_rvExistingCorrectionFields) delete _rvExistingCorrectionFields[fieldKey];
+        rvRenderFields();
+        const promptCount = Number(resp.gold_correction_fields_deleted || 0);
+        showToast(`Saved correction for "${fieldKey}" deleted (${promptCount} prompt example${promptCount === 1 ? '' : 's'})`);
+    } catch (e) {
+        showToast(`Failed to delete: ${e.message}`);
+    }
+}
+
+async function rvDeleteGoldOnlyCorrection(fieldKey) {
+    if (!confirm(`Delete prompt example for "${fieldKey}"?\n\nThis removes the stored correction from the LLM prompt. The field will revert to default extraction behaviour.`)) return;
+    try {
+        const vid = encodeURIComponent(_rvVendorId);
+        await apiJSON(`/vendors/${vid}/gold-corrections/${encodeURIComponent(fieldKey)}`, { method: 'DELETE' });
+        delete _rvGoldCorrections[fieldKey];
+        rvRenderSavedRegions(_rvSavedRegions, _rvGoldCorrections);
+        if (_rvExistingCorrectionFields) delete _rvExistingCorrectionFields[fieldKey];
+        rvRenderFields();
+        showToast(`Prompt example for "${fieldKey}" deleted`);
+    } catch (e) {
+        showToast(`Failed to delete: ${e.message}`);
+    }
+}

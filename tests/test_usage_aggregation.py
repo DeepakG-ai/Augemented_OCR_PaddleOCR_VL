@@ -56,7 +56,7 @@ class UsageAggregationQueryTests(unittest.IsolatedAsyncioTestCase):
                 "role": "client",
                 "is_active": True,
                 "total_extractions": 2,
-                "total_pages": 5,
+                "billable_pages": 5,
                 "total_input_tokens": 1000,
                 "total_output_tokens": 400,
                 "grand_total": 1400,
@@ -67,9 +67,39 @@ class UsageAggregationQueryTests(unittest.IsolatedAsyncioTestCase):
         rows = await db_mod.get_usage_by_client(pool)
 
         self.assertEqual(rows[0]["total_extractions"], 2)
-        self.assertEqual(rows[0]["total_pages"], 5)
+        self.assertEqual(rows[0]["billable_pages"], 5)
         self.assertEqual(rows[0]["grand_total"], 1400)
         self.assertEqual(rows[0]["total_llm_calls"], 5)
+
+    async def test_client_breakdown_page_count_comes_from_llm_usage_not_extractions(self) -> None:
+        """Pages in the client table must be counted from llm_usage so they survive extraction deletion."""
+        pool = MagicMock()
+        conn = AsyncMock()
+        pool.acquire.return_value = fake_acquire(conn)
+        conn.fetch.return_value = []
+
+        await db_mod.get_usage_by_client(pool)
+
+        sql = _compact_sql(conn.fetch.call_args[0][0])
+        # Page count must be COUNT(DISTINCT ...) from llm_usage
+        self.assertIn("COUNT(DISTINCT (lu.extraction_id, lu.page_num))", sql)
+        self.assertIn("lu.call_type = 'extraction'", sql)
+        # Must NOT use SUM(e.total_pages) — that is deletion-sensitive
+        self.assertNotIn("SUM(e.total_pages)", sql)
+
+    async def test_client_breakdown_selects_billable_pages_not_total_pages(self) -> None:
+        """Result column is billable_pages (from llm_usage), not total_pages (from extractions)."""
+        pool = MagicMock()
+        conn = AsyncMock()
+        pool.acquire.return_value = fake_acquire(conn)
+        conn.fetch.return_value = []
+
+        await db_mod.get_usage_by_client(pool)
+
+        sql = conn.fetch.call_args[0][0]
+        self.assertIn("billable_pages", sql)
+        # total_pages from the extractions table must not appear in SELECT
+        self.assertNotIn("et.total_pages", sql)
 
 
 if __name__ == "__main__":

@@ -57,7 +57,7 @@ def _map_document(doc: dict, header_map: dict, line_map: dict) -> dict:
             if target_field in mapped_item:
                 mapped_item[target_field] = raw_item.get(source_field)
         items.append(mapped_item)
-    out["items"] = items
+    out["line_items"] = items
     return out
 
 

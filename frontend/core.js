@@ -246,6 +246,9 @@ async function router() {
     } else if (route === '/admin/api-keys') {
         app.className = 'app';
         await renderApiKeysPage(app);
+    } else if (route === '/admin/corrections') {
+        app.className = 'app';
+        await renderAdminSpatialMemoryPage(app);
     } else if (route === '/review') {
         // Bare /review (no ID) — redirect to last extraction's review
         if (reviewExtractionId) {
@@ -308,6 +311,7 @@ function headerHTML() {
             <a class="nav-tab" data-route="/settings" href="#/settings">Settings</a>
             ${isAdmin ? `<a class="nav-tab" data-route="/admin/users" href="#/admin/users">Users</a>` : ''}
             ${isAdmin ? `<a class="nav-tab" data-route="/admin/api-keys" href="#/admin/api-keys">API Keys</a>` : ''}
+            ${isAdmin ? `<a class="nav-tab" data-route="/admin/corrections" href="#/admin/corrections">Saved Regions</a>` : ''}
         </nav>
         <div class="header-right">
             <button class="theme-toggle-btn" id="themeToggleBtn" onclick="toggleTheme()">${themeLabel}</button>

@@ -916,8 +916,7 @@ async def get_usage_by_client(pool: asyncpg.Pool) -> list[dict]:
             WITH extraction_totals AS (
                 SELECT
                     COALESCE((d.metadata->>'billing_user_id')::UUID, v.user_id) AS user_id,
-                    COUNT(e.id) FILTER (WHERE e.status = 'done')::INT AS total_extractions,
-                    COALESCE(SUM(e.total_pages) FILTER (WHERE e.status = 'done'), 0)::BIGINT AS total_pages
+                    COUNT(e.id) FILTER (WHERE e.status = 'done')::INT AS total_extractions
                 FROM vendors v
                 LEFT JOIN extractions e ON e.vendor_id = v.id
                 LEFT JOIN documents d ON d.id = e.document_id
@@ -929,7 +928,12 @@ async def get_usage_by_client(pool: asyncpg.Pool) -> list[dict]:
                     COALESCE(SUM(lu.prompt_tokens), 0)::BIGINT AS total_input_tokens,
                     COALESCE(SUM(lu.completion_tokens), 0)::BIGINT AS total_output_tokens,
                     COALESCE(SUM(lu.total_tokens), 0)::BIGINT AS grand_total,
-                    COUNT(lu.id)::INT AS total_llm_calls
+                    COUNT(lu.id)::INT AS total_llm_calls,
+                    COUNT(DISTINCT (lu.extraction_id, lu.page_num)) FILTER (
+                        WHERE lu.call_type = 'extraction'
+                          AND lu.extraction_id IS NOT NULL
+                          AND lu.page_num IS NOT NULL
+                    )::INT AS billable_pages
                 FROM llm_usage lu
                 GROUP BY lu.user_id
             )
@@ -939,7 +943,7 @@ async def get_usage_by_client(pool: asyncpg.Pool) -> list[dict]:
                 u.role,
                 u.is_active,
                 COALESCE(et.total_extractions, 0)::INT AS total_extractions,
-                COALESCE(et.total_pages, 0)::BIGINT AS total_pages,
+                COALESCE(ut.billable_pages, 0)::INT AS billable_pages,
                 COALESCE(ut.total_input_tokens, 0)::BIGINT AS total_input_tokens,
                 COALESCE(ut.total_output_tokens, 0)::BIGINT AS total_output_tokens,
                 COALESCE(ut.grand_total, 0)::BIGINT AS grand_total,
@@ -1539,6 +1543,159 @@ async def deactivate_spatial_memory(
         return int(result.split()[-1]) if result else 0
 
 
+async def get_spatial_memory_by_id(
+    pool: asyncpg.Pool,
+    sm_id: int,
+) -> dict | None:
+    """Fetch a single spatial memory entry by primary key (active or inactive)."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, vendor_id, layout_key, field_key, page_number,
+                   normalized_box, source_engine, created_from_extraction_id,
+                   last_verified_at, is_active
+            FROM spatial_memory
+            WHERE id = $1
+            """,
+            sm_id,
+        )
+        if row is None:
+            return None
+        d = dict(row)
+        _parse_jsonb(d, "normalized_box")
+        return d
+
+
+async def _delete_gold_correction_field_conn(
+    conn: asyncpg.Connection,
+    vendor_id: str,
+    field_key: str,
+) -> int:
+    key = str(field_key or "").strip()
+    if not vendor_id or not key:
+        return 0
+    rows = await conn.fetch(
+        """
+        UPDATE gold_examples
+           SET correction_diff = correction_diff - $2::TEXT
+         WHERE vendor_id = $1
+           AND correction_diff IS NOT NULL
+           AND correction_diff ? $2::TEXT
+        RETURNING id, correction_diff
+        """,
+        vendor_id,
+        key,
+    )
+    empty_ids: list[int] = []
+    for row in rows:
+        diff = row["correction_diff"]
+        if isinstance(diff, str):
+            diff = json.loads(diff)
+        if diff == {}:
+            empty_ids.append(int(row["id"]))
+    if empty_ids:
+        await conn.execute(
+            "DELETE FROM gold_examples WHERE id = ANY($1::INT[])",
+            empty_ids,
+        )
+    return len(rows)
+
+
+async def delete_spatial_memory_by_id(
+    pool: asyncpg.Pool,
+    sm_id: int,
+    *,
+    delete_gold_correction: bool = False,
+) -> dict | None:
+    """Hard-delete a spatial memory entry by ID. Returns the deleted row or None."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                DELETE FROM spatial_memory
+                WHERE id = $1
+                RETURNING id, vendor_id, layout_key, field_key, page_number
+                """,
+                sm_id,
+            )
+            if not row:
+                return None
+            result = dict(row)
+            if delete_gold_correction:
+                result["gold_correction_fields_deleted"] = await _delete_gold_correction_field_conn(
+                    conn,
+                    result["vendor_id"],
+                    result["field_key"],
+                )
+            return result
+
+
+async def list_spatial_memory_for_vendor(
+    pool: asyncpg.Pool,
+    vendor_id: str,
+) -> list[dict]:
+    """List all active spatial memory entries for a vendor (all layouts)."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, vendor_id, layout_key, field_key, page_number,
+                   normalized_box, source_engine, created_from_extraction_id,
+                   last_verified_at, is_active
+            FROM spatial_memory
+            WHERE vendor_id = $1 AND is_active = TRUE
+            ORDER BY layout_key, field_key, page_number
+            """,
+            vendor_id,
+        )
+        results = []
+        for r in rows:
+            d = dict(r)
+            _parse_jsonb(d, "normalized_box")
+            results.append(d)
+        return results
+
+
+async def list_spatial_memory_all(
+    pool: asyncpg.Pool,
+    *,
+    limit: int = 500,
+    offset: int = 0,
+) -> list[dict]:
+    """Admin: list all active spatial memory entries across all vendors."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT sm.id, sm.vendor_id, v.name AS vendor_name,
+                   sm.layout_key, sm.field_key, sm.page_number,
+                   sm.normalized_box, sm.source_engine,
+                   sm.created_from_extraction_id,
+                   sm.last_verified_at, sm.is_active,
+                   u.email AS client_email
+            FROM spatial_memory sm
+            LEFT JOIN vendors v ON v.id = sm.vendor_id
+            LEFT JOIN users u ON u.id = v.user_id
+            WHERE sm.is_active = TRUE
+            ORDER BY u.email NULLS LAST, v.name, sm.field_key, sm.page_number
+            LIMIT $1 OFFSET $2
+            """,
+            limit, offset,
+        )
+        results = []
+        for r in rows:
+            d = dict(r)
+            _parse_jsonb(d, "normalized_box")
+            results.append(d)
+        return results
+
+
+async def count_spatial_memory_all(pool: asyncpg.Pool) -> int:
+    """Admin: total count of active spatial memory entries across all vendors."""
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM spatial_memory WHERE is_active = TRUE"
+        )
+
+
 # -- Qwen layout boxes (auto-learned label geometry) -----------------------
 
 async def get_qwen_layout_boxes(
@@ -1792,8 +1949,19 @@ async def get_extraction_mapped_result(pool: asyncpg.Pool, extraction_id: int) -
             "SELECT mapped_result FROM extractions WHERE id = $1", extraction_id,
         )
         if isinstance(val, str):
-            return json.loads(val)
-        return val
+            val = json.loads(val)
+        return _normalize_mapped_result(val)
+
+
+def _normalize_mapped_result(val: Any) -> Any:
+    """Rename legacy 'items' key to 'line_items' in stored mapped results."""
+    if isinstance(val, list):
+        return [_normalize_mapped_result(v) for v in val]
+    if isinstance(val, dict) and "items" in val and "line_items" not in val:
+        out = dict(val)
+        out["line_items"] = out.pop("items")
+        return out
+    return val
 
 
 # -- Document queries ------------------------------------------------------
@@ -2369,6 +2537,21 @@ async def save_gold_example(
             json.dumps(correction_diff) if correction_diff else None,
         )
         return row["id"]
+
+
+async def delete_gold_correction_field(
+    pool: asyncpg.Pool,
+    vendor_id: str,
+    field_key: str,
+) -> int:
+    """Remove a field from all prompt correction examples for a vendor.
+
+    Removing every occurrence prevents get_gold_examples() from falling back to
+    an older correction for the same field after the latest one is deleted.
+    """
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            return await _delete_gold_correction_field_conn(conn, vendor_id, field_key)
 
 
 async def get_gold_examples(

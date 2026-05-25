@@ -27,6 +27,15 @@ def _env_int(name: str, default: int) -> int:
         )
 
 
+def _env_int_min(name: str, default: int, minimum: int) -> int:
+    value = _env_int(name, default)
+    if value < minimum:
+        raise ValueError(
+            f"Environment variable {name!r} must be >= {minimum}, got: {value!r}"
+        )
+    return value
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name)
     if raw is None:
@@ -54,6 +63,7 @@ LLM_TOP_P            = _env_float("LLM_TOP_P",            0.8)
 LLM_PRESENCE_PENALTY = _env_float("LLM_PRESENCE_PENALTY", 1.5)
 LLM_MAX_TOKENS_FIELDS = _env_int("LLM_MAX_TOKENS_FIELDS", 8192)
 LLM_TIMEOUT           = _env_float("LLM_TIMEOUT",          300.0)
+LLM_PAGE_BATCH_SIZE   = _env_int_min("LLM_PAGE_BATCH_SIZE", 1, 1)
 
 # ---------------------------------------------------------------------------
 # Worker
@@ -77,6 +87,8 @@ JPEG_QUALITY     = _env_int("JPEG_QUALITY",     92)
 DPI_FLOOR        = _env_int("DPI_FLOOR",        96)
 DPI_DEFAULT      = _env_int("DPI_DEFAULT",      128)
 PDF_WORKERS      = _env_int("PDF_WORKERS",      2)
+OCR_DEVICE       = os.getenv("OCR_DEVICE",      "cpu")
+
 
 # ---------------------------------------------------------------------------
 # Object store (MinIO + local fallback)

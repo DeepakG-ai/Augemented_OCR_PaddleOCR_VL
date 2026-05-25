@@ -14,3 +14,19 @@ __pycache__
 bbox
 logs
 *.pyc
+
+# Frontend/dev dependencies
+node_modules
+
+# Generated outputs and local run artifacts
+outputs
+gemini/output
+test-results
+e2e/report
+mlflow.db
+
+# Test fixtures/outputs and non-runtime docs
+tests
+docs
+audit
+bottleneck

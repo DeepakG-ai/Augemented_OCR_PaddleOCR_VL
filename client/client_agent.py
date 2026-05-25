@@ -266,7 +266,7 @@ def _format_extraction_for_output(extraction: Any) -> Any:
             continue
         out[key] = value
 
-    out["items"] = [
+    out["line_items"] = [
         {
             key: value
             for key, value in item.items()

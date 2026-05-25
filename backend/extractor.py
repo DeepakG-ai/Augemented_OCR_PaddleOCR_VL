@@ -29,6 +29,7 @@ from .config import (
     LLM_PRESENCE_PENALTY,
     LLM_MAX_TOKENS_FIELDS,
     LLM_TIMEOUT,
+    LLM_PAGE_BATCH_SIZE,
 )
 from .mlflow_tracing import (
     trace_build_user_message,
@@ -525,9 +526,10 @@ async def extract_document(
     system_prompt_page1: str | None = None,
 ) -> dict:
     """
-    Process pages in parallel batches of 2 (matches --parallel 2 on llama-server).
+    Process page 1 first, then process pages 2-N in configurable parallel batches.
     
     Ordering guarantees:
+    - Page 1 runs alone so bbox/layout extraction remains deterministic
     - asyncio.gather returns results in INPUT order (page 1 before page 2)
     - Pages already successful in existing_page_results are skipped on retry
     - If any page in a batch fails, processing stops (no further batches)
@@ -535,8 +537,6 @@ async def extract_document(
     
     Returns {"result": ..., "page_results": [...], "cancelled": bool, "last_completed_page": int}.
     """
-    PARALLEL_BATCH = 1  # Sequential: process page 1 before page 2
-
     total = len(pages)
     page_results: list[dict] = list(existing_page_results or [])
     cancelled = False
@@ -562,7 +562,7 @@ async def extract_document(
     ]
 
     logger.info("Parallel extraction: %d pages pending, %d already done, batch_size=%d",
-                len(pending_pages), len(already_done), PARALLEL_BATCH)
+                len(pending_pages), len(already_done), LLM_PAGE_BATCH_SIZE)
 
     # Helper — runs inside asyncio.gather, never raises
     async def _process_page(page: dict) -> dict:
@@ -631,34 +631,60 @@ async def extract_document(
                 page_ctx["error"] = str(exc)
                 return {"_page": page_num, "_total_pages": total, "_error": str(exc)}
 
-    # Process in batches of PARALLEL_BATCH
-    for batch_start in range(0, len(pending_pages), PARALLEL_BATCH):
-        batch = pending_pages[batch_start : batch_start + PARALLEL_BATCH]
+    # Phase A — Page 1 solo (sequential first phase)
+    page_1_pending = [p for p in pending_pages if p["page_number"] == 1]
+    later_pages_pending = [p for p in pending_pages if p["page_number"] > 1]
 
-        # Check cancellation before each batch
+    if page_1_pending:
+        p1 = page_1_pending[0]
         if cancel_event and cancel_event.is_set():
             cancelled = True
-            logger.info("Extraction cancelled before batch starting page %d", batch[0]["page_number"])
-            break
-
-        # Fire all pages in this batch concurrently — results come back in INPUT order
-        batch_results = await asyncio.gather(*[_process_page(p) for p in batch])
-
-        # Collect results and notify frontend (always in page order)
-        for page_result in batch_results:
-            page_results.append(page_result)
+            logger.info("Extraction cancelled before starting page 1")
+        else:
+            logger.info("Phase A: Processing Page 1 sequentially first")
+            p1_result = await _process_page(p1)
+            page_results.append(p1_result)
             if on_page_done:
                 try:
-                    await on_page_done(page_result["_page"], total, page_result)
+                    await on_page_done(1, total, p1_result)
                 except Exception as exc:
-                    logger.error("on_page_done callback failed page %s: %s", page_result.get("_page"), exc)
+                    logger.error("on_page_done callback failed page 1: %s", exc)
 
-        # If ANY page in the batch failed, stop processing further batches
-        if any("_error" in r for r in batch_results):
-            batch_had_failure = True
-            logger.warning("Batch had failures — stopping extraction. Failed pages: %s",
-                           [r["_page"] for r in batch_results if "_error" in r])
-            break
+            if "_error" in p1_result:
+                batch_had_failure = True
+                logger.warning("Page 1 failed — stopping extraction.")
+
+    # Phase B — Pages 2-N in parallel batches of LLM_PAGE_BATCH_SIZE
+    if not cancelled and not batch_had_failure and later_pages_pending:
+        logger.info("Phase B: Processing remaining %d page(s) in parallel batches of %d",
+                    len(later_pages_pending), LLM_PAGE_BATCH_SIZE)
+        for batch_start in range(0, len(later_pages_pending), LLM_PAGE_BATCH_SIZE):
+            batch = later_pages_pending[batch_start : batch_start + LLM_PAGE_BATCH_SIZE]
+
+            # Check cancellation before each batch
+            if cancel_event and cancel_event.is_set():
+                cancelled = True
+                logger.info("Extraction cancelled before batch starting page %d", batch[0]["page_number"])
+                break
+
+            # Fire all pages in this batch concurrently
+            batch_results = await asyncio.gather(*[_process_page(p) for p in batch])
+
+            # Collect results and notify frontend (always in page order)
+            for page_result in batch_results:
+                page_results.append(page_result)
+                if on_page_done:
+                    try:
+                        await on_page_done(page_result["_page"], total, page_result)
+                    except Exception as exc:
+                        logger.error("on_page_done callback failed page %s: %s", page_result.get("_page"), exc)
+
+            # If ANY page in the batch failed, stop processing further batches
+            if any("_error" in r for r in batch_results):
+                batch_had_failure = True
+                logger.warning("Batch had failures — stopping extraction. Failed pages: %s",
+                               [r["_page"] for r in batch_results if "_error" in r])
+                break
 
     # Sort all page_results by page number for correct merge order
     page_results.sort(key=lambda pr: pr.get("_page", 0))

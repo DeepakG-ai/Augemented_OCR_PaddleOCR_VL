@@ -477,3 +477,219 @@ async function _refreshUserTable() {
 function _currentAuthUser() {
     try { return JSON.parse(localStorage.getItem('auth_user') || 'null'); } catch (e) { return null; }
 }
+
+// ── Admin: Spatial Memory (Manual Corrections) Management ────────────────
+
+let _smEntries = [];
+let _smTotal = 0;
+const _smPageSize = 200;
+let _smOffset = 0;
+let _smFilter = '';
+
+async function renderAdminSpatialMemoryPage(app) {
+    _smOffset = 0;
+    _smFilter = '';
+    app.innerHTML = headerHTML() + `
+    <div class="page-content">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px">
+            <div>
+                <div class="page-title" style="margin:0">Saved Regions</div>
+                <div style="font-size:10px;color:var(--text-dim);margin-top:4px;letter-spacing:0.06em">
+                    Manual corrections stored as spatial memory — grouped by client
+                </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px">
+                <input id="smFilterInput" type="text" placeholder="Filter by client, vendor or field…"
+                    value="${escapeHtml(_smFilter)}"
+                    oninput="_smApplyFilter(this.value)"
+                    style="background:var(--bg2);border:1px solid var(--border);color:var(--text);
+                           padding:7px 12px;font-family:var(--mono);font-size:11px;border-radius:3px;width:260px"/>
+                <button onclick="_smReload()" style="
+                    background:var(--bg2);border:1px solid var(--border);color:var(--text);
+                    cursor:pointer;padding:8px 16px;font-family:var(--mono);font-size:11px;
+                    letter-spacing:0.08em;border-radius:3px;transition:opacity .15s"
+                    onmouseover="this.style.opacity='.7'" onmouseout="this.style.opacity='1'">
+                    REFRESH
+                </button>
+            </div>
+        </div>
+        <div id="smStatsStrip" style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px"></div>
+        <div id="smTable"></div>
+        <div id="smPager" style="display:flex;gap:10px;align-items:center;padding:12px 0;font-size:10px;color:var(--text-dim)"></div>
+    </div>`;
+    updateNavActive();
+    await _smReload();
+}
+
+async function _smReload() {
+    const tableEl = document.getElementById('smTable');
+    const statsEl = document.getElementById('smStatsStrip');
+    if (tableEl) tableEl.innerHTML = '<div style="padding:16px;font-size:10px;color:var(--text-dim)">Loading…</div>';
+    try {
+        const resp = await apiJSON(`/admin/spatial-memory?limit=${_smPageSize}&offset=${_smOffset}`);
+        _smEntries = resp.entries || [];
+        _smTotal = resp.total || 0;
+        _smUpdateStats(statsEl, _smEntries, _smTotal);
+        _smRenderTable();
+        _smRenderPager();
+    } catch (e) {
+        if (tableEl) tableEl.innerHTML = `<div style="padding:16px;font-size:11px;color:var(--red)">Failed to load: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function _smUpdateStats(statsEl, entries, total) {
+    if (!statsEl) return;
+    const clients  = new Set(entries.map(e => e.client_email || '(unassigned)')).size;
+    const vendors  = new Set(entries.map(e => e.vendor_id)).size;
+    const shown    = entries.length;
+    statsEl.innerHTML = [
+        _smStatCard('Total Saved Regions', total,   'var(--text)'),
+        _smStatCard('Clients',             clients,  'var(--blue)'),
+        _smStatCard('Vendors',             vendors,  'var(--green)'),
+        _smStatCard('Shown',               shown,    'var(--text-dim)'),
+    ].join('');
+}
+
+function _smStatCard(label, value, color) {
+    return `
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:4px;padding:14px 18px">
+        <div style="font-size:18px;font-weight:700;color:${color};font-family:var(--mono)">${value}</div>
+        <div style="font-size:9px;color:var(--text-dim);margin-top:3px;letter-spacing:0.08em">${label}</div>
+    </div>`;
+}
+
+function _smApplyFilter(val) {
+    _smFilter = val.toLowerCase();
+    _smRenderTable();
+}
+
+function _smRenderTable() {
+    const tableEl = document.getElementById('smTable');
+    if (!tableEl) return;
+
+    const q = _smFilter;
+    const filtered = q
+        ? _smEntries.filter(e =>
+            (e.client_email || '').toLowerCase().includes(q) ||
+            (e.vendor_name  || '').toLowerCase().includes(q) ||
+            (e.vendor_id    || '').toLowerCase().includes(q) ||
+            (e.field_key    || '').toLowerCase().includes(q))
+        : _smEntries;
+
+    if (!filtered.length) {
+        tableEl.innerHTML = '<div style="padding:20px;font-size:11px;color:var(--text-dim);text-align:center">No saved regions found.</div>';
+        return;
+    }
+
+    // Each row is its own full-width grid — NO outer grid wrapper.
+    // Columns: CLIENT | VENDOR | FIELD | LAYOUT KEY | PAGE | SOURCE | VERIFIED | ACTION
+    const cols = '1fr 1fr 140px 140px 48px 90px 105px 80px';
+    const rowStyle = `display:grid;grid-template-columns:${cols};align-items:center`;
+
+    const header = `
+    <div style="${rowStyle};border-bottom:2px solid var(--border);padding:6px 0;
+                font-size:9px;letter-spacing:0.1em;color:var(--text-dim);">
+        <span style="padding:0 8px">CLIENT</span>
+        <span style="padding:0 8px">VENDOR</span>
+        <span style="padding:0 8px">FIELD</span>
+        <span style="padding:0 8px">LAYOUT KEY</span>
+        <span style="padding:0 8px">PAGE</span>
+        <span style="padding:0 8px">SOURCE</span>
+        <span style="padding:0 8px">LAST VERIFIED</span>
+        <span style="padding:0 8px">ACTION</span>
+    </div>`;
+
+    let lastClient = null;
+    const rows = filtered.map(e => {
+        const ts     = e.last_verified_at ? new Date(e.last_verified_at).toLocaleDateString() : '—';
+        const src    = (e.source_engine || '').replace('paddleocr', 'PaddleOCR').replace('pypdfium', 'PDF');
+        const vname  = e.vendor_name || e.vendor_id;
+        const client = e.client_email || '(unassigned)';
+
+        // Plain full-width divider — NOT inside any grid, so it always spans 100%
+        let groupHeader = '';
+        if (client !== lastClient) {
+            lastClient = client;
+            groupHeader = `
+            <div style="background:var(--bg2);border-top:2px solid var(--border);
+                        border-bottom:1px solid var(--border);padding:6px 12px;
+                        font-size:9px;letter-spacing:0.08em;color:var(--blue);font-weight:600;">
+                👤 ${escapeHtml(client)}
+            </div>`;
+        }
+
+        return groupHeader + `
+        <div id="sm-admin-row-${e.id}"
+             style="${rowStyle};padding:7px 0;border-bottom:1px solid var(--border);
+                    transition:background .12s;"
+             onmouseover="this.style.background='var(--bg2)'"
+             onmouseout="this.style.background='transparent'">
+            <span style="padding:0 8px;font-size:9px;color:var(--text-dim);
+                         overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+                  title="${escapeHtml(client)}">${escapeHtml(client)}</span>
+            <span style="padding:0 8px;font-size:10px;color:var(--text);
+                         overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+                  title="${escapeHtml(e.vendor_id)}">${escapeHtml(vname)}</span>
+            <span style="padding:0 8px;font-size:10px;font-weight:600;color:var(--text)">${escapeHtml(e.field_key)}</span>
+            <span style="padding:0 8px;font-size:9px;color:var(--text-dim);
+                         overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+                  title="${escapeHtml(e.layout_key)}">${escapeHtml(e.layout_key)}</span>
+            <span style="padding:0 8px;font-size:10px;color:var(--text)">${e.page_number}</span>
+            <span style="padding:0 8px;font-size:9px;color:var(--text-dim)">${src}</span>
+            <span style="padding:0 8px;font-size:9px;color:var(--text-dim)">${ts}</span>
+            <span style="padding:0 8px">
+                <button onclick="_smAdminDelete(${e.id},'${escapeJsString(e.field_key)}','${escapeJsString(vname)}','${escapeJsString(client)}')"
+                    style="background:none;border:1px solid var(--red,#e06c75);color:var(--red,#e06c75);
+                           cursor:pointer;padding:3px 8px;font-size:9px;font-family:var(--mono);
+                           border-radius:2px;letter-spacing:0.06em;transition:opacity .15s"
+                    onmouseover="this.style.opacity='.7'" onmouseout="this.style.opacity='1'">
+                    DEL
+                </button>
+            </span>
+        </div>`;
+    }).join('');
+
+    // No outer grid — header and rows are independent full-width blocks
+    tableEl.innerHTML = header + rows;
+}
+
+function _smRenderPager() {
+    const el = document.getElementById('smPager');
+    if (!el) return;
+    const pages = Math.ceil(_smTotal / _smPageSize);
+    const current = Math.floor(_smOffset / _smPageSize) + 1;
+    if (pages <= 1) { el.innerHTML = ''; return; }
+    el.innerHTML = `
+        <button onclick="_smGoPage(${_smOffset - _smPageSize})" ${_smOffset === 0 ? 'disabled' : ''}
+            style="background:var(--bg2);border:1px solid var(--border);color:var(--text);
+                   padding:4px 10px;font-family:var(--mono);font-size:9px;cursor:pointer;border-radius:2px">
+            ← PREV
+        </button>
+        <span>PAGE ${current} / ${pages} &nbsp;·&nbsp; ${_smTotal} TOTAL</span>
+        <button onclick="_smGoPage(${_smOffset + _smPageSize})" ${current >= pages ? 'disabled' : ''}
+            style="background:var(--bg2);border:1px solid var(--border);color:var(--text);
+                   padding:4px 10px;font-family:var(--mono);font-size:9px;cursor:pointer;border-radius:2px">
+            NEXT →
+        </button>`;
+}
+
+async function _smGoPage(newOffset) {
+    _smOffset = Math.max(0, newOffset);
+    await _smReload();
+}
+
+async function _smAdminDelete(smId, fieldKey, vendorName, clientEmail) {
+    if (!confirm(`Delete saved correction?\n\nClient:  ${clientEmail}\nVendor:  ${vendorName}\nField:   ${fieldKey}\n\nThis removes the saved region and the prompt correction example for this field.`)) return;
+    try {
+        const resp = await apiJSON(`/spatial-memory/${smId}`, { method: 'DELETE' });
+        _smEntries = _smEntries.filter(e => e.id !== smId);
+        _smTotal = Math.max(0, _smTotal - 1);
+        _smRenderTable();
+        _smRenderPager();
+        _smUpdateStats(document.getElementById('smStatsStrip'), _smEntries, _smTotal);
+        const promptCount = Number(resp.gold_correction_fields_deleted || 0);
+        showToast(`Deleted saved correction for "${fieldKey}" (${promptCount} prompt example${promptCount === 1 ? '' : 's'})`);
+    } catch (e) {
+        showToast(`Failed to delete: ${e.message}`);
+    }
+}
