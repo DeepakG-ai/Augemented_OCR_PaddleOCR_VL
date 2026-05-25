@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Augmented OCR — Extraction Terminal</title>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+    <script>
+        // Apply theme immediately to avoid flashing
+        if (localStorage.getItem('theme') === 'light') {
+            document.documentElement.setAttribute('data-theme', 'light');
+        }
+    </script>
+</head>
+<body>
+    <div class="app" id="appRoot"></div>
+    <script src="core.js"></script>
+    <script src="login.js"></script>
+    <script src="vendors.js"></script>
+    <script src="extract.js"></script>
+    <script src="history.js"></script>
+    <script src="review.js"></script>
+    <script src="dashboard.js"></script>
+    <script src="settings.js"></script>
+    <script src="admin.js"></script>
+    <script src="apikeys.js"></script>
+    <script src="mapper.js"></script>
+</body>
+</html>

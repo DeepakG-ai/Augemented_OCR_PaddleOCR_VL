@@ -58,9 +58,6 @@ dist/
 dist-ssr/
 *.local
 
-# Docker
-.dockerignore
-
 # OS
 .DS_Store
 Thumbs.db

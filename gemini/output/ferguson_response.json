@@ -1,0 +1,92 @@
+{
+  "vendor_confirmed": true,
+  "fields": {
+    "from": "FERGUSON FACILITITES #0798\nPLEASE SUBMIT INVOICES TO:\nAPINVOICES@FERGUSON.COM\nNEWPORT NEWS VA 23606-3322\n800-563-0384\n317-291-5737",
+    "to": "FRESH PRODUCTS LLC\n30600 OREGON RD\nPERRYSBURG, OH 43551-4544\nPhone: 419-531-9741\nFax: 419-531-8472",
+    "ship_to": "FERGUSON FACILITIES SUPPLY\n8652 HAGGERTY ROAD\nSUITE 200\nBELLEVILLE, MI 48111-1845",
+    "po_number": "H798-1839",
+    "po_date": "11/18/25",
+    "line_items": [
+      {
+        "qty": "24",
+        "item_code": "F3WDSF010I060M02",
+        "net_price": "16.690",
+        "u/m": "BX"
+      },
+      {
+        "qty": "24",
+        "item_code": "F3WDSF010I060M04",
+        "net_price": "16.690",
+        "u/m": "BX"
+      },
+      {
+        "qty": "42",
+        "item_code": "F3WDSF010I060M06",
+        "net_price": "16.690",
+        "u/m": "PK"
+      },
+      {
+        "qty": "12",
+        "item_code": "F3WDSF010I060M08",
+        "net_price": "16.690",
+        "u/m": "BX"
+      }
+    ]
+  },
+  "boxes": {
+    "from": [
+      29,
+      113,
+      76,
+      124
+    ],
+    "to": [
+      29,
+      244,
+      53,
+      255
+    ],
+    "ship_to": [
+      500,
+      244,
+      570,
+      255
+    ],
+    "po_number": [
+      701,
+      44,
+      755,
+      55
+    ],
+    "po_date": [
+      135,
+      458,
+      172,
+      480
+    ],
+    "qty": [
+      94,
+      563,
+      122,
+      574
+    ],
+    "item_code": [
+      174,
+      563,
+      256,
+      574
+    ],
+    "net_price": [
+      601,
+      563,
+      676,
+      574
+    ],
+    "u/m": [
+      688,
+      563,
+      715,
+      574
+    ]
+  }
+}

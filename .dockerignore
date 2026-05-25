@@ -1,0 +1,32 @@
+.venv
+.env
+.env.*
+.pip_tmp
+.pytest_cache
+__pycache__
+.git
+.idea
+.jbeval
+.claude
+.paddlex_cache
+.paddlex_runtime
+.local_object_store
+bbox
+logs
+*.pyc
+
+# Frontend/dev dependencies
+node_modules
+
+# Generated outputs and local run artifacts
+outputs
+gemini/output
+test-results
+e2e/report
+mlflow.db
+
+# Test fixtures/outputs and non-runtime docs
+tests
+docs
+audit
+bottleneck

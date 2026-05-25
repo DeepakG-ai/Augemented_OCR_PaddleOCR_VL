@@ -5,7 +5,7 @@
 ### System Roles
 - **Qwen JSON** is the source of truth for field names and field values.
 - **PaddleOCR** is the source of truth for spatial words and bounding boxes.
-- **`qwen_backend/text_matcher.py`** is responsible for joining those two worlds.
+- **`backend/text_matcher.py`** is responsible for joining those two worlds.
 
 ### Why the Current Matcher Is Failing
 The live matcher still produces incorrect boxes because it mixes text matching and geometry in the wrong order.
@@ -322,7 +322,7 @@ The implementation is only acceptable if these scenarios pass:
 
 ## Locked Assumptions
 
-- The live implementation target is `qwen_backend/text_matcher.py`.
+- The live implementation target is `backend/text_matcher.py`.
 - `text_matcher_new.py` is **not** the source of truth for this spec.
 - Top-level header final boxes should stay on value blocks.
 - Line-item final boxes should stay on column/header anchors.

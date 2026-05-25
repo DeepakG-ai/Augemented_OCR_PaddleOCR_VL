@@ -59,14 +59,13 @@ This starts **10 containers**:
 |-----------|---------|------|
 | `postgres` | Database | 5432 |
 | `redis` | Prompt/result cache | 6379 |
-| `minio` | Object storage (files, pages, exports) | 9000 (API), 9001 (Console) |
+| `minio` | Object storage (files, pages) | 9000 (API), 9001 (Console) |
 | `api` | FastAPI backend + serves frontend | **8000** |
 | `normalize-worker` | PDF rendering / image normalization | — |
 | `ocr-worker` | PaddleOCR text detection | — |
 | `llm-worker` | Qwen3-VL multimodal extraction | — |
 | `postprocess-worker` | Field-to-bounding-box mapping | — |
-| `outbound-worker` | Excel export generation | — |
-| `phoenix` | LLM observability tracing | 6006, 4317 |
+| `mlflow` | LLM observability tracing | 5000 |
 
 ### 3. Wait for Health Checks
 
@@ -135,15 +134,6 @@ http://localhost:8000
 4. Click **"Confirm"** to save corrections
 5. Corrections automatically create a **gold example** that improves future extractions for this vendor
 
-### Step 5: Download Export
-
-From the History page or via API:
-```bash
-curl -OJ "http://localhost:8000/extractions/1/export.xlsx"
-```
-
----
-
 ## Alternative: Run Without Docker
 
 If you prefer running the backend directly:
@@ -152,7 +142,7 @@ If you prefer running the backend directly:
 
 ```bash
 # Create a virtual environment
-cd qwen_backend
+cd backend
 python -m venv .venv
 .venv\Scripts\activate  # Windows
 # source .venv/bin/activate  # Linux/Mac
@@ -177,7 +167,7 @@ MinIO is optional — the system falls back to a local `.local_object_store/` di
 
 ### 3. Configure Environment
 
-Edit `qwen_backend/.env`:
+Edit `backend/.env`:
 
 ```env
 DATABASE_URL=postgresql://augocr:augocr@localhost:5432/augocr
@@ -189,7 +179,7 @@ LLM_MODEL=qwen3vl
 ### 4. Start the API Server
 
 ```bash
-cd qwen_backend
+cd backend
 python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
@@ -197,19 +187,17 @@ python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 ```bash
 # Terminal 1
-python -m qwen_backend.worker --stage normalize
+python -m backend.worker --stage normalize
 
 # Terminal 2
-python -m qwen_backend.worker --stage ocr
+python -m backend.worker --stage ocr
 
 # Terminal 3
-python -m qwen_backend.worker --stage llm
+python -m backend.worker --stage llm
 
 # Terminal 4
-python -m qwen_backend.worker --stage postprocess
+python -m backend.worker --stage postprocess
 
-# Terminal 5
-python -m qwen_backend.worker --stage outbound
 ```
 
 ---
@@ -251,12 +239,6 @@ data: {"event":"done","job":{...},"extraction":{"result":{...},"field_locations"
 curl "http://localhost:8000/extractions/1"
 ```
 
-### Download Excel
-
-```bash
-curl -OJ "http://localhost:8000/extractions/1/export.xlsx"
-```
-
 ### Get Normalized Contract
 
 ```bash
@@ -271,7 +253,7 @@ curl "http://localhost:8000/extractions/1/contract"
 |---------|-----|-------------|
 | **Application** | http://localhost:8000 | — |
 | **MinIO Console** | http://localhost:9001 | `minioadmin` / `minioadmin` |
-| **Phoenix Tracing** | http://localhost:6006 | — |
+| **MLflow Tracing** | http://localhost:5000 | — |
 | **PostgreSQL** | `localhost:5432` | `augocr` / `augocr` |
 | **Redis** | `localhost:6379` | — |
 
@@ -316,14 +298,6 @@ If MinIO isn't running, the system falls back to local file storage at `.local_o
 docker compose ps minio
 ```
 
-### Excel export returns 404
-
-The Excel export is generated asynchronously by the `outbound-worker` after extraction completes. Wait a few seconds after extraction finishes, then retry. Check the outbound worker logs:
-
-```bash
-docker compose logs outbound-worker
-```
-
 ### Database schema issues
 
 The database schema is auto-created and migrated on startup. To reset completely:
@@ -333,3 +307,23 @@ docker compose down
 docker volume rm augemented_ocr_paddleocr_vl_pgdata
 docker compose up --build
 ```
+
+
+Email: admin@augocr.com
+Password: admin
+
+User: augocr
+Password: augocr
+Database: augocr
+
+
+
+
+# All tests (headless)
+npm run test:e2e
+
+# With visible browser
+npm run test:e2e:headed
+
+# Interactive UI
+npm run test:e2e:ui

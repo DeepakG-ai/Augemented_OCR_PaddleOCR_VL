@@ -7,11 +7,11 @@ import logging
 # Set up logging for our modules to see their debug lines
 logging.basicConfig(level=logging.INFO)
 
-# Ensure we can import from qwen_backend
+# Ensure we can import from backend
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from qwen_backend.processor import pdf_to_images
-from qwen_backend.ocr_runner import run_ocr_on_pages
+from backend.processor import pdf_to_images
+from backend.ocr_runner import run_ocr_on_pages
 
 async def main():
     target_pdf = r"C:\Users\aigroup5\Downloads\PDF Samples\Robert Scott\ROBERT SCOTT 542799.pdf"
@@ -59,7 +59,7 @@ if __name__ == "__main__":
         def __exit__(self, exc_type, exc_val, exc_tb): pass
         
     try:
-        from qwen_backend import ocr_runner
+        from backend import ocr_runner
         ocr_runner.trace_ocr_page = lambda x: DummyTrace()
     except Exception:
         pass

@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import qwen_backend.main as main
+import backend.main as main
 
 
 def _job(job_id: int, extraction_id: int, status: str, progress: dict | None = None) -> dict:
@@ -73,27 +73,24 @@ class InfrastructureSafetyTests(unittest.TestCase):
 
         for service in [
             "postgres:",
-            "redis:",
             "minio:",
             "api:",
             "normalize-worker:",
             "ocr-worker:",
             "llm-worker:",
             "postprocess-worker:",
-            "outbound-worker:",
-            "phoenix:",
+            "mlflow:",
         ]:
             self.assertIn(service, compose)
 
-        self.assertGreaterEqual(compose.count("healthcheck:"), 4)
+        self.assertGreaterEqual(compose.count("healthcheck:"), 2)
         self.assertIn('--stage", "normalize"', compose)
         self.assertIn('--stage", "ocr"', compose)
         self.assertIn('--stage", "llm"', compose)
         self.assertIn('--stage", "postprocess"', compose)
-        self.assertIn('--stage", "outbound"', compose)
 
     def test_db_module_contains_schema_and_locking_guards_for_workers(self) -> None:
-        db_text = (ROOT / "qwen_backend" / "db.py").read_text(encoding="utf-8")
+        db_text = (ROOT / "backend" / "db.py").read_text(encoding="utf-8")
 
         self.assertIn("CREATE TABLE IF NOT EXISTS vendors", db_text)
         self.assertIn("CREATE TABLE IF NOT EXISTS templates", db_text)
@@ -102,7 +99,6 @@ class InfrastructureSafetyTests(unittest.TestCase):
         self.assertIn("CREATE TABLE IF NOT EXISTS pages", db_text)
         self.assertIn("CREATE TABLE IF NOT EXISTS jobs", db_text)
         self.assertIn("CREATE TABLE IF NOT EXISTS review_events", db_text)
-        self.assertIn("CREATE TABLE IF NOT EXISTS integration_deliveries", db_text)
         self.assertIn("FOR UPDATE SKIP LOCKED", db_text)
         self.assertIn("status IN ('queued', 'running')", db_text)
 

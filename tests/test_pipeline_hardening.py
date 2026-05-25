@@ -14,8 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import qwen_backend.main as main
-import qwen_backend.worker as worker
+import backend.main as main
+import backend.worker as worker
 
 
 class LegacyRouteTests(unittest.TestCase):
@@ -31,7 +31,7 @@ class LegacyRouteTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 410)
-        self.assertIn("/ingest/ui", response.json()["detail"])
+        self.assertIn("/ingest/ui", response.json()["error"]["message"])
 
 
 class WorkerPipelineTests(unittest.IsolatedAsyncioTestCase):
@@ -63,6 +63,7 @@ class WorkerPipelineTests(unittest.IsolatedAsyncioTestCase):
              patch.object(worker.db_mod, "set_total_pages", new=AsyncMock()), \
              patch.object(worker.db_mod, "update_extraction_progress", new=AsyncMock()), \
              patch.object(worker.db_mod, "ensure_job", new=AsyncMock()), \
+             patch.object(worker.db_mod, "is_cancel_requested", new=AsyncMock(return_value=False)), \
              patch.object(worker.processor, "pdf_to_images", new=AsyncMock(return_value=rendered_pages)):
             await worker._process_normalize(pool, job)
 
@@ -84,9 +85,11 @@ class WorkerPipelineTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(worker.db_mod, "get_extraction", new=AsyncMock(return_value=extraction)), \
              patch.object(worker.db_mod, "update_extraction_progress", new=AsyncMock()), \
+             patch.object(worker.db_mod, "get_pages", new=AsyncMock(return_value=[{"page_number": 1, "source": "scanned", "char_count": 0, "word_geometry": []}])), \
              patch.object(worker, "_load_pages", new=AsyncMock(return_value=[{"page_number": 1, "image_b64": "abc"}])), \
              patch.object(worker.ocr_runner, "run_ocr_on_pages", new=AsyncMock(return_value=ocr_pages)), \
              patch.object(worker.db_mod, "save_ocr_data", new=AsyncMock()), \
+             patch.object(worker.db_mod, "is_cancel_requested", new=AsyncMock(return_value=False)), \
              patch.object(worker.db_mod, "update_job_progress", new=AsyncMock()) as mock_progress, \
              patch.object(worker, "_maybe_enqueue_postprocess", new=AsyncMock()):
             await worker._process_ocr(pool, job)
@@ -94,7 +97,7 @@ class WorkerPipelineTests(unittest.IsolatedAsyncioTestCase):
         mock_progress.assert_awaited_once_with(
             pool,
             12,
-            {"stage": "ocr", "pages_processed": 1},
+            {"stage": "ocr", "pages_processed": 1, "scanned_pages": 1},
         )
 
 

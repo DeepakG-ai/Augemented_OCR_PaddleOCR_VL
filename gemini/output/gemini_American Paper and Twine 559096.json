@@ -1,0 +1,95 @@
+{
+  "fields": {
+    "vendor": "FRESH PRODUCTS LLC\n000349 30600 OREGON ROAD\nPERRYSBURG OH 34551",
+    "po_number": "U63D61",
+    "ship_to": "AMERICAN PAPER & TWINE CO.\n7400 COCKRILL BEND BLVD.\nNASHVILLE TN 37209",
+    "line_items": [
+      {
+        "qty": "12",
+        "uom": "CS",
+        "unit_cost": "106.67000",
+        "item_number": "1102567"
+      },
+      {
+        "qty": "15",
+        "uom": "CS",
+        "unit_cost": "106.67000",
+        "item_number": "1102570"
+      },
+      {
+        "qty": "6",
+        "uom": "BX",
+        "unit_cost": "17.93000",
+        "item_number": "750123"
+      },
+      {
+        "qty": "2",
+        "uom": "CS",
+        "unit_cost": "32.19000",
+        "item_number": "759606"
+      },
+      {
+        "qty": "1",
+        "uom": "CS",
+        "unit_cost": "106.96000",
+        "item_number": "759803"
+      },
+      {
+        "qty": "3",
+        "uom": "CS",
+        "unit_cost": "34.08000",
+        "item_number": "760199"
+      },
+      {
+        "qty": "20",
+        "uom": "CS",
+        "unit_cost": "22.50000",
+        "item_number": "760225"
+      }
+    ]
+  },
+  "boxes": {
+    "vendor": [
+      157,
+      84,
+      168,
+      144
+    ],
+    "po_number": [
+      771,
+      64,
+      858,
+      74
+    ],
+    "ship_to": [
+      589,
+      157,
+      656,
+      168
+    ],
+    "qty": [
+      454,
+      340,
+      514,
+      351
+    ],
+    "uom": [
+      519,
+      340,
+      549,
+      351
+    ],
+    "unit_cost": [
+      599,
+      340,
+      686,
+      351
+    ],
+    "item_number": [
+      64,
+      340,
+      230,
+      351
+    ]
+  }
+}
