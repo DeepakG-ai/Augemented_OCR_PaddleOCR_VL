@@ -1,0 +1,76 @@
+Extract the header fields AND all visible line item rows from this purchase order page (page 1 of 1).
+
+If any field is empty or not visible, return null.
+
+<header_fields>
+  - vendor_name
+  - vendor_address
+  - invoice_number
+  - invoice_date
+  - po_number
+  - invoice_total
+  - invoice_subtotal
+  - tax_amount
+  - frieght_amount
+</header_fields>
+
+<line_item_columns>
+  - item
+  - line_description
+  - quantity_ordered
+  - quantity_received
+  - unit_price
+  - line_total
+  - uom
+</line_item_columns>
+
+Return JSON in exactly this shape:
+{
+  "fields": {
+    "vendor_name": null,
+    "vendor_address": null,
+    "invoice_number": null,
+    "invoice_date": null,
+    "po_number": null,
+    "invoice_total": null,
+    "invoice_subtotal": null,
+    "tax_amount": null,
+    "frieght_amount": null,
+    "line_items": [
+      {
+        "item": null,
+        "line_description": null,
+        "quantity_ordered": null,
+        "quantity_received": null,
+        "unit_price": null,
+        "line_total": null,
+        "uom": null
+      }
+    ]
+  },
+  "boxes": {
+    "vendor_name": null,
+    "vendor_address": null,
+    "invoice_number": null,
+    "invoice_date": null,
+    "po_number": null,
+    "invoice_total": null,
+    "invoice_subtotal": null,
+    "tax_amount": null,
+    "frieght_amount": null,
+    "item": null,
+    "line_description": null,
+    "quantity_ordered": null,
+    "quantity_received": null,
+    "unit_price": null,
+    "line_total": null,
+    "uom": null
+  }
+}
+
+<rules>
+- Empty or missing cells → null.
+- Extract every visible line item row.
+</rules>
+
+STRICTLY return ONLY valid JSON matching EXACTLY the structure above.

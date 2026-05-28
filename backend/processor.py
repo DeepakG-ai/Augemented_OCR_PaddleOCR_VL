@@ -98,6 +98,7 @@ def _render_pdf_sync(file_bytes: bytes, dpi: int = DPI_DEFAULT, max_pages: int |
         max_pages: If set, render at most this many pages (from page 1).
     """
     results: list[dict] = []
+    skipped_pages: list[int] = []
 
     pdf = None
     try:
@@ -127,6 +128,7 @@ def _render_pdf_sync(file_bytes: bytes, dpi: int = DPI_DEFAULT, max_pages: int |
                         "Page %d has invalid dimensions (%.1fx%.1f) — skipping.",
                         page_num, w_pts, h_pts
                     )
+                    skipped_pages.append(page_num)
                     continue
 
                 # Adaptive DPI — scale so long side hits MAX_LONG_SIDE exactly
@@ -171,12 +173,26 @@ def _render_pdf_sync(file_bytes: bytes, dpi: int = DPI_DEFAULT, max_pages: int |
                 })
 
             except Exception as page_err:
-                # Skip corrupt/unrenderable pages — don't crash the whole document
+                # Log and track — don't crash the whole document on a single bad page
                 logger.warning("Skipping page %d — render error: %s", page_num, page_err)
+                skipped_pages.append(page_num)
 
     finally:
         if pdf is not None:
             pdf.close()  # always release PDFium document resources
+
+    if skipped_pages:
+        logger.warning(
+            "PDF render partial — skipped %d/%d page(s): %s",
+            len(skipped_pages), render_count, skipped_pages,
+        )
+
+    # If every attempted page failed, surface a hard error — not a silent empty success
+    if not results and render_count > 0:
+        raise ValueError(
+            f"PDF_RENDER_FAILED: All {render_count} page(s) failed to render "
+            f"(skipped={skipped_pages})"
+        )
 
     logger.info("PDF render complete — %d/%d pages OK", len(results), total_pages)
     return results
@@ -190,15 +206,24 @@ def _resize_image_sync(file_bytes: bytes) -> list[dict]:
       - Convert to RGB (strips alpha, handles palette / grayscale modes)
       - Apply Qwen3-VL dual-budget resize (long-side + pixel-area cap)
       - Encode as JPEG base64
+
+    Raises ValueError("IMAGE_DECODE_FAILED: ...") on corrupt or unsupported input.
     """
-    img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    try:
+        img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    except Exception as exc:
+        raise ValueError(f"IMAGE_DECODE_FAILED: Could not open or decode image: {exc}") from exc
+
     w, h = img.size
 
     img = _resize_to_vlm_budget(img)
     logger.debug("Image normalised %dx%d → %dx%d", w, h, img.width, img.height)
 
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=JPEG_QUALITY)  # no optimize=True — local pipeline
+    try:
+        img.save(buf, format="JPEG", quality=JPEG_QUALITY)  # no optimize=True — local pipeline
+    except Exception as exc:
+        raise ValueError(f"IMAGE_DECODE_FAILED: Could not encode image as JPEG: {exc}") from exc
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
 
     return [{

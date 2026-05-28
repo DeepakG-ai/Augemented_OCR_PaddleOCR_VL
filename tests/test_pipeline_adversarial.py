@@ -145,6 +145,50 @@ class WorkerFailurePathTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mock_status.await_args.args[2], "failed")
         mock_fail_job.assert_awaited_once_with(pool_obj, 77, "minio down", retryable=False)
 
+    async def test_run_worker_releases_quota_and_fails_job_without_retry(self) -> None:
+        job = {"id": 77, "extraction_id": 88, "document_id": 99, "job_type": "ocr"}
+        extraction = {
+            "id": 88,
+            "document_id": 99,
+            "filename": "invoice.pdf",
+            "vendor_id": "V1",
+            "total_pages": 3,
+            "page_results": [],
+            "result": None,
+        }
+        document = {"id": 99, "metadata": {"billing_user_id": "user-1", "reserved_pages": 3}}
+
+        async def stop_after_first_idle(_seconds: float) -> None:
+            raise asyncio.CancelledError()
+
+        conn_mock = AsyncMock()
+        conn_mock.execute.return_value = "UPDATE 0"
+        mock_txn = MagicMock()
+        mock_txn.__aenter__ = AsyncMock(return_value=None)
+        mock_txn.__aexit__ = AsyncMock(return_value=False)
+        conn_mock.transaction = MagicMock(return_value=mock_txn)
+        ctx_mock = AsyncMock()
+        ctx_mock.__aenter__.return_value = conn_mock
+        pool_obj = type("Pool", (), {"close": AsyncMock(), "acquire": lambda self: ctx_mock})()
+        with patch.object(worker.db_mod, "create_pool", new=AsyncMock(return_value=pool_obj)), \
+             patch.object(worker.db_mod, "init", new=AsyncMock()), \
+             patch.object(worker.db_mod, "claim_job", new=AsyncMock(side_effect=[job, None])), \
+             patch.object(worker, "process_job", new=AsyncMock(side_effect=RuntimeError("ocr model failed"))), \
+             patch.object(worker.db_mod, "complete_job", new=AsyncMock()), \
+             patch.object(worker.db_mod, "set_extraction_status", new=AsyncMock()) as mock_status, \
+             patch.object(worker.db_mod, "get_extraction", new=AsyncMock(return_value=extraction)), \
+             patch.object(worker.db_mod, "get_document", new=AsyncMock(return_value=document)), \
+             patch.object(worker.db_mod, "release_quota_reservation", new=AsyncMock()) as mock_release, \
+             patch.object(worker.db_mod, "fail_job", new=AsyncMock()) as mock_fail_job, \
+             patch.object(worker.page_logger, "append_log", new=MagicMock()), \
+             patch.object(worker.asyncio, "sleep", new=AsyncMock(side_effect=stop_after_first_idle)):
+            with self.assertRaises(asyncio.CancelledError):
+                await worker.run_worker("ocr", "ocr-worker")
+
+        self.assertEqual(mock_status.await_args.args[2], "failed")
+        mock_release.assert_awaited_once_with(pool_obj, "user-1", 3)
+        mock_fail_job.assert_awaited_once_with(pool_obj, 77, "ocr model failed", retryable=False)
+
 
 class ResumeApiAdversarialTests(unittest.TestCase):
     @classmethod

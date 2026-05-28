@@ -20,7 +20,3 @@ bottleneck
 rapidfuzz==3.14.5
 json-repair==0.59.5
 mlflow==3.12.0
-watchdog>=4.0.0
-apscheduler==3.11.2
-psycopg2-binary>=2.9
-sqlalchemy>=2.0

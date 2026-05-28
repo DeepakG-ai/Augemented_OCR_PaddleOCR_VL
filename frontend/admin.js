@@ -1,9 +1,25 @@
 /* ── Augmented OCR — Admin: User Management page ────────────────────── */
 
+function _adminSubTabsHTML(activeTab) {
+    const tabStyle = (active) => `
+        padding:7px 18px;font-family:var(--mono);font-size:10px;font-weight:600;
+        letter-spacing:0.1em;border:none;cursor:pointer;transition:all 0.15s;
+        background:${active ? 'var(--blue)' : 'transparent'};
+        color:${active ? '#fff' : 'var(--text-dim)'};`;
+    return `
+    <div style="display:flex;border:1px solid var(--border);border-radius:3px;overflow:hidden;align-self:flex-end;margin-bottom:2px">
+        <button onclick="navigate('#/admin/users')" style="${tabStyle(activeTab === 'users')}">USERS</button>
+        <button onclick="navigate('#/admin/api-keys')" style="border-left:1px solid var(--border);${tabStyle(activeTab === 'apikeys')}">API KEYS</button>
+    </div>`;
+}
+
 async function renderAdminUsersPage(app) {
-    let users = [];
+    let users = [], topupReqs = [];
     try {
-        users = await apiJSON('/admin/users');
+        [users, topupReqs] = await Promise.all([
+            apiJSON('/admin/users'),
+            apiJSON('/admin/topup-requests?status=pending').catch(() => []),
+        ]);
     } catch (e) {
         showToast('Failed to load users: ' + e.message);
     }
@@ -16,11 +32,14 @@ async function renderAdminUsersPage(app) {
 
         <!-- Header row -->
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px">
-            <div>
-                <div class="page-title" style="margin:0">User Management</div>
-                <div style="font-size:10px;color:var(--text-dim);margin-top:4px;letter-spacing:0.06em">
-                    ${clients.length} CLIENT${clients.length !== 1 ? 'S' : ''} &nbsp;·&nbsp; ${admins.length} ADMIN${admins.length !== 1 ? 'S' : ''}
+            <div style="display:flex;align-items:center;gap:20px">
+                <div>
+                    <div class="page-title" style="margin:0">User Management</div>
+                    <div style="font-size:10px;color:var(--text-dim);margin-top:4px;letter-spacing:0.06em">
+                        ${clients.length} CLIENT${clients.length !== 1 ? 'S' : ''} &nbsp;·&nbsp; ${admins.length} ADMIN${admins.length !== 1 ? 'S' : ''}
+                    </div>
                 </div>
+                ${_adminSubTabsHTML('users')}
             </div>
             <button onclick="openCreateUserModal()" style="
                 display:flex;align-items:center;gap:8px;
@@ -33,26 +52,190 @@ async function renderAdminUsersPage(app) {
             </button>
         </div>
 
+        <!-- Top-up Requests notification panel -->
+        <div id="topupRequestsPanel">${_renderTopupRequestsPanel(topupReqs)}</div>
+
         <!-- Stats strip -->
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px">
             ${_userStatCard('Total Users', users.length, 'var(--text)')}
             ${_userStatCard('Active', users.filter(u=>u.is_active).length, 'var(--green)')}
             ${_userStatCard('Clients', clients.length, 'var(--blue)')}
-            ${_userStatCard('Total Pages Used', users.reduce((s,u)=>s+(u.pages_extracted||0),0).toLocaleString(), 'var(--amber,#e5c07b)')}
+            ${_userStatCard('Total Pages Used',
+                users.reduce((s,u)=>s+(u.pages_used||0),0).toLocaleString(),
+                'var(--amber,#e5c07b)')}
         </div>
 
         <!-- User cards -->
         <div id="adminUserTable">${_renderUserCards(users)}</div>
+        ${_createUserModalHTML()}
+        ${_resetPasswordModalHTML()}
+        ${_setPeriodModalHTML()}
+        ${_topupModalHTML()}
+        ${_userHistoryModalHTML()}
+        ${_topupReqRejectModalHTML()}
     </div>
 
     <div class="bottom-bar">
         <span style="font-size:10px;color:var(--text-dim);letter-spacing:0.1em">${users.length} USER${users.length !== 1 ? 'S' : ''} REGISTERED</span>
-    </div>
-    ${_createUserModalHTML()}
-    ${_resetPasswordModalHTML()}
-    ${_pageLimitModalHTML()}`;
+    </div>`;
 
     updateNavActive();
+}
+
+
+// ── Top-up Request Notification Panel ─────────────────────────────────────
+
+function _renderTopupRequestsPanel(requests) {
+    if (!requests || requests.length === 0) return '';
+
+    const rows = requests.map(r => {
+        const when = new Date(r.created_at).toLocaleString();
+        const pagesLabel = Number(r.requested_pages).toLocaleString();
+        return `
+        <div id="topup-req-row-${r.id}"
+             style="display:flex;align-items:center;gap:12px;padding:10px 14px;
+                    border-bottom:1px solid var(--border);flex-wrap:wrap">
+            <div style="flex:1;min-width:200px">
+                <div style="font-size:11px;font-weight:600;color:var(--text)">${escapeHtml(r.user_email || r.user_id)}</div>
+                <div style="font-size:9px;color:var(--text-dim);margin-top:2px;letter-spacing:0.04em">
+                    Requests <span style="color:var(--amber,#e5c07b);font-weight:700">${pagesLabel} pages</span>
+                    for <span style="color:var(--blue)">${escapeHtml(r.requested_period)}</span>
+                    ${r.note ? `· <em style="color:var(--text-dim)">${escapeHtml(r.note)}</em>` : ''}
+                </div>
+            </div>
+            <span style="font-size:9px;color:var(--text-dim);white-space:nowrap">${when}</span>
+            <div style="display:flex;gap:6px;flex-shrink:0">
+                <button onclick="approveTopupRequest(${r.id},'${escapeInlineJsString(r.user_email||'')}',${r.requested_pages},'${escapeInlineJsString(r.requested_period)}')"
+                    style="background:var(--green,#98c379);color:#1e1e1e;border:none;border-radius:3px;
+                           cursor:pointer;padding:5px 12px;font-size:9px;font-family:var(--mono);
+                           font-weight:700;letter-spacing:0.08em;transition:opacity 0.15s"
+                    onmouseover="this.style.opacity='.8'" onmouseout="this.style.opacity='1'">
+                    ✓ APPROVE
+                </button>
+                <button onclick="openRejectTopupModal(${r.id},'${escapeInlineJsString(r.user_email||'')}',${r.requested_pages})"
+                    style="background:none;border:1px solid var(--red,#e06c75);color:var(--red,#e06c75);
+                           border-radius:3px;cursor:pointer;padding:5px 12px;font-size:9px;
+                           font-family:var(--mono);font-weight:600;letter-spacing:0.08em;transition:opacity 0.15s"
+                    onmouseover="this.style.opacity='.7'" onmouseout="this.style.opacity='1'">
+                    ✕ REJECT
+                </button>
+            </div>
+        </div>`;
+    }).join('');
+
+    return `
+    <div style="background:rgba(229,192,123,.06);border:1px solid var(--amber,#e5c07b);
+                border-radius:4px;margin-bottom:24px;overflow:hidden">
+        <div style="display:flex;align-items:center;justify-content:space-between;
+                    padding:10px 14px;border-bottom:1px solid rgba(229,192,123,.25)">
+            <div style="display:flex;align-items:center;gap:8px">
+                <span style="width:8px;height:8px;border-radius:50%;background:var(--amber,#e5c07b);
+                             display:inline-block;animation:pulse 1.4s ease-in-out infinite"></span>
+                <span style="font-size:9px;font-weight:700;letter-spacing:0.12em;color:var(--amber,#e5c07b)">
+                    TOP-UP REQUESTS — ${requests.length} PENDING
+                </span>
+            </div>
+            <button onclick="_refreshTopupRequestsPanel()"
+                style="background:none;border:none;color:var(--text-dim);cursor:pointer;
+                       font-size:9px;font-family:var(--mono);letter-spacing:0.06em;padding:2px 6px;
+                       transition:color 0.15s"
+                onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--text-dim)'">
+                REFRESH
+            </button>
+        </div>
+        ${rows}
+    </div>`;
+}
+
+async function _refreshTopupRequestsPanel() {
+    try {
+        const reqs = await apiJSON('/admin/topup-requests?status=pending');
+        const el = document.getElementById('topupRequestsPanel');
+        if (el) el.innerHTML = _renderTopupRequestsPanel(reqs);
+    } catch (e) {
+        showToast('Refresh failed: ' + e.message);
+    }
+}
+
+async function approveTopupRequest(requestId, userEmail, pages, period) {
+    if (!confirm(
+        `Approve top-up for ${userEmail}?\n\n` +
+        `Pages: ${Number(pages).toLocaleString()}\nPeriod: ${period}\n\n` +
+        `The pages will be added to their current active subscription immediately.`
+    )) return;
+
+    try {
+        await apiJSON(`/admin/topup-requests/${requestId}/approve`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ resolution_note: null }),
+        });
+        showToast(`Approved: +${Number(pages).toLocaleString()} pages for ${userEmail}`);
+        await Promise.all([_refreshTopupRequestsPanel(), _refreshUserTable()]);
+    } catch (e) {
+        showToast('Error: ' + e.message);
+    }
+}
+
+// ── Reject Top-up Modal ────────────────────────────────────────────────
+
+function _topupReqRejectModalHTML() {
+    return `
+    <div class="modal-overlay" id="topupReqRejectModal">
+        <div class="modal">
+            <div class="modal-title">Reject Top-up Request</div>
+            <div id="topupReqRejectTarget" style="font-size:11px;color:var(--text-dim);margin-bottom:14px"></div>
+            <div class="modal-field">
+                <label class="modal-label">Reason (optional)</label>
+                <input class="modal-input" id="topupReqRejectNote" type="text" maxlength="500"
+                       placeholder="e.g. Please wait until next billing cycle" autocomplete="off">
+            </div>
+            <div id="topupReqRejectError" style="color:var(--red,#e06c75);font-size:11px;min-height:16px;margin-top:4px"></div>
+            <div class="modal-actions">
+                <button class="modal-btn secondary" onclick="closeModal('topupReqRejectModal')">Cancel</button>
+                <button class="modal-btn primary" id="topupReqRejectBtn"
+                        style="background:var(--red,#e06c75)"
+                        onclick="submitRejectTopupRequest()">Reject</button>
+            </div>
+        </div>
+    </div>`;
+}
+
+let _rejectTopupReqId = null;
+
+function openRejectTopupModal(requestId, userEmail, pages) {
+    _rejectTopupReqId = requestId;
+    document.getElementById('topupReqRejectTarget').textContent =
+        `User: ${userEmail} — ${Number(pages).toLocaleString()} pages`;
+    document.getElementById('topupReqRejectNote').value = '';
+    document.getElementById('topupReqRejectError').textContent = '';
+    document.getElementById('topupReqRejectModal').classList.add('open');
+    setTimeout(() => document.getElementById('topupReqRejectNote').focus(), 50);
+}
+
+async function submitRejectTopupRequest() {
+    const btn = document.getElementById('topupReqRejectBtn');
+    const errEl = document.getElementById('topupReqRejectError');
+    const note = (document.getElementById('topupReqRejectNote').value || '').trim();
+
+    btn.disabled = true;
+    btn.textContent = 'Rejecting…';
+    errEl.textContent = '';
+    try {
+        await apiJSON(`/admin/topup-requests/${_rejectTopupReqId}/reject`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ resolution_note: note || null }),
+        });
+        closeModal('topupReqRejectModal');
+        showToast('Top-up request rejected');
+        await _refreshTopupRequestsPanel();
+    } catch (e) {
+        errEl.textContent = 'Error: ' + e.message;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Reject';
+    }
 }
 
 function _userStatCard(label, value, color) {
@@ -81,7 +264,6 @@ function _renderUserCard(u, currentUser) {
     const isSelf    = currentUser && u.id === currentUser.id;
     const isClient  = u.role === 'client';
     const isActive  = u.is_active;
-    const limit     = u.subscription_limit != null ? u.subscription_limit : 0;
 
     // Avatar initials
     const initials = u.email.split('@')[0].slice(0,2).toUpperCase();
@@ -99,22 +281,8 @@ function _renderUserCard(u, currentUser) {
         ? `<span style="display:inline-flex;align-items:center;gap:4px;font-size:9px;font-weight:600;letter-spacing:0.1em;color:var(--green,#98c379)"><span style="width:6px;height:6px;border-radius:50%;background:var(--green,#98c379);display:inline-block"></span>ACTIVE</span>`
         : `<span style="display:inline-flex;align-items:center;gap:4px;font-size:9px;font-weight:600;letter-spacing:0.1em;color:var(--text-dim)"><span style="width:6px;height:6px;border-radius:50%;background:var(--text-dim);display:inline-block"></span>INACTIVE</span>`;
 
-    // Page limit display
-    const limitDisplay = !isClient ? '' : limit === 0
-        ? `<span style="color:var(--red,#e06c75);font-size:11px;font-weight:600;font-family:var(--mono)">NOT SET</span>`
-        : `<span style="font-size:13px;font-weight:700;font-family:var(--mono);color:var(--text)">${Number(limit).toLocaleString()}</span>`;
-
-    // Edit limit button (pencil icon)
-    const editLimitBtn = isClient
-        ? `<button onclick="openPageLimitModal('${escapeInlineJsString(u.id)}','${escapeInlineJsString(u.email)}',${limit})"
-               title="Edit page limit"
-               style="background:none;border:1px solid var(--border);border-radius:3px;cursor:pointer;padding:4px 7px;color:var(--text-dim);display:inline-flex;align-items:center;gap:4px;font-size:9px;transition:all 0.15s"
-               onmouseover="this.style.borderColor='var(--blue)';this.style.color='var(--blue)'"
-               onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-dim)'">
-               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
-               Edit
-           </button>`
-        : '';
+    // Subscription block (clients only)
+    const subscriptionBlock = isClient ? _renderSubscriptionBlock(u) : '';
 
     // Action buttons
     let deactivateBtn = '';
@@ -188,21 +356,109 @@ function _renderUserCard(u, currentUser) {
             </div>
         </div>
 
-        <!-- Page limit (clients only) -->
-        ${isClient ? `
-        <div style="text-align:center;padding:0 16px;border-left:1px solid var(--border);border-right:1px solid var(--border);min-width:100px">
-            <div style="font-size:9px;letter-spacing:0.1em;color:var(--text-dim);margin-bottom:4px">PAGE LIMIT</div>
-            <div style="display:flex;align-items:center;justify-content:center;gap:8px">
-                ${limitDisplay}
-                ${editLimitBtn}
-            </div>
-        </div>` : `<div style="min-width:100px;padding:0 16px;border-left:1px solid var(--border);border-right:1px solid var(--border)"></div>`}
+        <!-- Subscription block (clients only) -->
+        ${subscriptionBlock}
 
         <!-- Actions -->
         <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;min-width:160px;justify-content:flex-end">
             ${deactivateBtn}
             ${resetPwBtn}
             ${hardDeleteBtn}
+        </div>
+    </div>`;
+}
+
+// Renders the inline subscription panel inside a client card: limit / used
+// progress bar, period dates, days remaining, topup count, plus the three
+// action buttons (Set Period / Add Topup / History).
+function _renderSubscriptionBlock(u) {
+    const base       = u.base_limit || 0;
+    const topupTotal = u.topup_total || 0;
+    const effective  = u.effective_limit || 0;
+    const used       = u.pages_used || 0;
+    const remaining  = u.pages_remaining || 0;
+    const status     = u.period_status || 'none';
+    const periodEnd  = u.period_end ? new Date(u.period_end) : null;
+    const periodStart = u.period_start ? new Date(u.period_start) : null;
+
+    const noSub = status === 'none' || effective === 0;
+    const expired = status === 'expired';
+    const percent = effective > 0 ? Math.min(100, Math.round((used / effective) * 100)) : 0;
+
+    // Days-remaining string + color
+    let daysStr = '—';
+    let daysColor = 'var(--text-dim)';
+    if (periodEnd) {
+        const ms = periodEnd.getTime() - Date.now();
+        const days = Math.ceil(ms / 86400000);
+        if (days < 0) { daysStr = 'EXPIRED'; daysColor = 'var(--red,#e06c75)'; }
+        else if (days === 0) { daysStr = 'TODAY'; daysColor = 'var(--amber,#e5c07b)'; }
+        else if (days <= 14) { daysStr = `${days}d left`; daysColor = 'var(--amber,#e5c07b)'; }
+        else { daysStr = `${days}d left`; daysColor = 'var(--text-dim)'; }
+    }
+
+    // Progress bar fill color: green → amber → red
+    let barColor = 'var(--green,#98c379)';
+    if (percent >= 100) barColor = 'var(--red,#e06c75)';
+    else if (percent >= 80) barColor = 'var(--amber,#e5c07b)';
+
+    const periodStr = (periodStart && periodEnd)
+        ? `${periodStart.toLocaleDateString()} → ${periodEnd.toLocaleDateString()}`
+        : 'No active period';
+
+    const topupChip = topupTotal > 0
+        ? `<span style="font-size:9px;color:var(--amber,#e5c07b);background:rgba(229,192,123,.10);border:1px solid var(--amber,#e5c07b);border-radius:2px;padding:1px 6px;letter-spacing:0.05em">+${topupTotal.toLocaleString()} TOPUP</span>`
+        : '';
+
+    const summaryLine = noSub
+        ? `<span style="color:var(--red,#e06c75);font-size:11px;font-weight:600;font-family:var(--mono)">NO SUBSCRIPTION</span>`
+        : `<span style="font-size:12px;font-family:var(--mono);color:var(--text);font-weight:600">
+              ${used.toLocaleString()} / ${effective.toLocaleString()}
+           </span>
+           <span style="font-size:10px;color:var(--text-dim);margin-left:4px">pages</span>`;
+
+    const expiredBanner = expired
+        ? `<div style="font-size:9px;color:var(--red,#e06c75);letter-spacing:0.08em;margin-top:3px;font-weight:600">⚠ PERIOD EXPIRED — UPLOADS BLOCKED</div>`
+        : '';
+
+    return `
+    <div style="flex:1;min-width:240px;padding:0 18px;border-left:1px solid var(--border);border-right:1px solid var(--border)">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+            <div style="font-size:9px;letter-spacing:0.1em;color:var(--text-dim)">SUBSCRIPTION</div>
+            <div style="font-size:9px;color:${daysColor};letter-spacing:0.06em;font-weight:600">${daysStr}</div>
+        </div>
+        <div style="display:flex;align-items:baseline;gap:8px">
+            ${summaryLine}
+            ${topupChip}
+        </div>
+        ${noSub ? '' : `
+        <div style="height:5px;background:var(--bg1,#1e1e1e);border-radius:2px;margin-top:6px;overflow:hidden">
+            <div style="height:100%;width:${percent}%;background:${barColor};transition:width .3s"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-top:5px">
+            <span style="font-size:9px;color:var(--text-dim)">${periodStr}</span>
+            <span style="font-size:9px;color:var(--text-dim);font-family:var(--mono)">${percent}%</span>
+        </div>`}
+        ${expiredBanner}
+        <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">
+            <button onclick="openSetPeriodModal('${escapeInlineJsString(u.id)}','${escapeInlineJsString(u.email)}',${base},'${u.period_end || ''}')"
+                style="background:none;border:1px solid var(--border);border-radius:3px;cursor:pointer;padding:4px 9px;font-size:9px;font-family:var(--mono);color:var(--text-dim);letter-spacing:0.06em;transition:all 0.15s"
+                onmouseover="this.style.borderColor='var(--blue)';this.style.color='var(--blue)'"
+                onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-dim)'">
+                ${noSub ? '+ SET PERIOD' : 'SET PERIOD'}
+            </button>
+            <button onclick="openTopupModal('${escapeInlineJsString(u.id)}','${escapeInlineJsString(u.email)}',${remaining})"
+                ${noSub ? 'disabled style="opacity:.4;cursor:not-allowed;' : 'style="'}background:none;border:1px solid var(--border);border-radius:3px;${noSub ? '' : 'cursor:pointer;'}padding:4px 9px;font-size:9px;font-family:var(--mono);color:var(--text-dim);letter-spacing:0.06em;transition:all 0.15s"
+                ${noSub ? '' : `onmouseover="this.style.borderColor='var(--amber,#e5c07b)';this.style.color='var(--amber,#e5c07b)'"
+                                onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-dim)'"`}>
+                + TOPUP
+            </button>
+            <button onclick="openUserHistoryModal('${escapeInlineJsString(u.id)}','${escapeInlineJsString(u.email)}')"
+                style="background:none;border:1px solid var(--border);border-radius:3px;cursor:pointer;padding:4px 9px;font-size:9px;font-family:var(--mono);color:var(--text-dim);letter-spacing:0.06em;transition:all 0.15s"
+                onmouseover="this.style.borderColor='var(--blue)';this.style.color='var(--blue)'"
+                onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-dim)'">
+                HISTORY
+            </button>
         </div>
     </div>`;
 }
@@ -353,71 +609,349 @@ async function submitResetPassword() {
     }
 }
 
-// ── Page Limit Modal ──────────────────────────────────────────────────
+// ── Set Period Modal ─────────────────────────────────────────────────
+// Creates a new active subscription (page_limit + period_start + period_end).
+// Supersedes any prior active subscription on the server side.
 
-function _pageLimitModalHTML() {
+function _setPeriodModalHTML() {
     return `
-    <div class="modal-overlay" id="pageLimitModal">
+    <div class="modal-overlay" id="setPeriodModal">
         <div class="modal">
-            <div class="modal-title">Set Page Limit</div>
-            <div id="pageLimitTarget" style="font-size:11px;color:var(--text-dim);margin-bottom:14px"></div>
+            <div class="modal-title">Set Subscription Period</div>
+            <div id="setPeriodTarget" style="font-size:11px;color:var(--text-dim);margin-bottom:14px"></div>
             <div class="modal-field">
-                <label class="modal-label">Subscription Page Limit</label>
-                <input class="modal-input" id="pageLimitInput" type="number" min="0" step="1" placeholder="e.g. 1000" autocomplete="off"
+                <label class="modal-label">Page Limit</label>
+                <input class="modal-input" id="setPeriodLimit" type="number" min="0" step="1" placeholder="e.g. 1000" autocomplete="off"
                     style="font-family:var(--mono);font-size:14px;letter-spacing:0.04em">
             </div>
-            <div style="font-size:10px;color:var(--text-dim);margin-top:2px;line-height:1.5">
-                Set to <strong>0</strong> to block all uploads. The client can go slightly over this limit
-                on their last allowed PDF (soft overage), but the next upload will be blocked.
+            <div class="modal-field" style="margin-top:12px">
+                <label class="modal-label">Duration</label>
+                <select class="modal-input" id="setPeriodDuration" onchange="_setPeriodDurationChanged()" style="cursor:pointer">
+                    <option value="30">1 Month</option>
+                    <option value="90">3 Months</option>
+                    <option value="180">6 Months</option>
+                    <option value="365" selected>1 Year</option>
+                    <option value="custom">Custom (pick end date)</option>
+                </select>
             </div>
-            <div id="pageLimitError" style="color:var(--red,#e06c75);font-size:11px;min-height:16px;margin-top:8px"></div>
+            <div class="modal-field" style="margin-top:12px">
+                <label class="modal-label">Period Start</label>
+                <input class="modal-input" id="setPeriodStart" type="date" autocomplete="off"
+                    style="font-family:var(--mono);font-size:12px">
+            </div>
+            <div class="modal-field" id="setPeriodEndWrap" style="margin-top:12px;display:none">
+                <label class="modal-label">Period End</label>
+                <input class="modal-input" id="setPeriodEnd" type="date" autocomplete="off"
+                    style="font-family:var(--mono);font-size:12px">
+            </div>
+            <div class="modal-field" style="margin-top:12px">
+                <label class="modal-label">Note (optional)</label>
+                <input class="modal-input" id="setPeriodNote" type="text" maxlength="500"
+                       placeholder="e.g. Annual contract — renewed by John" autocomplete="off">
+            </div>
+            <div style="font-size:10px;color:var(--text-dim);margin-top:8px;line-height:1.5">
+                Creating a new period <strong>replaces</strong> the current active subscription.
+                Any unused base pages and top-ups from the previous period are forfeited.
+            </div>
+            <div id="setPeriodError" style="color:var(--red,#e06c75);font-size:11px;min-height:16px;margin-top:8px"></div>
             <div class="modal-actions">
-                <button class="modal-btn secondary" onclick="closeModal('pageLimitModal')">Cancel</button>
-                <button class="modal-btn primary" id="pageLimitSaveBtn" onclick="submitPageLimit()">Save Limit</button>
+                <button class="modal-btn secondary" onclick="closeModal('setPeriodModal')">Cancel</button>
+                <button class="modal-btn primary" id="setPeriodSaveBtn" onclick="submitSetPeriod()">Save Period</button>
             </div>
         </div>
     </div>`;
 }
 
-let _pageLimitUserId = null;
+let _setPeriodUserId = null;
 
-function openPageLimitModal(userId, email, currentLimit) {
-    _pageLimitUserId = userId;
-    document.getElementById('pageLimitTarget').textContent = `User: ${email}`;
-    document.getElementById('pageLimitInput').value = currentLimit || '';
-    document.getElementById('pageLimitError').textContent = '';
-    document.getElementById('pageLimitModal').classList.add('open');
-    setTimeout(() => document.getElementById('pageLimitInput').focus(), 50);
+function openSetPeriodModal(userId, email, currentLimit /*, currentEndIso*/) {
+    _setPeriodUserId = userId;
+    document.getElementById('setPeriodTarget').textContent = `User: ${email}`;
+    document.getElementById('setPeriodLimit').value = currentLimit || '';
+    document.getElementById('setPeriodDuration').value = '365';
+    document.getElementById('setPeriodNote').value = '';
+    document.getElementById('setPeriodError').textContent = '';
+    const today = new Date();
+    document.getElementById('setPeriodStart').value = today.toISOString().slice(0, 10);
+    const oneYear = new Date(today.getTime() + 365 * 86400000);
+    document.getElementById('setPeriodEnd').value = oneYear.toISOString().slice(0, 10);
+    document.getElementById('setPeriodEndWrap').style.display = 'none';
+    document.getElementById('setPeriodModal').classList.add('open');
+    setTimeout(() => document.getElementById('setPeriodLimit').focus(), 50);
 }
 
-async function submitPageLimit() {
-    const input = document.getElementById('pageLimitInput');
-    const errEl = document.getElementById('pageLimitError');
-    const saveBtn = document.getElementById('pageLimitSaveBtn');
-    const raw = input.value.trim();
+function _setPeriodDurationChanged() {
+    const v = document.getElementById('setPeriodDuration').value;
+    document.getElementById('setPeriodEndWrap').style.display = v === 'custom' ? 'block' : 'none';
+}
 
-    if (raw === '') { errEl.textContent = 'Page limit is required.'; return; }
-    const limit = parseInt(raw, 10);
-    if (isNaN(limit) || limit < 0) { errEl.textContent = 'Must be a non-negative integer.'; return; }
+async function submitSetPeriod() {
+    const errEl = document.getElementById('setPeriodError');
+    const saveBtn = document.getElementById('setPeriodSaveBtn');
+    const limit = parseInt(document.getElementById('setPeriodLimit').value.trim(), 10);
+    if (isNaN(limit) || limit < 0) { errEl.textContent = 'Page limit must be a non-negative integer.'; return; }
+
+    const startStr = document.getElementById('setPeriodStart').value;
+    if (!startStr) { errEl.textContent = 'Period start is required.'; return; }
+    const start = new Date(startStr + 'T00:00:00Z');
+
+    const durationVal = document.getElementById('setPeriodDuration').value;
+    let end;
+    if (durationVal === 'custom') {
+        const endStr = document.getElementById('setPeriodEnd').value;
+        if (!endStr) { errEl.textContent = 'Custom end date is required.'; return; }
+        end = new Date(endStr + 'T23:59:59Z');
+    } else {
+        end = new Date(start.getTime() + parseInt(durationVal, 10) * 86400000);
+    }
+    if (end <= start) { errEl.textContent = 'End must be after start.'; return; }
     errEl.textContent = '';
 
     saveBtn.disabled = true;
     saveBtn.textContent = 'Saving...';
     try {
-        await apiJSON(`/admin/users/${_pageLimitUserId}/subscription-limit`, {
-            method: 'PATCH',
+        await apiJSON(`/admin/users/${_setPeriodUserId}/subscriptions`, {
+            method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ subscription_limit: limit }),
+            body: JSON.stringify({
+                page_limit: limit,
+                period_start: start.toISOString(),
+                period_end: end.toISOString(),
+                note: document.getElementById('setPeriodNote').value.trim() || null,
+            }),
         });
-        closeModal('pageLimitModal');
-        showToast(`Page limit set to ${limit.toLocaleString()}`);
+        closeModal('setPeriodModal');
+        showToast(`Subscription set: ${limit.toLocaleString()} pages until ${end.toLocaleDateString()}`);
         await _refreshUserTable();
     } catch (e) {
         errEl.textContent = 'Error: ' + e.message;
     } finally {
         saveBtn.disabled = false;
-        saveBtn.textContent = 'Save Limit';
+        saveBtn.textContent = 'Save Period';
     }
+}
+
+
+// ── Top-up Modal ─────────────────────────────────────────────────────
+// Grants extra pages to the user's current active subscription.
+
+function _topupModalHTML() {
+    return `
+    <div class="modal-overlay" id="topupModal">
+        <div class="modal">
+            <div class="modal-title">Add Top-up Pages</div>
+            <div id="topupTarget" style="font-size:11px;color:var(--text-dim);margin-bottom:6px"></div>
+            <div id="topupRemaining" style="font-size:10px;color:var(--text-dim);margin-bottom:14px"></div>
+            <div class="modal-field">
+                <label class="modal-label">Extra Pages</label>
+                <input class="modal-input" id="topupPages" type="number" min="1" step="1" placeholder="e.g. 500" autocomplete="off"
+                    style="font-family:var(--mono);font-size:14px;letter-spacing:0.04em">
+            </div>
+            <div class="modal-field" style="margin-top:12px">
+                <label class="modal-label">Note (optional)</label>
+                <input class="modal-input" id="topupNote" type="text" maxlength="500"
+                       placeholder="e.g. Paid invoice INV-1234" autocomplete="off">
+            </div>
+            <div style="font-size:10px;color:var(--text-dim);margin-top:8px;line-height:1.5">
+                Top-ups expire with the current subscription period — unused pages are forfeited
+                when the period ends.
+            </div>
+            <div id="topupError" style="color:var(--red,#e06c75);font-size:11px;min-height:16px;margin-top:8px"></div>
+            <div class="modal-actions">
+                <button class="modal-btn secondary" onclick="closeModal('topupModal')">Cancel</button>
+                <button class="modal-btn primary" id="topupSaveBtn" onclick="submitTopup()">Add Top-up</button>
+            </div>
+        </div>
+    </div>`;
+}
+
+let _topupUserId = null;
+
+function openTopupModal(userId, email, remaining) {
+    _topupUserId = userId;
+    document.getElementById('topupTarget').textContent = `User: ${email}`;
+    document.getElementById('topupRemaining').textContent =
+        `Current remaining: ${Number(remaining || 0).toLocaleString()} pages`;
+    document.getElementById('topupPages').value = '';
+    document.getElementById('topupNote').value = '';
+    document.getElementById('topupError').textContent = '';
+    document.getElementById('topupModal').classList.add('open');
+    setTimeout(() => document.getElementById('topupPages').focus(), 50);
+}
+
+async function submitTopup() {
+    const errEl = document.getElementById('topupError');
+    const saveBtn = document.getElementById('topupSaveBtn');
+    const pages = parseInt(document.getElementById('topupPages').value.trim(), 10);
+    if (isNaN(pages) || pages <= 0) { errEl.textContent = 'Pages must be a positive integer.'; return; }
+    errEl.textContent = '';
+
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Saving...';
+    try {
+        await apiJSON(`/admin/users/${_topupUserId}/topups`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                pages,
+                note: document.getElementById('topupNote').value.trim() || null,
+            }),
+        });
+        closeModal('topupModal');
+        showToast(`Added ${pages.toLocaleString()} top-up pages`);
+        await _refreshUserTable();
+    } catch (e) {
+        if (e.message.includes('409')) {
+            errEl.textContent = 'No active subscription — create a period first.';
+        } else {
+            errEl.textContent = 'Error: ' + e.message;
+        }
+    } finally {
+        saveBtn.disabled = false;
+        saveBtn.textContent = 'Add Top-up';
+    }
+}
+
+
+// ── User History Modal ───────────────────────────────────────────────
+// Chronological table of every subscription period + every top-up for a
+// single user. Built on demand from GET /admin/users/{id}/history.
+
+function _userHistoryModalHTML() {
+    return `
+    <div class="modal-overlay" id="userHistoryModal">
+        <div class="modal" style="max-width:880px;width:90vw">
+            <div class="modal-title">Subscription History</div>
+            <div id="userHistoryTarget" style="font-size:11px;color:var(--text-dim);margin-bottom:14px"></div>
+            <div id="userHistoryBody" style="max-height:60vh;overflow-y:auto">
+                <div style="padding:20px;color:var(--text-dim);font-size:11px">Loading…</div>
+            </div>
+            <div class="modal-actions">
+                <button class="modal-btn primary" onclick="closeModal('userHistoryModal')">Close</button>
+            </div>
+        </div>
+    </div>`;
+}
+
+async function openUserHistoryModal(userId, email) {
+    document.getElementById('userHistoryTarget').textContent = `User: ${email}`;
+    document.getElementById('userHistoryBody').innerHTML =
+        '<div style="padding:20px;color:var(--text-dim);font-size:11px">Loading…</div>';
+    document.getElementById('userHistoryModal').classList.add('open');
+    try {
+        const data = await apiJSON(`/admin/users/${userId}/history`);
+        document.getElementById('userHistoryBody').innerHTML = _renderUserHistory(data);
+    } catch (e) {
+        document.getElementById('userHistoryBody').innerHTML =
+            `<div style="padding:20px;color:var(--red,#e06c75);font-size:11px">Failed to load: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function _renderUserHistory(data) {
+    const subs  = data.subscriptions || [];
+    const tops  = data.topups || [];
+
+    // Build one merged chronological event list. Each row: when, type,
+    // pages, period window, status, note, admin.
+    const events = [];
+    for (const s of subs) {
+        events.push({
+            ts:       s.created_at,
+            type:     'subscription',
+            pages:    s.page_limit,
+            from:     s.period_start,
+            to:       s.period_end,
+            status:   s.status,
+            note:     s.note || '',
+            admin:    s.created_by_email || '—',
+            extra:    `Used ${Number(s.pages_used || 0).toLocaleString()} · Topups +${Number(s.topup_total || 0).toLocaleString()}`,
+        });
+    }
+    for (const t of tops) {
+        events.push({
+            ts:       t.created_at,
+            type:     'topup',
+            pages:    t.pages,
+            from:     t.sub_period_start,
+            to:       t.sub_period_end,
+            status:   t.sub_status,
+            note:     t.note || '',
+            admin:    t.created_by_email || '—',
+            extra:    `On subscription #${t.subscription_id}`,
+        });
+    }
+    events.sort((a, b) => new Date(b.ts) - new Date(a.ts));
+
+    if (!events.length) {
+        return '<div style="padding:20px;color:var(--text-dim);font-size:11px;text-align:center">No subscription history yet.</div>';
+    }
+
+    const statBlock = `
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px">
+        <div style="background:var(--bg2);border:1px solid var(--border);border-radius:3px;padding:10px 12px">
+            <div style="font-size:9px;letter-spacing:0.1em;color:var(--text-dim);margin-bottom:4px">SUBSCRIPTIONS</div>
+            <div style="font-size:16px;font-weight:700;font-family:var(--mono);color:var(--blue)">${subs.length}</div>
+        </div>
+        <div style="background:var(--bg2);border:1px solid var(--border);border-radius:3px;padding:10px 12px">
+            <div style="font-size:9px;letter-spacing:0.1em;color:var(--text-dim);margin-bottom:4px">TOP-UPS</div>
+            <div style="font-size:16px;font-weight:700;font-family:var(--mono);color:var(--amber,#e5c07b)">${tops.length}</div>
+        </div>
+        <div style="background:var(--bg2);border:1px solid var(--border);border-radius:3px;padding:10px 12px">
+            <div style="font-size:9px;letter-spacing:0.1em;color:var(--text-dim);margin-bottom:4px">EXTRA PAGES GRANTED</div>
+            <div style="font-size:16px;font-weight:700;font-family:var(--mono);color:var(--amber,#e5c07b)">+${tops.reduce((s,t)=>s+(t.pages||0),0).toLocaleString()}</div>
+        </div>
+    </div>`;
+
+    const cols = '110px 90px 80px 180px 90px 1fr 120px';
+    const rowStyle = `display:grid;grid-template-columns:${cols};align-items:center;gap:8px`;
+
+    const header = `
+    <div style="${rowStyle};padding:8px 10px;border-bottom:2px solid var(--border);
+                font-size:9px;letter-spacing:0.1em;color:var(--text-dim);position:sticky;top:0;background:var(--bg1,#1e1e1e);z-index:1">
+        <span>WHEN</span>
+        <span>TYPE</span>
+        <span style="text-align:right">PAGES</span>
+        <span>PERIOD</span>
+        <span>STATUS</span>
+        <span>NOTE</span>
+        <span>ADMIN</span>
+    </div>`;
+
+    const rows = events.map(ev => {
+        const when = new Date(ev.ts).toLocaleString();
+        const typeBadge = ev.type === 'subscription'
+            ? `<span style="font-size:9px;font-weight:700;letter-spacing:0.1em;color:var(--blue);background:var(--blue-bg,rgba(97,175,239,.1));border:1px solid var(--blue);border-radius:2px;padding:1px 6px">SUB</span>`
+            : `<span style="font-size:9px;font-weight:700;letter-spacing:0.1em;color:var(--amber,#e5c07b);background:rgba(229,192,123,.10);border:1px solid var(--amber,#e5c07b);border-radius:2px;padding:1px 6px">TOPUP</span>`;
+        const pageStr = ev.type === 'topup'
+            ? `+${Number(ev.pages).toLocaleString()}`
+            : Number(ev.pages).toLocaleString();
+        const pageColor = ev.type === 'topup' ? 'var(--amber,#e5c07b)' : 'var(--text)';
+        const periodStr = (ev.from && ev.to)
+            ? `${new Date(ev.from).toLocaleDateString()} → ${new Date(ev.to).toLocaleDateString()}`
+            : '—';
+        const statusColor = {
+            active:     'var(--green,#98c379)',
+            expired:    'var(--text-dim)',
+            cancelled:  'var(--red,#e06c75)',
+            superseded: 'var(--text-dim)',
+        }[ev.status] || 'var(--text-dim)';
+
+        return `
+        <div style="${rowStyle};padding:8px 10px;border-bottom:1px solid var(--border);font-size:10px;
+                    transition:background .12s"
+             onmouseover="this.style.background='var(--bg2)'"
+             onmouseout="this.style.background='transparent'">
+            <span style="color:var(--text-dim);font-family:var(--mono)">${when}</span>
+            <span>${typeBadge}</span>
+            <span style="text-align:right;font-family:var(--mono);font-weight:600;color:${pageColor}">${pageStr}</span>
+            <span style="font-family:var(--mono);color:var(--text-dim);font-size:9px">${periodStr}</span>
+            <span style="text-transform:uppercase;font-size:9px;letter-spacing:0.08em;color:${statusColor};font-weight:600">${ev.status || '—'}</span>
+            <span style="color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(ev.note)}">${escapeHtml(ev.note || ev.extra || '')}</span>
+            <span style="color:var(--text-dim);font-size:9px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(ev.admin)}">${escapeHtml(ev.admin)}</span>
+        </div>`;
+    }).join('');
+
+    return statBlock + header + rows;
 }
 
 // ── Shared helpers ─────────────────────────────────────────────────────

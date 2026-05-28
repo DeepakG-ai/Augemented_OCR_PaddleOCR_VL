@@ -235,13 +235,20 @@ async function renderReviewPage(app, extractionId) {
             _rvAllFieldLocs = [];
             _rvFieldLocs = data.field_locations || {};
         }
-        try { _rvPages = await apiJSON(`/extractions/${extractionId}/pages`); } catch (e2) { _rvPages = []; }
+        try {
+            _rvPages = await apiJSON(`/extractions/${extractionId}/pages`);
+        } catch (e2) {
+            console.warn(e2);
+            _rvPages = [];
+            showToast('Could not load document pages — PDF preview unavailable');
+        }
     } catch (e) {
         // Auth/ownership failure — do not fall back to cached state.
         // 401: token expired (apiFetch already reloads); 403: wrong tenant.
         if (e.message && (e.message.includes('401') || e.message.includes('403'))) throw e;
         // Other API failure — fall back to in-memory state if available
         console.warn('Failed to fetch extraction from API, using in-memory fallback:', e.message);
+        showToast('Could not fetch extraction data — falling back to cached view');
         _rvVendorId = null;
         const fallbackResult = reviewResult || {};
         _rvIsPoPerPage = Array.isArray(fallbackResult);
@@ -280,6 +287,7 @@ async function renderReviewPage(app, extractionId) {
     } catch (e) {
         if (e.message && (e.message.includes('401') || e.message.includes('403'))) throw e;
         console.warn('OCR data not available for click-to-select:', e.message);
+        showToast('OCR overlay unavailable — click-to-select disabled for this document');
     }
 
     if (_rvVendorId) {
@@ -290,6 +298,7 @@ async function renderReviewPage(app, extractionId) {
             if (e.message && (e.message.includes('401') || e.message.includes('403'))) throw e;
             console.warn('Saved correction metadata not available:', e.message);
             _rvExistingCorrectionFields = {};
+            showToast('Could not load saved corrections — duplicate-field warnings may be incomplete');
         }
     }
 
@@ -301,6 +310,7 @@ async function renderReviewPage(app, extractionId) {
         if (e.message && (e.message.includes('401') || e.message.includes('403'))) throw e;
         console.warn('Spatial memory fields not available:', e.message);
         _rvExistingSpatialFields = {};
+        showToast('Could not load spatial memory fields — override warnings will not appear');
     }
 
     _rvTotalPages = _rvPages.length || 1;

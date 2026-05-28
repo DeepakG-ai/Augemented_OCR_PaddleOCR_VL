@@ -6,7 +6,11 @@
       "Bash(.venv/Scripts/python.exe -m pytest tests/test_auth.py -v)",
       "Bash(.venv/Scripts/python.exe -m pytest tests/ -v)",
       "Bash(.venv/Scripts/python.exe -m pytest tests/test_db_vendor_filtering.py tests/test_auth.py::JwtTokenTests::test_tampered_signature_is_rejected -v)",
-      "Bash(.venv/Scripts/python.exe *)"
+      "Bash(.venv/Scripts/python.exe *)",
+      "Bash(git stash *)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\aigroup5\\\\PycharmProjects\\\\Augemented_OCR_PaddleOCR_VL\" -Recurse -Directory)",
+      "Bash(Select-Object -First 20)",
+      "PowerShell($out = & git diff main..HEAD --stat 2>&1; Write-Output \"Count=$\\($out.Count\\)\"; $out | Select-Object -First 80)"
     ]
   }
 }

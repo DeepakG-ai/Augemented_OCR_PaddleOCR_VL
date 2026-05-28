@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import hashlib
 import logging
 import os
@@ -18,7 +19,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
-from fastapi import Depends, Header, HTTPException, Query, Request, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 
@@ -87,14 +88,37 @@ def create_access_token(user_id: str, role: str, email: str) -> str:
     return jwt.encode(payload, _require_secret(), algorithm=JWT_ALGORITHM)
 
 
+def _ensure_canonical_b64url_segment(segment: str) -> None:
+    """Reject JWT segments whose text is not the canonical base64url form."""
+    if not segment or "=" in segment:
+        raise ValueError("JWT segment is not canonical base64url")
+    try:
+        padded = segment + ("=" * (-len(segment) % 4))
+        raw = base64.b64decode(padded.encode("ascii"), altchars=b"-_", validate=True)
+    except (UnicodeEncodeError, ValueError, binascii.Error) as exc:
+        raise ValueError("JWT segment is malformed base64url") from exc
+    canonical = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    if not secrets.compare_digest(canonical, segment):
+        raise ValueError("JWT segment is not canonical base64url")
+
+
+def _ensure_canonical_jwt(token: str) -> None:
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise ValueError("JWT must contain exactly three segments")
+    for part in parts:
+        _ensure_canonical_b64url_segment(part)
+
+
 def decode_token(token: str) -> dict:
     try:
+        _ensure_canonical_jwt(token)
         return jwt.decode(token, _require_secret(), algorithms=[JWT_ALGORITHM])
-    except JWTError as exc:
+    except (JWTError, ValueError) as exc:
         _sec.warning("auth.token_invalid  error=%s", str(exc))
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid or expired token: {exc}",
+            detail="Invalid or expired token",  # sanitized — never leak JWT internals to client
             headers={"WWW-Authenticate": "Bearer"},
         ) from exc
 
@@ -126,7 +150,10 @@ def encrypt_api_key(raw_key: str) -> str:
 
 
 def decrypt_api_key(encrypted: str) -> str:
-    return _fernet().decrypt(encrypted.encode()).decode()
+    try:
+        return _fernet().decrypt(encrypted.encode()).decode()
+    except Exception as exc:
+        raise ValueError("API key decryption failed — server configuration error") from exc
 
 
 # -- FastAPI dependency -----------------------------------------------------
@@ -244,17 +271,17 @@ async def get_current_user_or_api_key(
 async def get_current_user_sse(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
-    token: str | None = Query(None, description="Token for SSE/EventSource clients"),
 ) -> dict:
     """
-    Extract user from Bearer header OR ?token= query param (needed for SSE,
-    since EventSource cannot set headers).
+    Extract user from the Bearer header for SSE endpoints.
+
+    Query-parameter token auth was removed because the token would appear in
+    uvicorn/proxy access logs. SSE clients must use fetch() + ReadableStream
+    with an Authorization header instead of the native EventSource API.
     """
     raw_token: str | None = None
     if credentials and credentials.scheme.lower() == "bearer":
         raw_token = credentials.credentials
-    elif token:
-        raw_token = token
 
     if not raw_token:
         raise HTTPException(

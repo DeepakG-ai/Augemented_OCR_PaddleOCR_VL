@@ -147,39 +147,73 @@ class DeleteExtractionSQLTests(unittest.IsolatedAsyncioTestCase):
 # ---------------------------------------------------------------------------
 
 class BillablePagesSourceTests(unittest.IsolatedAsyncioTestCase):
+    """v2 quota: get_user_billable_pages delegates to get_user_quota_v2 which
+    still COUNTs from llm_usage scoped by user_id — these tests verify the
+    underlying SQL still has that invariant.
+
+    Two cases are exercised: an active subscription (quota uses the period
+    window) and no-active-subscription (lifetime billing fallback)."""
+
+    async def _all_sqls_after(self, conn) -> str:
+        rows = list(conn.fetchrow.call_args_list)
+        vals = list(conn.fetchval.call_args_list)
+        return _compact(" ".join([c.args[0] for c in rows + vals]))
 
     async def test_billable_pages_query_reads_from_llm_usage(self) -> None:
-        """get_user_billable_pages must COUNT from llm_usage, not SUM from extractions."""
+        """v2: the COUNT(DISTINCT) over llm_usage now lives inside the
+        active-subscription branch (via fetchval). Verifies invariant survives."""
         pool, conn = _make_pool_conn()
-        conn.fetchrow.return_value = {"subscription_limit": 1000, "billable_pages": 30}
+        # get_user_quota_v2 → active-sub fetchrow, then pending fetchrow.
+        conn.fetchrow.side_effect = [
+            {"id": 1, "page_limit": 1000,
+             "period_start": "2026-01-01", "period_end": "2027-01-01"},
+            {"pending": 0},
+        ]
+        # fetchval: SUM(topups) then COUNT(DISTINCT) usage.
+        conn.fetchval.side_effect = [0, 30]
 
         await db_mod.get_user_billable_pages(
             pool, "12345678-1234-5678-1234-567812345678"
         )
 
-        sql = _compact(conn.fetchrow.call_args[0][0])
-        self.assertIn("llm_usage", sql)
-        self.assertIn("COUNT(DISTINCT (lu.extraction_id, lu.page_num))", sql)
-        self.assertNotIn("FROM extractions", sql)
-        self.assertNotIn("SUM(e.total_pages)", sql)
+        all_sql = await self._all_sqls_after(conn)
+        self.assertIn("llm_usage", all_sql)
+        self.assertIn("COUNT(DISTINCT (lu.extraction_id, lu.page_num))", all_sql)
+        self.assertNotIn("FROM extractions", all_sql)
+        self.assertNotIn("SUM(e.total_pages)", all_sql)
 
     async def test_billable_pages_scoped_by_user_id_not_vendor(self) -> None:
-        """Billing survives vendor deletion because it filters on lu.user_id."""
+        """v2 quota still scopes by lu.user_id, never via vendor JOIN — so
+        billing survives vendor deletion."""
         pool, conn = _make_pool_conn()
-        conn.fetchrow.return_value = {"subscription_limit": 500, "billable_pages": 30}
+        conn.fetchrow.side_effect = [
+            {"id": 1, "page_limit": 500,
+             "period_start": "2026-01-01", "period_end": "2027-01-01"},
+            {"pending": 0},
+        ]
+        conn.fetchval.side_effect = [0, 30]
 
         await db_mod.get_user_billable_pages(
             pool, "12345678-1234-5678-1234-567812345678"
         )
 
-        sql = _compact(conn.fetchrow.call_args[0][0])
-        self.assertIn("lu.user_id = $1", sql)
-        self.assertNotIn("JOIN vendors", sql)
+        all_sql = await self._all_sqls_after(conn)
+        self.assertIn("lu.user_id = $1", all_sql)
+        self.assertNotIn("JOIN vendors", all_sql)
 
     async def test_billable_count_unchanged_after_simulated_deletion(self) -> None:
         """Simulate 30 pages used, delete 3 extractions: billable count stays 30."""
         pool, conn = _make_pool_conn()
-        conn.fetchrow.return_value = {"subscription_limit": 100, "billable_pages": 30}
+        # Two get_user_billable_pages calls (before + after) → 4 fetchrow + 4 fetchval.
+        conn.fetchrow.side_effect = [
+            {"id": 1, "page_limit": 100,
+             "period_start": "2026-01-01", "period_end": "2027-01-01"},
+            {"pending": 0},
+            {"id": 1, "page_limit": 100,
+             "period_start": "2026-01-01", "period_end": "2027-01-01"},
+            {"pending": 0},
+        ]
+        conn.fetchval.side_effect = [0, 30, 0, 30]
         conn.execute.return_value = "DELETE 1"
 
         before = await db_mod.get_user_billable_pages(
@@ -201,34 +235,44 @@ class BillablePagesSourceTests(unittest.IsolatedAsyncioTestCase):
 # ---------------------------------------------------------------------------
 
 class ReserveQuotaSourceTests(unittest.IsolatedAsyncioTestCase):
+    """reserve_quota now uses two fetchrow + two fetchval calls:
+        (1) FOR UPDATE on users (pending_pages)
+        (2) active subscription lookup
+        (3) SUM(topups) over the active sub
+        (4) COUNT(DISTINCT) usage within the period window from llm_usage.
+    """
 
     async def test_reserve_quota_counts_from_llm_usage(self) -> None:
         """reserve_quota must use llm_usage for billable count, not extractions."""
         pool, conn = _make_pool_conn()
-        conn.fetchrow.return_value = {
-            "subscription_limit": 1000,
-            "pending_pages": 0,
-            "billable_pages": 30,
-        }
+        conn.fetchrow.side_effect = [
+            {"pending": 0},
+            {"id": 1, "page_limit": 1000,
+             "period_start": "2026-01-01", "period_end": "2027-01-01"},
+        ]
+        conn.fetchval.side_effect = [0, 30]  # topups=0, used=30
         conn.execute.return_value = "UPDATE 1"
 
         await db_mod.reserve_quota(
             pool, "12345678-1234-5678-1234-567812345678", incoming_pages=5
         )
 
-        sql = _compact(conn.fetchrow.call_args[0][0])
-        self.assertIn("llm_usage", sql)
-        self.assertIn("COUNT(DISTINCT (lu.extraction_id, lu.page_num))", sql)
-        self.assertNotIn("SUM(e.total_pages)", sql)
+        all_rows = " ".join(_compact(c.args[0]) for c in conn.fetchrow.call_args_list)
+        all_vals = " ".join(_compact(c.args[0]) for c in conn.fetchval.call_args_list)
+        all_sql = all_rows + " " + all_vals
+        self.assertIn("llm_usage", all_sql)
+        self.assertIn("COUNT(DISTINCT (lu.extraction_id, lu.page_num))", all_sql)
+        self.assertNotIn("SUM(e.total_pages)", all_sql)
 
     async def test_reserve_quota_blocks_user_even_after_deletion(self) -> None:
         """A user at 100/100 cannot upload even if they deleted old extractions."""
         pool, conn = _make_pool_conn()
-        conn.fetchrow.return_value = {
-            "subscription_limit": 100,
-            "pending_pages": 0,
-            "billable_pages": 100,
-        }
+        conn.fetchrow.side_effect = [
+            {"pending": 0},
+            {"id": 1, "page_limit": 100,
+             "period_start": "2026-01-01", "period_end": "2027-01-01"},
+        ]
+        conn.fetchval.side_effect = [0, 100]  # topups=0, used=100
         conn.execute.return_value = "UPDATE 1"
 
         result = await db_mod.reserve_quota(

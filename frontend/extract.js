@@ -81,9 +81,9 @@ async function renderExtractPage(app) {
         <div class="sidebar-section"><div class="section-title">Document</div></div>
         <div class="upload-zone" id="dropzone" onclick="document.getElementById('fileInput').click()">
             <div class="upload-icon">⬆</div>
-            <div class="upload-text"><strong>Drop file or browse</strong><br>PDF, JPEG, PNG</div>
+            <div class="upload-text"><strong>Drop file or browse</strong><br>PDF only</div>
         </div>
-        <input type="file" id="fileInput" accept="image/*,.pdf" style="display:none" onchange="handleFile(this.files[0])">
+        <input type="file" id="fileInput" accept="application/pdf,.pdf" style="display:none" onchange="handleFile(this.files[0])">
         <div id="fileBadge" style="display:none" class="file-badge"><span>✓</span><span id="fileNameLabel" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span></div>
     </aside>
     <main class="viewer">
@@ -337,6 +337,17 @@ function setupDropzone() {
 
 async function handleFile(file) {
     if (!file) return;
+
+    // Hard block — only PDFs allowed (matches backend _require_pdf guard)
+    const nameLower = (file.name || '').toLowerCase();
+    const isPdfByName = nameLower.endsWith('.pdf');
+    const isPdfByMime = !file.type || file.type === 'application/pdf';
+    if (!isPdfByName || !isPdfByMime) {
+        showToast(`Only PDF files are accepted. "${file.name}" was rejected.`);
+        const fi = document.getElementById('fileInput'); if (fi) fi.value = '';
+        return;
+    }
+
     loadedFile = file;
     document.getElementById('noDoc').style.display = 'none';
     document.getElementById('docFrame').style.display = 'block';
@@ -358,26 +369,17 @@ async function handleFile(file) {
         updatePageNav();
         renderCurrentPage();
     } catch (e) {
-        // Fallback: client-side preview
+        // Fallback: client-side PDF preview if /upload-preview is unreachable
         const reader = new FileReader();
         reader.onload = ev => {
-            const b64 = ev.target.result;
             const container = document.getElementById('docImgContainer');
             if (!container) return;
             container.replaceChildren();
-            if (file.name.toLowerCase().endsWith('.pdf') || b64.startsWith('data:application/pdf')) {
-                const embed = document.createElement('embed');
-                embed.src = b64;
-                embed.type = 'application/pdf';
-                embed.style.cssText = 'width:100%;height:600px;border:none;';
-                container.appendChild(embed);
-            } else {
-                const img = document.createElement('img');
-                img.src = b64;
-                img.alt = 'document';
-                img.className = 'doc-img';
-                container.appendChild(img);
-            }
+            const embed = document.createElement('embed');
+            embed.src = ev.target.result;
+            embed.type = 'application/pdf';
+            embed.style.cssText = 'width:100%;height:600px;border:none;';
+            container.appendChild(embed);
             totalPages = 1; currentPage = 1; updatePageNav();
         };
         reader.readAsDataURL(file);
@@ -670,6 +672,16 @@ function updatePipelineFromSSE(jobState) {
         return;
     }
 
+    if (event === 'partial') {
+        if (_pipelineTimerInterval) { clearInterval(_pipelineTimerInterval); _pipelineTimerInterval = null; }
+        const el = document.getElementById('pipelineTimer');
+        if (el && _pipelineStartTime) {
+            const elapsed = ((Date.now() - _pipelineStartTime) / 1000).toFixed(1);
+            el.textContent = `${elapsed}s — STOPPED`;
+        }
+        return;
+    }
+
     // Set current stage as active
     _pipelineSeenStages.add(stage);
     let detail = message || PIPELINE_STAGES.find(p => p.id === uiStage)?.detail || '';
@@ -932,6 +944,19 @@ async function runExtract() {
         let errorMsg = 'Extraction failed: ' + err.message;
         let failedStage = 'detect'; // default: failed during vendor detection
         let actionButtons = '<button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">Retry Extraction</button>';
+
+        const apiDetail = err.error || {};
+        if (err.status === 402 && apiDetail.code === 'QUOTA_EXCEEDED') {
+            const limit = apiDetail.subscription_limit;
+            const used = apiDetail.total_extracted_pages;
+            const over = Math.abs(apiDetail.overage || 0);
+            errorMsg = `Page limit exceeded — ${used} pages used, limit is ${limit} (${over} over). Contact your administrator to increase your limit.`;
+            failedStage = 'upload';
+        } else if (err.status === 409 && apiDetail.reason === 'unknown_vendor') {
+            errorMsg = 'Unknown vendor — no alias matched the document. Add the vendor name as an alias, then retry.';
+            failedStage = 'detect';
+            actionButtons = '<button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">Retry Extraction</button> <button class="small-btn" onclick="navigate(\'#/vendors\')" style="margin-top:8px">Manage Vendors</button>';
+        }
 
         try {
             const match402 = err.message.match(/HTTP 402:\s*(.+)/s);

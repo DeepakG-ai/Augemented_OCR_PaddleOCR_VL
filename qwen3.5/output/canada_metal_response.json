@@ -1,0 +1,36 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "{\n  \"fields\": {\n    \"vendor_name\": \"CMNA\",\n    \"vendor_address\": \"8271 rue Lafrenais\\nSt. Léonard, Québec H1P 2B1\\nTEL: (514) 327-2011 FAX: (514) 327-7810\",\n    \"invoice_number\": \"INV-CM1005\",\n    \"invoice_date\": \"May 14, 2026\",\n    \"po_number\": \"DP00001005\",\n    \"invoice_total\": \"53,123.92\",\n    \"invoice_subtotal\": \"32,779.36\",\n    \"tax_amount\": \"2,294.56\",\n    \"frieght_amount\": \"18,050.00\",\n    \"line_items\": [\n      {\n        \"item\": \"INK-10000\",\n        \"line_description\": \"Ink, Special\\nEXTENDED SUPREXE AG\",\n        \"quantity_ordered\": 4000,\n        \"quantity_received\": 3500,\n        \"unit_price\": 3.52976,\n        \"line_total\": 12354.16,\n        \"uom\": \"GA.\"\n      },\n      {\n        \"item\": \"DG4V-5-23A\",\n        \"line_description\": \"Bronze, 85-5-5 Raw Material\\nMS, RM 002.001\",\n        \"quantity_ordered\": 2000,\n        \"quantity_received\": 1400,\n        \"unit_price\": 4.28584,\n        \"line_total\": 6000.18,\n        \"uom\": \"EA.\"\n      },\n      {\n        \"item\": \"DAT-RM-001\",\n        \"line_description\": \"FLASH Supreze\\nTest Component Q A35C100\",\n        \"quantity_ordered\": 2000,\n        \"quantity_received\": 1100,\n        \"unit_price\": 6.17858,\n        \"line_total\": 6796.44,\n        \"uom\": \"EA.\"\n      },\n      {\n        \"item\": \"568-CCL75-P2\",\n        \"line_description\": \"Fastener\\n005407-PC Powder Coated\",\n        \"quantity_ordered\": 1500,\n        \"quantity_received\": 800,\n        \"unit_price\": 4.02381,\n        \"line_total\": 3219.05,\n        \"uom\": \"EA.\"\n      },\n      {\n        \"item\": \"ZAL-200-Q\",\n        \"line_description\": \"Co-By\\nTest Component Q A35C100\",\n        \"quantity_ordered\": 1000,\n        \"quantity_received\": 800,\n        \"unit_price\": 5.51191,\n        \"line_total\": 4409.53,\n        \"uom\": \"EA.\"\n      }\n    ]\n  },\n  \"boxes\": {\n    \"vendor_name\": [82, 79, 176, 96],\n    \"vendor_address\": [31, 124, 279, 172],\n    \"invoice_number\": [790, 85, 869, 93],\n    \"invoice_date\": [790, 48, 816, 56],\n    \"po_number\": [604, 305, 742, 313],\n    \"invoice_total\": [870, 877, 939, 887],\n    \"invoice_subtotal\": [870, 820, 939, 829],\n    \"tax_amount\": [870, 831, 939, 840],\n    \"frieght_amount\": [870, 851, 939, 860],\n    \"item\": [231, 328, 291, 337],\n    \"line_description\": [302, 367, 669, 376],\n    \"quantity_ordered\": [44, 363, 95, 371],\n    \"quantity_received\": [108, 363, 159, 371],\n    \"unit_price\": [702, 367, 754, 376],\n    \"line_total\": [870, 367, 939, 376],\n    \"uom\": [767, 367, 792, 376]\n  }\n}"
+      }
+    }
+  ],
+  "created": 1779954471,
+  "model": "Qwen3.5-9B-UD-Q4_K_XL.gguf",
+  "system_fingerprint": "b9294-0f3cb3fc8",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 1170,
+    "prompt_tokens": 2356,
+    "total_tokens": 3526,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "id": "chatcmpl-R53d2vyK44V4EUMtiEuBaqRwgq6eo4Rd",
+  "timings": {
+    "cache_n": 0,
+    "prompt_n": 2356,
+    "prompt_ms": 7260.85,
+    "prompt_per_token_ms": 3.0818548387096776,
+    "prompt_per_second": 324.4799162632474,
+    "predicted_n": 1170,
+    "predicted_ms": 35359.465,
+    "predicted_per_token_ms": 30.221764957264956,
+    "predicted_per_second": 33.08873592968672
+  }
+}

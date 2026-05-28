@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 # -- Vendor ---------------------------------------------------------------
@@ -40,6 +40,61 @@ class UserOut(BaseModel):
     is_active: bool = True
     subscription_limit: int | None = None
     created_at: datetime | None = None
+    # Per-user current period summary (admin list view). All optional so old
+    # callers/tests keep working.
+    period_start: datetime | None = None
+    period_end: datetime | None = None
+    base_limit: int | None = None
+    topup_total: int | None = None
+    effective_limit: int | None = None
+    pages_used: int | None = None
+    pages_remaining: int | None = None
+    period_status: str | None = None  # 'active' | 'expired' | 'cancelled' | 'none'
+
+
+class SubscriptionCreate(BaseModel):
+    page_limit: int = Field(..., ge=0, description="Base pages granted for the period.")
+    period_start: datetime | None = Field(
+        None,
+        description="ISO timestamp. Defaults to now() when omitted.",
+    )
+    period_end: datetime = Field(
+        ...,
+        description="ISO timestamp. Must be after period_start.",
+    )
+    note: str | None = Field(None, max_length=500)
+
+
+class TopupCreate(BaseModel):
+    pages: int = Field(..., gt=0, description="Extra pages to grant in addition to base.")
+    note: str | None = Field(None, max_length=500)
+
+
+class SubscriptionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    page_limit: int
+    period_start: datetime
+    period_end: datetime
+    status: str
+    note: str | None = None
+    created_at: datetime
+    created_by_email: str | None = None
+    topup_total: int = 0
+    pages_used: int = 0
+
+
+class TopupOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    subscription_id: int
+    pages: int
+    note: str | None = None
+    created_at: datetime
+    created_by_email: str | None = None
+    sub_period_start: datetime | None = None
+    sub_period_end: datetime | None = None
+    sub_status: str | None = None
 
 
 class TokenOut(BaseModel):
@@ -83,6 +138,8 @@ class ApiKeyOut(BaseModel):
     prefix: str
     is_active: bool = True
     owner_email: str | None = None
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
     total_tokens: int = 0
     total_documents: int = 0
     total_pages: int = 0
@@ -260,3 +317,69 @@ class ExtractionJobStartOut(BaseModel):
     status: str
     detected_vendor: Any | None = None
     usage_warning: Any | None = None
+
+
+# -- Top-up requests -------------------------------------------------------
+
+class TopupRequestCreate(BaseModel):
+    """User-submitted top-up page request.
+
+    Any positive integer is accepted for requested_pages — the admin decides
+    what to actually grant. requested_period is a free-text label (e.g.
+    '1 month', '6 months', '2 years', 'Q3 extension') — no enumeration is
+    enforced so admins can use any period that makes sense for the client.
+    """
+
+    requested_pages: int = Field(
+        ...,
+        gt=0,
+        le=10_000_000,
+        description="Number of extra pages requested. Any positive integer.",
+    )
+    requested_period: str = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="Free-text period label, e.g. '3 months', '1 year', 'Q4 extension'.",
+    )
+    note: str | None = Field(None, max_length=500)
+
+    @field_validator("requested_pages", mode="before")
+    @classmethod
+    def coerce_pages(cls, v):
+        """Accept numeric strings from form-style callers; reject floats with decimals."""
+        if isinstance(v, str):
+            try:
+                v = int(v)
+            except ValueError:
+                raise ValueError("requested_pages must be a whole number")
+        if isinstance(v, float) and not v.is_integer():
+            raise ValueError("requested_pages must be a whole number, not a decimal")
+        return int(v)
+
+    @field_validator("requested_period", mode="before")
+    @classmethod
+    def strip_period(cls, v):
+        if isinstance(v, str):
+            v = v.strip()
+        return v
+
+
+class TopupRequestResolve(BaseModel):
+    resolution_note: str | None = Field(None, max_length=500)
+
+
+class TopupRequestOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    user_id: str
+    user_email: str | None = None
+    requested_pages: int
+    requested_period: str
+    note: str | None = None
+    status: str
+    resolution_note: str | None = None
+    resolved_by: str | None = None
+    resolved_by_email: str | None = None
+    resolved_at: datetime | None = None
+    created_at: datetime

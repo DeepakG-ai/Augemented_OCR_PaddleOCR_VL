@@ -8,7 +8,11 @@ let _vendorPageClients = [];
 async function renderVendorsPage(app) {
     let vendors = [];
     let allUsers = [];
-    try { vendors = await apiJSON('/vendors'); } catch (e) { console.warn(e); }
+    let _vendorLoadError = null;
+    try { vendors = await apiJSON('/vendors'); } catch (e) {
+        console.warn(e);
+        _vendorLoadError = e.message || 'Failed to load vendors';
+    }
     db.vendors = vendors;
 
     const isAdmin = (getAuthUser() || {}).role === 'admin';
@@ -37,7 +41,10 @@ async function renderVendorsPage(app) {
         <span style="font-size:10px;letter-spacing:0.1em">${bottomBarExtra}<span style="color:var(--text-dim)">${vendors.length} VENDOR${vendors.length !== 1 ? 'S' : ''} REGISTERED</span></span>
     </div>` + vendorModalHTML();
 
-    if (isAdmin) {
+    if (_vendorLoadError) {
+        const c = document.getElementById('vendorCards');
+        if (c) c.innerHTML = `<div style="background:rgba(224,108,117,0.12);border:1px solid var(--red,#e06c75);border-radius:4px;padding:12px 16px;font-size:11px;color:var(--red,#e06c75)">&#9888; Could not load vendors: ${escapeHtml(_vendorLoadError)}</div>`;
+    } else if (isAdmin) {
         renderVendorCardsByClient(vendors, _vendorPageClients, allUsers);
     } else {
         renderVendorCards(vendors);

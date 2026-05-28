@@ -109,6 +109,9 @@ test.describe('Client Isolation & Auth Guard', () => {
     await page.route('**/vendors', (route) =>
       route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([]) })
     );
+    await page.route('**/admin/users', (route) =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([]) })
+    );
 
     await page.goto('/#/vendors');
     await expect(page.locator('header')).toBeVisible({ timeout: 5000 });

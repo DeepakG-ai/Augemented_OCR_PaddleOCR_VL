@@ -97,40 +97,58 @@ def _fake_submission() -> dict:
 # ---------------------------------------------------------------------------
 
 class PageLimitsQueryTests(unittest.IsolatedAsyncioTestCase):
+    """get_user_billable_pages now resolves its limit/used via the v2 quota
+    helper (subscriptions + topups + period-windowed usage). These tests pin
+    the new behavior while keeping the original invariants intact."""
 
-    async def test_get_user_billable_pages_query_structure(self) -> None:
+    def _setup_active_sub_conn(self, page_limit: int = 5000, used: int = 42,
+                               topup_total: int = 0):
         pool = MagicMock()
         conn = AsyncMock()
         pool.acquire.return_value = _fake_acquire(conn)
-        conn.fetchrow.return_value = {"subscription_limit": 5000, "billable_pages": 42}
+        conn.fetchrow.side_effect = [
+            {"id": 1, "page_limit": page_limit,
+             "period_start": "2026-01-01", "period_end": "2027-01-01"},
+            {"pending": 0},
+        ]
+        conn.fetchval.side_effect = [topup_total, used]
+        return pool, conn
+
+    async def test_get_user_billable_pages_query_structure(self) -> None:
+        pool, conn = self._setup_active_sub_conn(page_limit=5000, used=42)
 
         result = await db_mod.get_user_billable_pages(
             pool, "12345678-1234-5678-1234-567812345678"
         )
 
-        self.assertTrue(conn.fetchrow.called)
-        sql = _compact(conn.fetchrow.call_args[0][0])
-        self.assertIn("SELECT COUNT(DISTINCT (lu.extraction_id, lu.page_num))", sql)
-        self.assertIn("lu.call_type = 'extraction'", sql)
-        # Default fallback is now 0, not 1000
-        self.assertIn("COALESCE(u.subscription_limit, 0) AS subscription_limit", sql)
+        # The COUNT-from-llm_usage query is now a fetchval, not the only fetchrow
+        all_sql = " ".join(
+            _compact(c.args[0]) for c in conn.fetchrow.call_args_list + conn.fetchval.call_args_list
+        )
+        self.assertIn("COUNT(DISTINCT (lu.extraction_id, lu.page_num))", all_sql)
+        self.assertIn("lu.call_type = 'extraction'", all_sql)
         self.assertEqual(result["subscription_limit"], 5000)
         self.assertEqual(result["billable_pages"], 42)
         self.assertEqual(result["remaining"], 4958)
 
     async def test_get_user_billable_pages_handles_none_row(self) -> None:
+        """No active subscription: limit=0, lifetime usage reported as billable_pages."""
         pool = MagicMock()
         conn = AsyncMock()
-        pool.acquire.return_value = _fake_acquire(conn)
-        conn.fetchrow.return_value = None
+        # side_effect (not return_value) so pool.acquire() yields a fresh CM each
+        # call — get_user_billable_pages opens it twice (quota lookup, then the
+        # lifetime-usage fallback).
+        pool.acquire.side_effect = lambda: _fake_acquire(conn)
+        conn.fetchrow.side_effect = [None, {"pending": 0}]
+        conn.fetchval.return_value = 0
 
         result = await db_mod.get_user_billable_pages(
             pool, "12345678-1234-5678-1234-567812345678"
         )
-        # Fallback is 0 — admin must set it
         self.assertEqual(result["subscription_limit"], 0)
         self.assertEqual(result["billable_pages"], 0)
         self.assertEqual(result["remaining"], 0)
+        self.assertFalse(result["has_active_subscription"])
 
     async def test_fallback_for_invalid_uuid_returns_zero(self) -> None:
         pool = MagicMock()
@@ -140,11 +158,7 @@ class PageLimitsQueryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["remaining"], 0)
 
     async def test_remaining_is_negative_when_exceeded(self) -> None:
-        pool = MagicMock()
-        conn = AsyncMock()
-        pool.acquire.return_value = _fake_acquire(conn)
-        conn.fetchrow.return_value = {"subscription_limit": 500, "billable_pages": 503}
-
+        pool, conn = self._setup_active_sub_conn(page_limit=500, used=503)
         result = await db_mod.get_user_billable_pages(
             pool, "12345678-1234-5678-1234-567812345678"
         )
@@ -152,11 +166,7 @@ class PageLimitsQueryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["remaining"], -3)
 
     async def test_remaining_exactly_at_limit_is_zero(self) -> None:
-        pool = MagicMock()
-        conn = AsyncMock()
-        pool.acquire.return_value = _fake_acquire(conn)
-        conn.fetchrow.return_value = {"subscription_limit": 1000, "billable_pages": 1000}
-
+        pool, conn = self._setup_active_sub_conn(page_limit=1000, used=1000)
         result = await db_mod.get_user_billable_pages(
             pool, "12345678-1234-5678-1234-567812345678"
         )
@@ -165,18 +175,15 @@ class PageLimitsQueryTests(unittest.IsolatedAsyncioTestCase):
     async def test_billing_query_uses_user_id_not_vendor_join(self) -> None:
         """Billing query must filter by lu.user_id, not JOIN vendors.
         After vendor deletion vendor_id is detached; user_id persists on llm_usage."""
-        pool = MagicMock()
-        conn = AsyncMock()
-        pool.acquire.return_value = _fake_acquire(conn)
-        conn.fetchrow.return_value = {"subscription_limit": 1000, "billable_pages": 75}
-
+        pool, conn = self._setup_active_sub_conn(page_limit=1000, used=75)
         await db_mod.get_user_billable_pages(
             pool, "12345678-1234-5678-1234-567812345678"
         )
-
-        sql = _compact(conn.fetchrow.call_args[0][0])
-        self.assertIn("lu.user_id = $1", sql)
-        self.assertNotIn("JOIN vendors", sql)
+        all_sql = " ".join(
+            _compact(c.args[0]) for c in conn.fetchrow.call_args_list + conn.fetchval.call_args_list
+        )
+        self.assertIn("lu.user_id = $1", all_sql)
+        self.assertNotIn("JOIN vendors", all_sql)
 
     async def test_update_user_subscription_limit_query_structure(self) -> None:
         pool = MagicMock()

@@ -68,18 +68,24 @@ class AdminListUsersTests(unittest.TestCase):
     def test_returns_list_of_users(self) -> None:
         rows = [_user_row("u-1", "a@x.com", "client"),
                 _user_row("u-2", "b@x.com", "admin")]
-        with patch.object(main.db_mod, "list_users", new=AsyncMock(return_value=rows)):
+        with patch.object(main.db_mod, "expire_due_subscriptions",
+                          new=AsyncMock(return_value=0)) as mock_expire, \
+             patch.object(main.db_mod, "list_users", new=AsyncMock(return_value=rows)):
             r = self.client.get("/admin/users")
         self.assertEqual(r.status_code, 200)
+        mock_expire.assert_awaited_once()
         body = r.json()
         self.assertEqual(len(body), 2)
         self.assertEqual(body[0]["email"], "a@x.com")
         self.assertEqual(body[1]["role"], "admin")
 
     def test_returns_empty_list_when_no_users(self) -> None:
-        with patch.object(main.db_mod, "list_users", new=AsyncMock(return_value=[])):
+        with patch.object(main.db_mod, "expire_due_subscriptions",
+                          new=AsyncMock(return_value=0)) as mock_expire, \
+             patch.object(main.db_mod, "list_users", new=AsyncMock(return_value=[])):
             r = self.client.get("/admin/users")
         self.assertEqual(r.status_code, 200)
+        mock_expire.assert_awaited_once()
         self.assertEqual(r.json(), [])
 
     def test_client_cannot_list_users(self) -> None:

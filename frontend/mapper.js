@@ -17,6 +17,8 @@ let mpNotices = [];
 let mpSampleInfo = null;         // {filename, line_item_count, ...} or null
 let mpCompareMode = false;
 let mpLoading = false;
+let mpSchemaId = null;           // currently assigned schema id
+let mpSchemas = [];              // [{id, name, slug, is_system}]
 
 // admin "act-as-client" state
 let mpIsAdmin = false;
@@ -27,6 +29,16 @@ let mpClientId = null;           // UUID of selected client (null = admin's own)
 let mpDragging = false;
 let mpDragFrom = null;           // {section, field, portEl}
 let mpListenersBound = false;
+
+function mpIsInternalSourceField(name) {
+    return typeof name === 'string' && name.startsWith('_');
+}
+
+function mpCleanSourceMap(map) {
+    return Object.fromEntries(
+        Object.entries(map || {}).filter(([src]) => !mpIsInternalSourceField(src))
+    );
+}
 
 // ── ENTRY ──────────────────────────────────────────────────────────────
 async function renderMapperPage(app) {
@@ -102,11 +114,13 @@ async function mpLoadVendor(vendorId) {
 
         mpTemplateId = mapping.template_id || null;
         mpHasTemplate = !!mapping.has_template;
-        mpHeaderMap = mapping.header_map || {};
-        mpLineMap = mapping.line_map || {};
+        mpHeaderMap = mpCleanSourceMap(mapping.header_map);
+        mpLineMap = mpCleanSourceMap(mapping.line_map);
         mpTargetHeader = mapping.target_header_fields || [];
         mpTargetLine = mapping.target_line_fields || [];
         mpNotices = mapping.pending_notices || [];
+        mpSchemaId = mapping.schema_id || null;
+        mpSchemas = mapping.schemas || [];
 
         // Source fields: prefer the latest real extraction; fall back to the
         // template field names. Always show every mapped field even if the
@@ -139,11 +153,12 @@ function mpFieldsFromObject(obj, extraKeys) {
     const out = [];
     const seen = new Set();
     Object.entries(obj || {}).forEach(([k, v]) => {
-        if (k === 'line_items') return;
+        if (k === 'line_items' || mpIsInternalSourceField(k)) return;
         seen.add(k);
         out.push({ name: k, value: v });
     });
     (extraKeys || []).forEach(k => {
+        if (mpIsInternalSourceField(k)) return;
         if (!seen.has(k)) { seen.add(k); out.push({ name: k, value: undefined }); }
     });
     return out;
@@ -151,8 +166,16 @@ function mpFieldsFromObject(obj, extraKeys) {
 function mpFieldsFromNames(names, extraKeys) {
     const out = [];
     const seen = new Set();
-    (names || []).forEach(n => { if (!seen.has(n)) { seen.add(n); out.push({ name: n, value: undefined }); } });
-    (extraKeys || []).forEach(k => { if (!seen.has(k)) { seen.add(k); out.push({ name: k, value: undefined }); } });
+    (names || []).forEach(n => {
+        if (!mpIsInternalSourceField(n) && !seen.has(n)) {
+            seen.add(n); out.push({ name: n, value: undefined });
+        }
+    });
+    (extraKeys || []).forEach(k => {
+        if (!mpIsInternalSourceField(k) && !seen.has(k)) {
+            seen.add(k); out.push({ name: k, value: undefined });
+        }
+    });
     return out;
 }
 
@@ -208,7 +231,9 @@ function mpMapperBodyHTML() {
         </div>
         <div class="mp-panel mp-panel-target">
             <div class="mp-panel-head">
-                <span class="mp-panel-title">AP Automation Schema</span>
+                ${mpIsAdmin
+                    ? `<select id="mpSchemaSelect" class="mp-schema-select" onchange="mpSchemaChange(this.value)"></select>`
+                    : `<span class="mp-panel-title" id="mpSchemaLabel">Schema</span>`}
                 <span class="mp-panel-tag accent">SCHEMA</span>
             </div>
             <div class="mp-panel-scroll" id="mpTargetScroll"></div>
@@ -244,9 +269,9 @@ function mpSourceSectionHTML(label, fields, section) {
             <div class="mp-field mp-src-field${mapped ? ' mapped' : ''}" style="animation-delay:${i * 22}ms">
                 <span class="mp-field-name">${escapeHtml(f.name)}</span>
                 <span class="mp-field-val">${mpFmtValue(f.value)}</span>
-                <span class="mp-port mp-port-src${mapped ? ' mapped' : ''}"
+                <span class="mp-port mp-port-src${mapped ? ' mapped' : ''}${mpIsAdmin ? '' : ' mp-port-readonly'}"
                       data-section="${section}" data-field="${escapeHtml(f.name)}"
-                      onmousedown="mpStartDrag(event,'${section}','${escapeInlineJsString(f.name)}')"></span>
+                      ${mpIsAdmin ? `onmousedown="mpStartDrag(event,'${section}','${escapeInlineJsString(f.name)}')"` : ''}></span>
             </div>`;
         }).join('')
         : `<div class="mp-empty-row">No ${section} fields</div>`;
@@ -260,9 +285,47 @@ function mpSourceSectionHTML(label, fields, section) {
 function mpRenderTarget() {
     const el = document.getElementById('mpTargetScroll');
     if (!el) return;
+
+    // Populate schema dropdown (admin) or update label (user)
+    if (mpIsAdmin) {
+        const sel = document.getElementById('mpSchemaSelect');
+        if (sel) {
+            sel.innerHTML = mpSchemas.map(s =>
+                `<option value="${s.id}" ${s.id === mpSchemaId ? 'selected' : ''}>${escapeHtml(s.name)}</option>`
+            ).join('');
+        }
+    } else {
+        const lbl = document.getElementById('mpSchemaLabel');
+        if (lbl) {
+            const schema = mpSchemas.find(s => s.id === mpSchemaId);
+            lbl.textContent = schema ? schema.name : 'Schema';
+        }
+    }
+
     el.innerHTML =
         mpTargetSectionHTML('HEADER', mpTargetHeader, 'header')
         + mpTargetSectionHTML('LINE ITEMS', mpTargetLine, 'line');
+}
+
+function mpSchemaChange(schemaIdStr) {
+    const newId = parseInt(schemaIdStr, 10);
+    if (newId === mpSchemaId) return;
+    mpSchemaId = newId;
+    const schema = mpSchemas.find(s => s.id === newId);
+    if (!schema) return;
+    const newHeader = schema.header_fields || [];
+    const newLine = schema.line_fields || [];
+    // Drop connections that target fields no longer in the new schema
+    const hSet = new Set(newHeader);
+    const lSet = new Set(newLine);
+    for (const k of Object.keys(mpHeaderMap)) if (!hSet.has(mpHeaderMap[k])) delete mpHeaderMap[k];
+    for (const k of Object.keys(mpLineMap)) if (!lSet.has(mpLineMap[k])) delete mpLineMap[k];
+    mpTargetHeader = newHeader;
+    mpTargetLine = newLine;
+    mpRenderSource();
+    mpRenderTarget();
+    requestAnimationFrame(() => requestAnimationFrame(mpRedrawConnections));
+    showToast(`Schema changed to ${schema.name}`);
 }
 
 function mpTargetSectionHTML(label, targets, section) {
@@ -273,15 +336,19 @@ function mpTargetSectionHTML(label, targets, section) {
         let badge;
         if (mapped) {
             badge = `<span class="mp-tgt-src" title="${escapeHtml(src)}">${escapeHtml(src)}</span>`
-                + `<button class="mp-tgt-x" onclick="mpDisconnect('${section}','${escapeInlineJsString(t)}')" title="Remove mapping">✕</button>`;
+                + (mpIsAdmin
+                    ? `<button class="mp-tgt-x" onclick="mpDisconnect('${section}','${escapeInlineJsString(t)}')" title="Remove mapping">✕</button>`
+                    : '');
         } else {
             badge = `<span class="mp-tgt-empty">unmapped</span>`;
         }
+        const dropAttr = mpIsAdmin
+            ? `onmouseup="mpEndDragOnTarget(event,'${section}','${escapeInlineJsString(t)}')"` : '';
         return `
         <div class="mp-field mp-tgt-field${mapped ? ' mapped' : ''}" style="animation-delay:${i * 22}ms">
-            <span class="mp-port mp-port-tgt${mapped ? ' mapped' : ''}"
+            <span class="mp-port mp-port-tgt${mapped ? ' mapped' : ''}${mpIsAdmin ? '' : ' mp-port-readonly'}"
                   data-section="${section}" data-target="${escapeHtml(t)}"
-                  onmouseup="mpEndDragOnTarget(event,'${section}','${escapeInlineJsString(t)}')"></span>
+                  ${dropAttr}></span>
             <span class="mp-field-name">${escapeHtml(t)}</span>
             ${badge}
         </div>`;
@@ -534,14 +601,18 @@ async function mpDismissNotices() {
 
 // ── SAVE / TOGGLE ──────────────────────────────────────────────────────
 async function mpSaveMapping() {
-    if (!mpVendorId || !mpHasTemplate) return;
+    if (!mpVendorId || !mpHasTemplate || !mpIsAdmin) return;
     const btn = document.getElementById('mpSaveBtn');
     if (btn) { btn.disabled = true; btn.textContent = 'Saving...'; }
     try {
         await apiJSON(`/vendors/${mpVendorId}/mapping`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ header_map: mpHeaderMap, line_map: mpLineMap }),
+            body: JSON.stringify({
+                header_map: mpHeaderMap,
+                line_map: mpLineMap,
+                schema_id: mpSchemaId,
+            }),
         });
         const flash = document.getElementById('mapperPage');
         if (flash) { flash.classList.remove('mp-flash'); void flash.offsetWidth; flash.classList.add('mp-flash'); }
@@ -625,10 +696,11 @@ function mpRenderBottomBar() {
             <button class="small-btn" onclick="mpToggleCompare()" ${canEdit ? '' : 'disabled'}>
                 ${mpCompareMode ? '✎ Edit Mapping' : '⇄ Compare'}
             </button>
+            ${mpIsAdmin ? `
             <button class="small-btn" onclick="mpClearAll()" ${canEdit ? '' : 'disabled'}>Clear</button>
             <button class="small-btn mp-primary" id="mpSaveBtn" onclick="mpSaveMapping()" ${canEdit ? '' : 'disabled'}>
                 Save Mapping
-            </button>
+            </button>` : `<span class="mp-readonly-badge">VIEW ONLY</span>`}
         </div>`;
 }
 
@@ -826,6 +898,15 @@ body.mp-dragging,body.mp-dragging *{cursor:grabbing!important;}
 .mp-acting-badge{font-size:9px;letter-spacing:0.1em;padding:3px 8px;
   border:1px solid var(--amber,#f59e0b);color:var(--amber,#f59e0b);
   border-radius:2px;white-space:nowrap;background:rgba(245,158,11,.08);}
+.mp-schema-select{background:var(--bg3);border:1px solid var(--border2);color:var(--text);
+  font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:0.04em;
+  padding:3px 8px;border-radius:2px;cursor:pointer;outline:none;flex:1;
+  text-transform:uppercase;}
+.mp-schema-select:focus{border-color:var(--blue);}
+.mp-port-readonly{cursor:default!important;opacity:0.5;}
+.mp-port-readonly:hover{transform:none!important;box-shadow:none!important;}
+.mp-readonly-badge{font-size:8px;letter-spacing:0.12em;padding:3px 8px;
+  border:1px solid var(--border);color:var(--text-dim);border-radius:2px;}
 `;
     document.head.appendChild(style);
 }

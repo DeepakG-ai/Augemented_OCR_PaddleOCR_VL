@@ -444,18 +444,18 @@ def test_extract_edge_cases(raw_key: str):
     r2 = httpx.post(f"{BASE}/v1/extract",
         headers={"X-API-Key": raw_key},
         files={"file": ("empty.pdf", b"", "application/pdf")}, timeout=30)
-    if r2.status_code in (400, 500):
+    if r2.status_code in (400, 415, 500):
         ok(f"Empty file -> {r2.status_code}")
     else:
-        fail("Empty file", f"Expected 400/500, got {r2.status_code}")
+        fail("Empty file", f"Expected 400/415/500, got {r2.status_code}")
 
     r3 = httpx.post(f"{BASE}/v1/extract",
         headers={"X-API-Key": raw_key},
         files={"file": ("doc.txt", b"not a pdf", "text/plain")}, timeout=30)
-    if r3.status_code in (400, 500):
+    if r3.status_code in (400, 415, 500):
         ok(f"Non-PDF file -> {r3.status_code}")
     else:
-        fail("Non-PDF file", f"Expected 400/500, got {r3.status_code}")
+        fail("Non-PDF file", f"Expected 400/415/500, got {r3.status_code}")
 
     minimal_pdf = (
         b"%PDF-1.0\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"

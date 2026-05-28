@@ -288,3 +288,51 @@ class ReliabilityHardeningTests(unittest.TestCase):
                 main.app.dependency_overrides.pop(auth_mod.get_current_user_or_api_key, None)
             else:
                 main.app.dependency_overrides[auth_mod.get_current_user_or_api_key] = previous_override
+
+    def test_ingest_releases_quota_when_vendor_render_raises(self) -> None:
+        client_user = {
+            "id": "11111111-1111-1111-1111-111111111111",
+            "role": "client",
+            "email": "client@test",
+        }
+        previous_override = main.app.dependency_overrides.get(auth_mod.get_current_user)
+        main.app.dependency_overrides[auth_mod.get_current_user] = lambda: client_user
+        try:
+            with patch("backend.main.db_mod.get_user_is_executing", new=AsyncMock(return_value=False)), \
+                 patch("backend.main.processor.count_pdf_pages", return_value=2), \
+                 patch("backend.main.db_mod.reserve_quota", new=AsyncMock(return_value={
+                     "allowed": True,
+                     "reason": "ok",
+                     "used": 10,
+                     "limit": 100,
+                     "remaining": 88,
+                     "pending": 0,
+                 })), \
+                 patch("backend.main.render_page_1_for_detection", new=AsyncMock(side_effect=RuntimeError("renderer down"))), \
+                 patch("backend.main.db_mod.release_quota_reservation", new=AsyncMock()) as mock_release:
+                response = self.client.post(
+                    "/ingest/ui",
+                    files={"file": ("test.pdf", b"%PDF-1.4...", "application/pdf")},
+                )
+
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.json()["error"]["code"], "PDF_RENDER_FAILED")
+            mock_release.assert_called_once_with(unittest.mock.ANY, client_user["id"], 2)
+        finally:
+            if previous_override is None:
+                main.app.dependency_overrides.pop(auth_mod.get_current_user, None)
+            else:
+                main.app.dependency_overrides[auth_mod.get_current_user] = previous_override
+
+    def test_error_envelope_backfills_code_and_message_for_structured_details(self) -> None:
+        body = main._error_body(
+            409,
+            {
+                "reason": "unknown_vendor",
+                "hint": "Create the vendor and vendor id first, then retry this document.",
+            },
+        )
+
+        self.assertEqual(body["error"]["code"], "CONFLICT")
+        self.assertEqual(body["error"]["reason"], "unknown_vendor")
+        self.assertIn("Create the vendor", body["error"]["message"])

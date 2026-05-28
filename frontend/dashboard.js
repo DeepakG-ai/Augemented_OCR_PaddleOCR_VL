@@ -31,10 +31,6 @@ function fmtLatency(ms) {
     return (n / 1000).toFixed(1) + 's';
 }
 
-function fmtCurrency(n) {
-    return '$' + Number(n || 0).toFixed(4);
-}
-
 function _todayISO() {
     return new Date().toISOString().slice(0, 10);
 }
@@ -104,15 +100,17 @@ function _renderPieChart(inputTokens, outputTokens) {
     </div>`;
 }
 
-// ── BAR CHART (daily input vs output tokens, last 30 days) ────────────
+// ── BAR CHART (daily input vs output tokens, last 10 days) ────────────
 function _renderBarChart(days) {
     if (!days || days.length === 0) {
         return `<div style="color:var(--text-dim);text-align:center;padding:48px 0;font-size:10px">No data yet</div>`;
     }
 
-    const sorted = [...days].reverse();
-    const W = 580, H = 170;
-    const PAD = { top: 14, right: 20, bottom: 28, left: 54 };
+    // Take only the last 10 days
+    const trimmed = days.slice(0, 10);
+    const sorted = [...trimmed].reverse();
+    const W = 500, H = 170;
+    const PAD = { top: 14, right: 16, bottom: 28, left: 54 };
     const cW = W - PAD.left - PAD.right;
     const cH = H - PAD.top  - PAD.bottom;
     const n = sorted.length;
@@ -135,24 +133,21 @@ function _renderBarChart(days) {
 
     const baseY = PAD.top + cH;
     const slotW = cW / Math.max(n, 1);
-    const groupGap = Math.min(12, slotW * 0.28);
-    const groupW = Math.min(42, Math.max(2, slotW - groupGap));
+    const groupGap = Math.min(12, slotW * 0.22);
+    const groupW = Math.min(42, Math.max(6, slotW - groupGap));
     const barGap = groupW >= 5 ? Math.min(4, groupW * 0.16) : 0.5;
-    const barW = Math.max(1, (groupW - barGap) / 2);
+    const barW = Math.max(2, (groupW - barGap) / 2);
 
     function groupX(i) { return PAD.left + i * slotW + (slotW - groupW) / 2; }
     function groupCenter(i) { return groupX(i) + groupW / 2; }
 
-    const step = Math.max(1, Math.floor(n / 8));
-    const xLabels = sorted
-        .map((d, i) => ({ d, i }))
-        .filter(({ i }) => i % step === 0 || i === n - 1)
-        .map(({ d, i }) => {
-            const label = String(d.day || '').slice(5);
-            return `<text x="${groupCenter(i)}" y="${H - 5}" text-anchor="middle"
-                          fill="var(--text-dim)" font-size="9" font-family="JetBrains Mono,monospace"
-                          >${label}</text>`;
-        }).join('');
+    // Show all x-axis labels since we only have ≤10 bars
+    const xLabels = sorted.map((d, i) => {
+        const label = String(d.day || '').slice(5);
+        return `<text x="${groupCenter(i)}" y="${H - 5}" text-anchor="middle"
+                      fill="var(--text-dim)" font-size="9" font-family="JetBrains Mono,monospace"
+                      >${label}</text>`;
+    }).join('');
 
     function barRect(d, i, key, color, label, offset) {
         const value = Number(d[key] || 0);
@@ -170,7 +165,7 @@ function _renderBarChart(days) {
     ).join('');
 
     return `
-    <svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" style="max-width:${W}px;display:block">
+    <svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" style="display:block" preserveAspectRatio="xMidYMid meet">
         ${gridLines}
         <line x1="${PAD.left}" y1="${baseY}" x2="${W - PAD.right}" y2="${baseY}"
               stroke="var(--border)" stroke-width="1"/>
@@ -179,36 +174,129 @@ function _renderBarChart(days) {
     </svg>`;
 }
 
+// ── LINE CHART (daily LLM calls vs total documents) ───────────────────
+function _renderLineChart(days) {
+    if (!days || days.length === 0) {
+        return `<div style="color:var(--text-dim);text-align:center;padding:48px 0;font-size:10px">No data yet</div>`;
+    }
+
+    const trimmed = days.slice(0, 10);
+    const sorted  = [...trimmed].reverse();
+    const n = sorted.length;
+
+    const W = 500, H = 170;
+    const PAD = { top: 16, right: 20, bottom: 28, left: 44 };
+    const cW = W - PAD.left - PAD.right;
+    const cH = H - PAD.top  - PAD.bottom;
+
+    const dataMax = Math.max(
+        ...sorted.map(d => Math.max(Number(d.llm_calls || 0), Number(d.docs_processed || 0))),
+        1
+    );
+
+    // Nice-number Y axis: snap interval to 1,2,5,10,20,50,100…
+    function niceAxis(rawMax) {
+        const targetTicks = 4;
+        const rawInterval = rawMax / targetTicks;
+        const mag = Math.pow(10, Math.floor(Math.log10(rawInterval || 1)));
+        const norm = rawInterval / mag;
+        const interval = norm <= 1 ? mag : norm <= 2 ? 2 * mag : norm <= 5 ? 5 * mag : 10 * mag;
+        const axisMax = Math.ceil(rawMax / interval) * interval;
+        const ticks = [];
+        for (let t = interval; t <= axisMax; t += interval) ticks.push(t);
+        return { axisMax, ticks };
+    }
+    const { axisMax, ticks } = niceAxis(dataMax);
+
+    function xP(i) { return PAD.left + (n <= 1 ? cW / 2 : (i / (n - 1)) * cW); }
+    function yP(v) { return PAD.top + cH - (Number(v || 0) / axisMax) * cH; }
+
+    const gridLines = ticks.map(t => {
+        const y = PAD.top + cH - (t / axisMax) * cH;
+        return `<line x1="${PAD.left}" y1="${y}" x2="${W - PAD.right}" y2="${y}"
+                      stroke="var(--border)" stroke-width="1" stroke-dasharray="3,3"/>
+                <text x="${PAD.left - 5}" y="${y + 4}" text-anchor="end"
+                      fill="var(--text-dim)" font-size="9" font-family="JetBrains Mono,monospace">${t}</text>`;
+    }).join('');
+
+    const llmPts  = sorted.map((d, i) => `${xP(i)},${yP(d.llm_calls)}`).join(' ');
+    const docsPts = sorted.map((d, i) => `${xP(i)},${yP(d.docs_processed)}`).join(' ');
+
+    const llmDots = sorted.map((d, i) => `
+        <circle cx="${xP(i)}" cy="${yP(d.llm_calls)}" r="3" fill="#3b82f6" stroke="var(--bg1)" stroke-width="1.5">
+            <title>${String(d.day || '').slice(5)}: ${d.llm_calls || 0} LLM calls</title>
+        </circle>`).join('');
+
+    const docsDots = sorted.map((d, i) => `
+        <circle cx="${xP(i)}" cy="${yP(d.docs_processed)}" r="3" fill="#22c55e" stroke="var(--bg1)" stroke-width="1.5">
+            <title>${String(d.day || '').slice(5)}: ${d.docs_processed || 0} documents</title>
+        </circle>`).join('');
+
+    const step = Math.max(1, Math.floor(n / 7));
+    const xLabels = sorted.map((d, i) => {
+        if (i % step !== 0 && i !== n - 1) return '';
+        return `<text x="${xP(i)}" y="${H - 4}" text-anchor="middle"
+                      fill="var(--text-dim)" font-size="9" font-family="JetBrains Mono,monospace"
+                      >${String(d.day || '').slice(5)}</text>`;
+    }).join('');
+
+    return `
+    <svg viewBox="0 0 ${W} ${H}" width="100%" style="display:block">
+        ${gridLines}
+        <line x1="${PAD.left}" y1="${PAD.top + cH}" x2="${W - PAD.right}" y2="${PAD.top + cH}"
+              stroke="var(--border)" stroke-width="1"/>
+        <polyline points="${llmPts}"  fill="none" stroke="#3b82f6" stroke-width="2"
+                  stroke-linejoin="round" stroke-linecap="round"/>
+        <polyline points="${docsPts}" fill="none" stroke="#22c55e" stroke-width="2"
+                  stroke-linejoin="round" stroke-linecap="round"/>
+        ${llmDots}
+        ${docsDots}
+        ${xLabels}
+    </svg>
+    <div style="display:flex;justify-content:center;gap:20px;margin-top:8px">
+        <span style="display:flex;align-items:center;gap:6px;font-size:9px;color:var(--text-dim)">
+            <span style="display:inline-block;width:18px;height:2px;background:#3b82f6;border-radius:1px"></span>LLM CALLS
+        </span>
+        <span style="display:flex;align-items:center;gap:6px;font-size:9px;color:var(--text-dim)">
+            <span style="display:inline-block;width:18px;height:2px;background:#22c55e;border-radius:1px"></span>TOTAL DOCUMENTS
+        </span>
+    </div>`;
+}
+
 // ── DAILY BREAKDOWN TABLE ─────────────────────────────────────────────
-function _renderDailyTable(days) {
+function _renderDailyTable(days, isAdmin) {
     if (!days || days.length === 0) return '';
+    const displayDays = days.slice(0, 10);
     return `
     <div style="margin-top:20px;background:var(--bg1);border:1px solid var(--border);border-radius:4px;overflow:hidden">
-        <div style="padding:12px 16px;border-bottom:1px solid var(--border);font-size:9px;letter-spacing:0.14em;color:var(--text-dim)">
-            DAILY BREAKDOWN
+        <div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
+            <span style="font-size:9px;letter-spacing:0.14em;color:var(--text-dim)">DAILY BREAKDOWN</span>
+            <span style="font-size:9px;color:var(--text-dim)">${displayDays.length} of ${days.length} days</span>
         </div>
         <div style="overflow-x:auto">
-            <table style="width:100%;border-collapse:collapse;font-size:10px">
+            <table style="width:100%;min-width:${isAdmin ? '700px' : '500px'};border-collapse:collapse;font-size:10px">
                 <thead>
                     <tr style="border-bottom:1px solid var(--border)">
-                        <th style="text-align:left;padding:8px 16px;color:var(--text-dim);font-weight:500;letter-spacing:0.08em">DATE</th>
-                        <th style="text-align:right;padding:8px 16px;color:var(--text-dim);font-weight:500;letter-spacing:0.08em">INPUT</th>
-                        <th style="text-align:right;padding:8px 16px;color:var(--text-dim);font-weight:500;letter-spacing:0.08em">OUTPUT</th>
-                        <th style="text-align:right;padding:8px 16px;color:var(--text-dim);font-weight:500;letter-spacing:0.08em">TOTAL</th>
-                        <th style="text-align:right;padding:8px 16px;color:var(--text-dim);font-weight:500;letter-spacing:0.08em">DOCS</th>
-                        <th style="text-align:right;padding:8px 16px;color:var(--text-dim);font-weight:500;letter-spacing:0.08em">CALLS</th>
-                        <th style="text-align:right;padding:8px 16px;color:var(--text-dim);font-weight:500;letter-spacing:0.08em">AVG LATENCY</th>
+                        <th style="text-align:left;padding:8px 16px;color:var(--text-dim);font-weight:500;letter-spacing:0.08em;white-space:nowrap">DATE</th>
+                        ${isAdmin ? `
+                        <th style="text-align:right;padding:8px 16px;color:var(--text-dim);font-weight:500;letter-spacing:0.08em;white-space:nowrap">INPUT</th>
+                        <th style="text-align:right;padding:8px 16px;color:var(--text-dim);font-weight:500;letter-spacing:0.08em;white-space:nowrap">OUTPUT</th>
+                        <th style="text-align:right;padding:8px 16px;color:var(--text-dim);font-weight:500;letter-spacing:0.08em;white-space:nowrap">TOTAL</th>` : ''}
+                        <th style="text-align:right;padding:8px 16px;color:var(--text-dim);font-weight:500;letter-spacing:0.08em;white-space:nowrap">DOCS</th>
+                        <th style="text-align:right;padding:8px 16px;color:var(--text-dim);font-weight:500;letter-spacing:0.08em;white-space:nowrap">${isAdmin ? 'CALLS' : 'PAGES EXTRACTED'}</th>
+                        <th style="text-align:right;padding:8px 16px;color:var(--text-dim);font-weight:500;letter-spacing:0.08em;white-space:nowrap">AVG LATENCY</th>
                     </tr>
                 </thead>
                 <tbody>
-                    ${days.map((d, idx) => `
+                    ${displayDays.map((d, idx) => `
                     <tr style="border-bottom:1px solid var(--border);${idx % 2 === 1 ? 'background:var(--bg2)' : ''}">
-                        <td style="padding:7px 16px;color:var(--text-mid);font-family:var(--mono)">${String(d.day || '').slice(0, 10)}</td>
+                        <td style="padding:7px 16px;color:var(--text-mid);font-family:var(--mono);white-space:nowrap">${String(d.day || '').slice(0, 10)}</td>
+                        ${isAdmin ? `
                         <td style="padding:7px 16px;text-align:right;color:var(--blue)">${fmtTokens(d.input_tokens)}</td>
                         <td style="padding:7px 16px;text-align:right;color:var(--green)">${fmtTokens(d.output_tokens)}</td>
-                        <td style="padding:7px 16px;text-align:right;color:var(--text)">${fmtTokens(d.total_tokens)}</td>
+                        <td style="padding:7px 16px;text-align:right;color:var(--text)">${fmtTokens(d.total_tokens)}</td>` : ''}
                         <td style="padding:7px 16px;text-align:right;color:var(--text-dim)">${d.docs_processed || 0}</td>
-                        <td style="padding:7px 16px;text-align:right;color:var(--text-dim)">${d.llm_calls || 0}</td>
+                        <td style="padding:7px 16px;text-align:right;color:var(--blue)">${d.llm_calls || 0}</td>
                         <td style="padding:7px 16px;text-align:right;color:var(--text-dim)">${d.avg_call_ms ? (d.avg_call_ms / 1000).toFixed(1) + 's' : '—'}</td>
                     </tr>`).join('')}
                 </tbody>
@@ -227,7 +315,10 @@ let _activeClientDashboardUser = null;
 let _userDocsFilter = { preset: 'today', date_from: _todayISO(), date_to: _todayISO() };
 let _userDocsData = [];
 
-function _renderClientTable(clients) {
+function _renderClientTable(clients, errorMsg = null) {
+    if (errorMsg) {
+        return `<div style="background:rgba(224,108,117,0.12);border:1px solid var(--red,#e06c75);border-radius:4px;padding:12px 16px;margin:12px;font-size:11px;color:var(--red,#e06c75)">&#9888; Could not load client breakdown: ${escapeHtml(errorMsg)}</div>`;
+    }
     if (!clients || clients.length === 0) {
         return `<div style="color:var(--text-dim);padding:16px;font-size:11px">No clients yet.</div>`;
     }
@@ -277,6 +368,9 @@ function _renderClientRow(c) {
 }
 
 function _renderDocRow(d) {
+    const _au = (() => { try { return JSON.parse(localStorage.getItem('auth_user') || 'null'); } catch { return null; } })();
+    const showTokens = _au && _au.role === 'admin';
+    const colSpan = showTokens ? 10 : 7;
     const isExpanded = _expandedDoc === d.extraction_id;
     const statusColor = d.status === 'done' ? 'var(--green)' : d.status === 'error' ? 'var(--red,#e06c75)' : 'var(--amber)';
     const billablePages = Number(d.billable_pages || 0);
@@ -290,16 +384,17 @@ function _renderDocRow(d) {
         <td style="padding:6px 8px;color:var(--text-dim);white-space:nowrap">${fmtDate(d.created_at)}</td>
         <td style="padding:6px 8px;text-align:right;color:var(--text-mid);white-space:nowrap">${billablePages}/${totalPages} pages</td>
         <td style="padding:6px 8px;text-align:right;color:${statusColor};font-weight:500">${(d.status || '').toUpperCase()}</td>
+        ${showTokens ? `
         <td style="padding:6px 8px;text-align:right;color:var(--blue)">${fmtTokens(d.total_input_tokens)}</td>
         <td style="padding:6px 8px;text-align:right;color:var(--green)">${fmtTokens(d.total_output_tokens)}</td>
-        <td style="padding:6px 8px;text-align:right;font-weight:500">${fmtTokens(d.grand_total)}</td>
+        <td style="padding:6px 8px;text-align:right;font-weight:500">${fmtTokens(d.grand_total)}</td>` : ''}
         <td style="padding:6px 8px;text-align:right;color:var(--text-dim)">${fmtLatency(d.total_latency_ms)}</td>
         <td style="padding:6px 8px;text-align:center">
             ${d.llm_calls > 0 ? `<button class="small-btn" onclick="togglePageUsage(${d.extraction_id})"
                 style="${isExpanded ? 'background:var(--blue);color:#fff' : ''}">${isExpanded ? 'Hide' : 'Detail'}</button>` : '—'}
         </td>
     </tr>
-    ${isExpanded ? `<tr id="pages-${d.extraction_id}"><td colspan="10" style="padding:0 8px 8px 32px;background:var(--bg1)">${_renderPageUsage(d.extraction_id)}</td></tr>` : ''}`;
+    ${isExpanded ? `<tr id="pages-${d.extraction_id}"><td colspan="${colSpan}" style="padding:0 8px 8px 32px;background:var(--bg1)">${_renderPageUsage(d.extraction_id)}</td></tr>` : ''}`;
 }
 
 function _renderPageUsage(extractionId) {
@@ -437,7 +532,10 @@ function applyUserDocsDates() {
     renderDashboardPage(document.getElementById('appRoot'));
 }
 
-function _renderUserDocsTable(docs) {
+function _renderUserDocsTable(docs, errorMsg = null) {
+    if (errorMsg) {
+        return `<div style="background:rgba(224,108,117,0.12);border:1px solid var(--red,#e06c75);border-radius:4px;padding:12px 16px;margin:12px;font-size:11px;color:var(--red,#e06c75)">&#9888; Could not load PDF usage: ${escapeHtml(errorMsg)}</div>`;
+    }
     if (!docs || docs.length === 0) {
         return `<div style="padding:18px;color:var(--text-dim);font-size:11px">No PDFs found for this date range.</div>`;
     }
@@ -451,9 +549,6 @@ function _renderUserDocsTable(docs) {
                     <th style="text-align:left;padding:8px;font-weight:500">DATE</th>
                     <th style="text-align:right;padding:8px;font-weight:500">BILLABLE PAGES</th>
                     <th style="text-align:right;padding:8px;font-weight:500">STATUS</th>
-                    <th style="text-align:right;padding:8px;font-weight:500">INPUT</th>
-                    <th style="text-align:right;padding:8px;font-weight:500">OUTPUT</th>
-                    <th style="text-align:right;padding:8px;font-weight:500">TOTAL</th>
                     <th style="text-align:right;padding:8px;font-weight:500">LATENCY</th>
                     <th style="text-align:center;padding:8px;font-weight:500">DETAIL</th>
                 </tr>
@@ -480,6 +575,9 @@ async function renderDashboardPage(app) {
     // Admin sees system-wide stats; clients see their own
     const statsEndpoint = isAdmin ? '/admin/stats' : '/user/stats';
     let stats = {}, days = [], subscription = null;
+    let _statsLoadFailed = false;
+    let _clientsLoadError = null;
+    let _userDocsLoadError = null;
     try {
         const data = await apiJSON(statsEndpoint);
         stats = data.stats || {};
@@ -487,6 +585,7 @@ async function renderDashboardPage(app) {
         subscription = data.subscription || null;
     } catch (e) {
         console.warn('Dashboard fetch error:', e);
+        _statsLoadFailed = true;
     }
 
     // Admin also fetches per-client breakdown; clients fetch their own docs
@@ -495,11 +594,19 @@ async function renderDashboardPage(app) {
     _pageUsageCache  = {};
     _expandedDoc     = null;
     if (isAdmin) {
-        try { _clientsData = await apiJSON('/admin/usage/clients'); } catch (e) { console.warn(e); }
+        try {
+            _clientsData = await apiJSON('/admin/usage/clients');
+        } catch (e) {
+            console.warn(e);
+            _clientsLoadError = e.message || 'Failed to load client breakdown';
+        }
     } else {
         try {
             _userDocsData = await apiJSON(`/user/documents?${_userDocsQuery(_userDocsFilter)}`);
-        } catch (e) { console.warn(e); }
+        } catch (e) {
+            console.warn(e);
+            _userDocsLoadError = e.message || 'Failed to load document usage';
+        }
     }
 
     const totalInput  = Number(stats.total_input_tokens  || 0);
@@ -516,14 +623,22 @@ async function renderDashboardPage(app) {
     <div class="page-content">
         <div class="page-title">Dashboard${isAdmin ? '' : ' — My Usage'}</div>
 
+        ${_statsLoadFailed ? `
+        <div style="background:rgba(224,108,117,0.12);border:1px solid var(--red,#e06c75);border-radius:4px;padding:10px 16px;margin-bottom:16px;font-size:11px;color:var(--red,#e06c75)">
+            &#9888; Usage statistics could not be loaded — figures below may be stale or unavailable.
+            <button onclick="renderDashboardPage(document.getElementById('appRoot'))"
+                style="background:none;border:1px solid currentColor;border-radius:3px;color:inherit;font-size:10px;padding:2px 8px;margin-left:12px;cursor:pointer">Retry</button>
+        </div>` : ''}
+
         <!-- KPI strip -->
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:${(!isAdmin && subLimit > 0) ? '14px' : '24px'}">
             ${_kpiCard('PAGES USED', fmtNum(stats.billable_pages), 'var(--blue)', 'lifetime pages (billing)')}
-            ${_kpiCard('HISTORY ITEMS', fmtNum(stats.total_extractions), 'var(--green)', 'visible extractions')}
+            ${_kpiCard(isAdmin ? 'HISTORY ITEMS' : 'TOTAL DOCUMENTS', fmtNum(stats.total_extractions), 'var(--green)', isAdmin ? 'visible extractions' : 'documents processed')}
+            ${isAdmin ? `
             ${_kpiCard('INPUT TOKENS', fmtTokens(totalInput), 'var(--blue)', 'prompt tokens')}
             ${_kpiCard('OUTPUT TOKENS', fmtTokens(totalOutput), 'var(--green)', 'completion tokens')}
             ${_kpiCard('GRAND TOTAL', fmtTokens(grandTotal), 'var(--amber)', 'all tokens')}
-            ${_kpiCard('LLM CALLS', fmtNum(stats.total_llm_calls), 'var(--text-mid)', 'model invocations')}
+            ${_kpiCard('LLM CALLS', fmtNum(stats.total_llm_calls), 'var(--text-mid)', 'model invocations')}` : ''}
         </div>
 
         <!-- Subscription quota bar (client users with a limit set) -->
@@ -531,42 +646,87 @@ async function renderDashboardPage(app) {
         <div style="margin-bottom:24px;background:var(--bg1);border:1px solid var(--border);border-radius:4px;padding:12px 18px">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
                 <span style="font-size:9px;letter-spacing:0.12em;color:var(--text-dim)">SUBSCRIPTION QUOTA</span>
-                <span style="font-size:10px;color:var(--text-mid)">${fmtNum(subUsed)} / ${fmtNum(subLimit)} pages</span>
+                <div style="display:flex;align-items:center;gap:12px">
+                    <span style="font-size:10px;color:var(--text-mid)">${fmtNum(subUsed)} / ${fmtNum(subLimit)} pages</span>
+                    <button onclick="openTopupRequestModal()"
+                        style="background:none;border:1px solid ${subPct >= 80 ? 'var(--amber,#e5c07b)' : 'var(--border)'};
+                               color:${subPct >= 80 ? 'var(--amber,#e5c07b)' : 'var(--text-dim)'};
+                               border-radius:3px;cursor:pointer;padding:3px 10px;font-size:9px;
+                               font-family:var(--mono);letter-spacing:0.08em;font-weight:600;
+                               transition:all 0.15s"
+                        onmouseover="this.style.borderColor='var(--amber,#e5c07b)';this.style.color='var(--amber,#e5c07b)'"
+                        onmouseout="this.style.borderColor='${subPct >= 80 ? 'var(--amber,#e5c07b)' : 'var(--border)'}';this.style.color='${subPct >= 80 ? 'var(--amber,#e5c07b)' : 'var(--text-dim)'}'">
+                        ${subPct >= 100 ? '⚠ REQUEST TOP-UP' : '+ REQUEST TOP-UP'}
+                    </button>
+                </div>
             </div>
             <div style="height:6px;background:var(--bg2,#2a2a2a);border-radius:3px;overflow:hidden">
                 <div style="height:100%;background:${subColor};width:${subPct}%;transition:width 0.3s"></div>
             </div>
             <div style="display:flex;justify-content:space-between;margin-top:5px">
-                <span style="font-size:9px;color:var(--text-dim)">${fmtNum(Math.max(0, subLimit - subUsed))} pages remaining</span>
+                <span style="font-size:9px;color:${subPct >= 100 ? 'var(--red,#e06c75)' : 'var(--text-dim)'}">
+                    ${subPct >= 100 ? '⚠ Quota exhausted — uploads blocked' : fmtNum(Math.max(0, subLimit - subUsed)) + ' pages remaining'}
+                </span>
                 <span style="font-size:9px;color:var(--text-dim)">${subPct}% used</span>
             </div>
-        </div>` : ''}
+        </div>` : (!isAdmin && subLimit === 0 ? `
+        <div style="margin-bottom:24px;background:var(--bg1);border:1px solid var(--border);border-radius:4px;padding:12px 18px;display:flex;align-items:center;justify-content:space-between">
+            <span style="font-size:10px;color:var(--text-dim)">No active subscription — contact admin to set up a plan.</span>
+            <button onclick="openTopupRequestModal()"
+                style="background:none;border:1px solid var(--border);color:var(--text-dim);
+                       border-radius:3px;cursor:pointer;padding:3px 10px;font-size:9px;
+                       font-family:var(--mono);letter-spacing:0.08em;transition:all 0.15s"
+                onmouseover="this.style.borderColor='var(--amber,#e5c07b)';this.style.color='var(--amber,#e5c07b)'"
+                onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-dim)'">
+                + REQUEST TOP-UP
+            </button>
+        </div>` : '')}
 
-        <!-- Charts row -->
-        <div style="display:grid;grid-template-columns:1fr 260px;gap:16px;align-items:start">
-            <div style="background:var(--bg1);border:1px solid var(--border);border-radius:4px;padding:18px 20px">
-                <div style="font-size:9px;letter-spacing:0.14em;color:var(--text-dim);margin-bottom:6px">
-                    TOKEN TREND — LAST 30 DAYS
-                </div>
-                <div style="display:flex;gap:20px;margin-bottom:12px">
-                    <span style="display:flex;align-items:center;gap:6px;font-size:9px;color:var(--text-dim)">
-                        <span style="display:inline-block;width:10px;height:10px;background:#3b82f6;border-radius:2px"></span>Input
-                    </span>
-                    <span style="display:flex;align-items:center;gap:6px;font-size:9px;color:var(--text-dim)">
-                        <span style="display:inline-block;width:10px;height:10px;background:#22c55e;border-radius:2px"></span>Output
-                    </span>
-                </div>
-                ${_renderBarChart(days)}
-            </div>
-            <div style="background:var(--bg1);border:1px solid var(--border);border-radius:4px;padding:18px 20px;text-align:center">
+        ${isAdmin ? `
+        <!-- Admin: 50/50 split — Line chart (left) | Vendor Breakdown (right) -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:stretch">
+
+            <!-- LEFT: Daily activity line chart -->
+            <div style="background:var(--bg1);border:1px solid var(--border);border-radius:4px;padding:14px 16px;min-width:0;overflow:hidden">
                 <div style="font-size:9px;letter-spacing:0.14em;color:var(--text-dim);margin-bottom:12px">
-                    INPUT vs OUTPUT SPLIT
+                    DAILY BREAKDOWN
                 </div>
-                ${_renderPieChart(totalInput, totalOutput)}
+                ${_renderLineChart(days)}
             </div>
-        </div>
 
-        ${_renderDailyTable(days)}
+            <!-- RIGHT: Vendor Breakdown by Client -->
+            <div style="background:var(--bg1);border:1px solid var(--border);border-radius:4px;overflow:hidden">
+                <div style="padding:12px 16px;border-bottom:1px solid var(--border)">
+                    <span style="font-size:9px;letter-spacing:0.14em;color:var(--text-dim)">VENDOR BREAKDOWN BY CLIENT</span>
+                </div>
+                <div id="vendorSummaryTable" style="overflow-x:auto">
+                    <div style="color:var(--text-dim);padding:14px;font-size:11px">Loading vendor data…</div>
+                </div>
+            </div>
+        </div>` : `
+        <!-- User: 50/50 split — Line chart (left) | Vendor Breakdown (right) -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:stretch">
+
+            <!-- LEFT: Daily activity line chart -->
+            <div style="background:var(--bg1);border:1px solid var(--border);border-radius:4px;padding:14px 16px;min-width:0;overflow:hidden">
+                <div style="font-size:9px;letter-spacing:0.14em;color:var(--text-dim);margin-bottom:12px">
+                    DAILY BREAKDOWN
+                </div>
+                ${_renderLineChart(days)}
+            </div>
+
+            <!-- RIGHT: My Vendor Breakdown -->
+            <div style="background:var(--bg1);border:1px solid var(--border);border-radius:4px;overflow:hidden">
+                <div style="padding:12px 16px;border-bottom:1px solid var(--border)">
+                    <span style="font-size:9px;letter-spacing:0.14em;color:var(--text-dim)">MY VENDOR BREAKDOWN</span>
+                </div>
+                <div id="vendorSummaryTable" style="overflow-x:auto">
+                    <div style="color:var(--text-dim);padding:14px;font-size:11px">Loading vendor data…</div>
+                </div>
+            </div>
+        </div>`}
+
+        ${_renderDailyTable(days, isAdmin)}
 
         ${!isAdmin ? `
         <!-- Per-document PDF usage (client only) -->
@@ -578,7 +738,7 @@ async function renderDashboardPage(app) {
             <div style="padding:0 16px">
                 ${_renderUserDocsFilterRow(_userDocsFilter)}
             </div>
-            ${_renderUserDocsTable(_userDocsData)}
+            ${_renderUserDocsTable(_userDocsData, _userDocsLoadError)}
         </div>` : ''}
 
         ${isAdmin ? `
@@ -589,34 +749,18 @@ async function renderDashboardPage(app) {
                 <span style="font-size:9px;color:var(--text-dim)">${_clientsData.length} client${_clientsData.length !== 1 ? 's' : ''}</span>
             </div>
             <div style="overflow-x:auto">
-                ${_renderClientTable(_clientsData)}
+                ${_renderClientTable(_clientsData, _clientsLoadError)}
             </div>
-        </div>
-
-        <!-- Admin: per-client vendor counts -->
-        <div style="margin-top:24px;background:var(--bg1);border:1px solid var(--border);border-radius:4px;overflow:hidden">
-            <div style="padding:12px 16px;border-bottom:1px solid var(--border)">
-                <span style="font-size:9px;letter-spacing:0.14em;color:var(--text-dim)">VENDOR BREAKDOWN BY CLIENT</span>
-            </div>
-            <div id="vendorSummaryTable" style="overflow-x:auto">
-                <div style="color:var(--text-dim);padding:14px;font-size:11px">Loading vendor data…</div>
-            </div>
-        </div>` : `
-        <!-- Client: own vendor breakdown -->
-        <div style="margin-top:24px;background:var(--bg1);border:1px solid var(--border);border-radius:4px;overflow:hidden">
-            <div style="padding:12px 16px;border-bottom:1px solid var(--border)">
-                <span style="font-size:9px;letter-spacing:0.14em;color:var(--text-dim)">MY VENDOR BREAKDOWN</span>
-            </div>
-            <div id="vendorSummaryTable" style="overflow-x:auto">
-                <div style="color:var(--text-dim);padding:14px;font-size:11px">Loading vendor data…</div>
-            </div>
-        </div>`}
+        </div>` : ''}
     </div>
     <div class="bottom-bar">
         <span style="font-size:10px;color:var(--text-dim);letter-spacing:0.1em">${isAdmin ? 'SYSTEM' : 'MY'} USAGE DASHBOARD</span>
         <button class="small-btn" onclick="renderDashboardPage(document.getElementById('appRoot'))"
                 style="margin-left:12px">REFRESH</button>
-    </div>`;
+    </div>
+
+    ${!isAdmin ? _topupRequestModalHTML() : ''}
+    `;
     // Load vendor breakdown asynchronously after paint
     if (isAdmin) {
         apiJSON('/admin/dashboard/vendors')
@@ -1081,7 +1225,6 @@ async function renderClientDashboardPage(app, userId) {
             ${_kpiCard('UNBILLED PAGES', fmtNum(s.unbilled_pages), 'var(--amber)', 'not charged as extraction pages')}
             ${_kpiCard('INPUT TOKENS', fmtTokens(inputTokens), 'var(--blue)', 'prompt tokens')}
             ${_kpiCard('OUTPUT TOKENS', fmtTokens(outputTokens), 'var(--green)', 'completion tokens')}
-            ${_kpiCard('COST ESTIMATE', fmtCurrency(s.cost_estimate), 'var(--amber)', s.currency || 'USD')}
         </div>
 
         <div style="background:var(--bg1);border:1px solid var(--border);border-radius:4px;padding:18px 20px;margin-bottom:20px">
@@ -1098,4 +1241,173 @@ async function renderClientDashboardPage(app, userId) {
         </div>
     </div>`;
     updateNavActive();
+}
+
+
+// ── Top-up Request Modal (client only) ───────────────────────────────────
+
+function _topupRequestModalHTML() {
+    return `
+    <div class="modal-overlay" id="topupRequestModal">
+        <div class="modal" style="max-width:460px">
+            <div class="modal-title">Request Top-up Pages</div>
+            <div style="font-size:10px;color:var(--text-dim);margin-bottom:16px;line-height:1.6">
+                Your request will be sent to the admin for review.
+                You'll be able to continue uploading once approved.
+            </div>
+
+            <!-- Pages — free numeric input -->
+            <div class="modal-field">
+                <label class="modal-label">How many pages do you need?</label>
+                <div style="position:relative">
+                    <input class="modal-input" id="topupReqPages" type="number"
+                           min="1" step="1" placeholder="e.g. 1500"
+                           autocomplete="off"
+                           style="font-family:var(--mono);font-size:14px;letter-spacing:0.04em;padding-right:60px"
+                           oninput="_topupReqValidatePages(this)">
+                    <span style="position:absolute;right:12px;top:50%;transform:translateY(-50%);
+                                 font-size:10px;color:var(--text-dim);pointer-events:none;letter-spacing:0.06em">
+                        PAGES
+                    </span>
+                </div>
+                <div id="topupReqPagesHint"
+                     style="font-size:9px;color:var(--text-dim);margin-top:4px;letter-spacing:0.04em">
+                    Enter any whole number greater than 0
+                </div>
+            </div>
+
+            <!-- Period — preset + Custom option -->
+            <div class="modal-field" style="margin-top:12px">
+                <label class="modal-label">For what period?</label>
+                <select class="modal-input" id="topupReqPeriod"
+                        style="cursor:pointer" onchange="_topupReqPeriodChanged()">
+                    <option value="1 month">1 Month</option>
+                    <option value="3 months">3 Months</option>
+                    <option value="6 months" selected>6 Months</option>
+                    <option value="1 year">1 Year</option>
+                    <option value="custom">Custom…</option>
+                </select>
+            </div>
+
+            <!-- Custom period text input (hidden until "Custom…" is selected) -->
+            <div class="modal-field" id="topupReqCustomPeriodWrap"
+                 style="margin-top:8px;display:none">
+                <label class="modal-label">Describe the period</label>
+                <input class="modal-input" id="topupReqCustomPeriod" type="text"
+                       maxlength="64"
+                       placeholder="e.g. Q3 extension, 2 years, 18 months"
+                       autocomplete="off">
+            </div>
+
+            <!-- Note / reason -->
+            <div class="modal-field" style="margin-top:12px">
+                <label class="modal-label">Note / Reason (optional)</label>
+                <input class="modal-input" id="topupReqNote" type="text" maxlength="500"
+                       placeholder="e.g. End-of-quarter processing spike" autocomplete="off">
+            </div>
+
+            <div id="topupReqStatus"
+                 style="min-height:16px;margin-top:10px;font-size:11px;color:var(--text-dim)"></div>
+
+            <div class="modal-actions">
+                <button class="modal-btn secondary" onclick="closeModal('topupRequestModal')">Cancel</button>
+                <button class="modal-btn primary" id="topupReqSubmitBtn"
+                        onclick="submitTopupRequest()">Send Request</button>
+            </div>
+        </div>
+    </div>`;
+}
+
+function _topupReqValidatePages(input) {
+    const hint = document.getElementById('topupReqPagesHint');
+    const val = parseInt(input.value, 10);
+    if (!input.value || isNaN(val) || val < 1) {
+        if (hint) { hint.textContent = 'Enter any whole number greater than 0'; hint.style.color = 'var(--text-dim)'; }
+        input.style.borderColor = '';
+    } else {
+        if (hint) { hint.textContent = `${val.toLocaleString()} pages requested`; hint.style.color = 'var(--green,#98c379)'; }
+        input.style.borderColor = 'var(--green,#98c379)';
+    }
+}
+
+function _topupReqPeriodChanged() {
+    const v = document.getElementById('topupReqPeriod').value;
+    const wrap = document.getElementById('topupReqCustomPeriodWrap');
+    if (wrap) wrap.style.display = v === 'custom' ? 'block' : 'none';
+    if (v === 'custom') {
+        setTimeout(() => document.getElementById('topupReqCustomPeriod')?.focus(), 30);
+    }
+}
+
+function openTopupRequestModal() {
+    const modal = document.getElementById('topupRequestModal');
+    if (!modal) return;
+    const pagesEl = document.getElementById('topupReqPages');
+    if (pagesEl) { pagesEl.value = ''; pagesEl.style.borderColor = ''; }
+    const hintEl = document.getElementById('topupReqPagesHint');
+    if (hintEl) { hintEl.textContent = 'Enter any whole number greater than 0'; hintEl.style.color = 'var(--text-dim)'; }
+    document.getElementById('topupReqPeriod').value = '6 months';
+    document.getElementById('topupReqCustomPeriodWrap').style.display = 'none';
+    document.getElementById('topupReqCustomPeriod').value = '';
+    document.getElementById('topupReqNote').value = '';
+    document.getElementById('topupReqStatus').textContent = '';
+    document.getElementById('topupReqStatus').style.color = 'var(--text-dim)';
+    modal.classList.add('open');
+    setTimeout(() => document.getElementById('topupReqPages').focus(), 50);
+}
+
+async function submitTopupRequest() {
+    const btn = document.getElementById('topupReqSubmitBtn');
+    const statusEl = document.getElementById('topupReqStatus');
+
+    // Validate pages
+    const rawPages = document.getElementById('topupReqPages').value.trim();
+    const pages = parseInt(rawPages, 10);
+    if (!rawPages || isNaN(pages) || pages < 1) {
+        statusEl.style.color = 'var(--red,#e06c75)';
+        statusEl.textContent = 'Please enter a valid number of pages (minimum 1).';
+        document.getElementById('topupReqPages').focus();
+        return;
+    }
+
+    // Resolve period (preset or custom)
+    const periodSel = document.getElementById('topupReqPeriod').value;
+    let period = periodSel;
+    if (periodSel === 'custom') {
+        period = (document.getElementById('topupReqCustomPeriod').value || '').trim();
+        if (!period) {
+            statusEl.style.color = 'var(--red,#e06c75)';
+            statusEl.textContent = 'Please describe the custom period.';
+            document.getElementById('topupReqCustomPeriod').focus();
+            return;
+        }
+    }
+
+    const note = (document.getElementById('topupReqNote').value || '').trim();
+
+    btn.disabled = true;
+    btn.textContent = 'Sending…';
+    statusEl.style.color = 'var(--text-dim)';
+    statusEl.textContent = '';
+
+    try {
+        await apiJSON('/me/topup-requests', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                requested_pages: pages,
+                requested_period: period,
+                note: note || null,
+            }),
+        });
+        statusEl.style.color = 'var(--green,#98c379)';
+        statusEl.textContent = `Request sent — ${pages.toLocaleString()} pages for "${period}". Admin will review shortly.`;
+        btn.textContent = 'Sent ✓';
+        setTimeout(() => closeModal('topupRequestModal'), 2500);
+    } catch (e) {
+        statusEl.style.color = 'var(--red,#e06c75)';
+        statusEl.textContent = 'Error: ' + e.message;
+        btn.disabled = false;
+        btn.textContent = 'Send Request';
+    }
 }

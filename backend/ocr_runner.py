@@ -38,30 +38,40 @@ if not logger.handlers:
 
 _executor = ThreadPoolExecutor(max_workers=3)
 
+class OCRUnavailable(Exception):
+    """Exception raised when PaddleOCR fails to initialize or run."""
+    pass
+
+
 import threading
 import numpy as np
 import cv2
 
 _ocr_local = threading.local()
 
+
 def _get_ocr_engine():
     """Lazy-initialize PaddleOCR engine (thread-local)."""
     if not hasattr(_ocr_local, "engine"):
         logger.info("Initializing PaddleOCR engine...")
         t0 = time.perf_counter()
-        from .config import OCR_DEVICE
-        from paddleocr import PaddleOCR
-        _ocr_local.engine = PaddleOCR(
-            text_detection_model_name="PP-OCRv5_mobile_det",
-            text_recognition_model_name="PP-OCRv5_mobile_rec",
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            device=OCR_DEVICE,
-            enable_mkldnn=(OCR_DEVICE == "cpu"),
-            cpu_threads=4,
-            return_word_box=True,
-        )
+        try:
+            from .config import OCR_DEVICE
+            from paddleocr import PaddleOCR
+            _ocr_local.engine = PaddleOCR(
+                text_detection_model_name="PP-OCRv5_mobile_det",
+                text_recognition_model_name="PP-OCRv5_mobile_rec",
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+                device=OCR_DEVICE,
+                enable_mkldnn=(OCR_DEVICE == "cpu"),
+                cpu_threads=4,
+                return_word_box=True,
+            )
+        except Exception as exc:
+            logger.exception("PaddleOCR model initialization failed")
+            raise OCRUnavailable(f"OCR model initialization failed: {exc}") from exc
         elapsed = (time.perf_counter() - t0) * 1000
         logger.info("PaddleOCR engine ready for thread %s in %.0fms", threading.current_thread().name, elapsed)
         sys.stderr.flush()
@@ -82,13 +92,14 @@ def _run_ocr_on_page(image_b64: str, page_number: int) -> dict:
 
     t0 = time.perf_counter()
     try:
-        ocr = _get_ocr_engine()
-
         # Decode base64 directly to in-memory numpy array (no disk write needed)
-        img_bytes = base64.b64decode(image_b64)
+        img_bytes = base64.b64decode(image_b64, validate=True)
         img_array = np.frombuffer(img_bytes, dtype=np.uint8)
         img_cv = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        if img_cv is None:
+            raise ValueError("OpenCV could not decode OCR page image")
 
+        ocr = _get_ocr_engine()
         result = ocr.predict(img_cv)
 
         words = []
@@ -123,7 +134,13 @@ def _run_ocr_on_page(image_b64: str, page_number: int) -> dict:
 
     except Exception as exc:
         logger.error("PaddleOCR failed on page %d: %s", page_number, exc)
-        return {"page_number": page_number, "words": []}
+        return {
+            "page_number": page_number,
+            "words": [],
+            "_ocr_error": str(exc),
+            "_ocr_error_type": type(exc).__name__,
+        }
+
 
 
 async def run_ocr_on_pages(pages: list[dict]) -> list[dict]:
@@ -148,6 +165,12 @@ async def run_ocr_on_pages(pages: list[dict]) -> list[dict]:
         tasks.append(task)
         
     ocr_pages = await asyncio.gather(*tasks)
+
+    # Check for failures and raise OCRUnavailable to avoid silent blank page failures
+    failed_pages = [p for p in ocr_pages if p.get("_ocr_error")]
+    if failed_pages:
+        details = "; ".join(f"page {p['page_number']}: {p['_ocr_error']}" for p in failed_pages)
+        raise OCRUnavailable(f"PaddleOCR failed: {details}")
 
     elapsed = (time.perf_counter() - t0) * 1000
     total_words = sum(len(p["words"]) for p in ocr_pages)

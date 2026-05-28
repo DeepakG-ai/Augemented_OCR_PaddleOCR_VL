@@ -162,8 +162,8 @@ class AdminBillingReportingIsolationTests(unittest.IsolatedAsyncioTestCase):
         list_query_args = conn.fetch.call_args
         list_query = _compact_sql(list_query_args[0][0])
         list_params = list_query_args[0][1:]
-        self.assertIn("COALESCE((d.metadata->>'billing_user_id')::UUID, v.user_id) = $2", list_query)
-        self.assertEqual(str(list_params[1]), user_id)
+        self.assertIn("COALESCE((d.metadata->>'billing_user_id')::UUID, v.user_id) = $3", list_query)
+        self.assertEqual(str(list_params[2]), user_id)
 
         # Check count_all_extractions
         await db_mod.count_all_extractions(pool, user_id=user_id)

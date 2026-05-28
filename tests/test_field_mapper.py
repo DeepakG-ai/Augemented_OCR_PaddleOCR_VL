@@ -88,6 +88,95 @@ class ApplyMappingTests(unittest.TestCase):
         self.assertIsNone(mapped["vendor_name"])  # source 'supplier' absent in doc
 
 
+class ApplyMappingWithSchemaTests(unittest.TestCase):
+    """The schema= kwarg lets callers override the canonical target list."""
+
+    def test_custom_schema_replaces_default_header_targets(self):
+        # SyteLine-style PO Automation schema (no overlap with default AP fields).
+        po_schema = {
+            "header_fields": ["CustNum", "Client", "CustPo", "OrderDate"],
+            "line_fields": ["Line", "Item", "QtyOrdered", "Price"],
+        }
+        result = {
+            "buyer_code": 105240,
+            "buyer_name": "ACME",
+            "po_no": "PO-1",
+            "line_items": [
+                {"sku": "X1", "qty": 5, "price": 19.99},
+            ],
+        }
+        mapping = {
+            "header_map": {"buyer_code": "CustNum", "buyer_name": "Client", "po_no": "CustPo"},
+            "line_map": {"sku": "Item", "qty": "QtyOrdered", "price": "Price"},
+        }
+        mapped = field_mapper.apply_mapping(result, mapping, schema=po_schema)
+
+        # Output carries every PO header target, unmapped → None.
+        self.assertEqual(set(mapped) - {"line_items"}, set(po_schema["header_fields"]))
+        self.assertEqual(mapped["CustNum"], 105240)
+        self.assertEqual(mapped["Client"], "ACME")
+        self.assertEqual(mapped["CustPo"], "PO-1")
+        self.assertIsNone(mapped["OrderDate"])
+        # AP defaults must NOT appear when a schema is supplied.
+        self.assertNotIn("vendor_name", mapped)
+        self.assertNotIn("po_number", mapped)
+        # Line items use PO line schema.
+        self.assertEqual(set(mapped["line_items"][0]), set(po_schema["line_fields"]))
+        self.assertEqual(mapped["line_items"][0]["Item"], "X1")
+        self.assertEqual(mapped["line_items"][0]["QtyOrdered"], 5)
+        self.assertEqual(mapped["line_items"][0]["Price"], 19.99)
+
+    def test_none_schema_falls_back_to_module_defaults(self):
+        result = {"supplier": "ACME", "line_items": [{"part": "X1"}]}
+        mapping = {"header_map": {"supplier": "vendor_name"},
+                   "line_map": {"part": "item"}}
+        mapped = field_mapper.apply_mapping(result, mapping, schema=None)
+        # Falls back to HEADER_TARGETS / LINE_TARGETS — vendor_name is present.
+        self.assertIn("vendor_name", mapped)
+        self.assertEqual(mapped["vendor_name"], "ACME")
+        self.assertEqual(set(mapped) - {"line_items"}, set(field_mapper.HEADER_TARGETS))
+
+    def test_schema_with_missing_fields_falls_back(self):
+        # Schema with empty/missing field lists should not crash — falls back.
+        result = {"supplier": "ACME", "line_items": []}
+        mapping = {"header_map": {"supplier": "vendor_name"}, "line_map": {}}
+        mapped = field_mapper.apply_mapping(result, mapping, schema={"header_fields": [], "line_fields": []})
+        # Empty schema → falls back to module-level defaults (per || in apply_mapping).
+        self.assertIn("vendor_name", mapped)
+
+    def test_schema_drops_mappings_to_unknown_targets(self):
+        po_schema = {
+            "header_fields": ["CustNum", "Client"],
+            "line_fields": ["Item"],
+        }
+        result = {"x": 1, "y": 2, "line_items": [{"sku": "A"}]}
+        # 'vendor_name' is not in the PO schema → mapping is silently dropped
+        # because output skeleton only includes the schema's fields.
+        mapping = {"header_map": {"x": "CustNum", "y": "vendor_name"},
+                   "line_map": {"sku": "Item"}}
+        mapped = field_mapper.apply_mapping(result, mapping, schema=po_schema)
+        self.assertEqual(mapped["CustNum"], 1)
+        self.assertNotIn("vendor_name", mapped)
+        self.assertEqual(mapped["line_items"][0]["Item"], "A")
+
+    def test_schema_applied_to_list_result_shape(self):
+        po_schema = {
+            "header_fields": ["CustPo"],
+            "line_fields": ["Item"],
+        }
+        result = [
+            {"po_no": "PO-A", "line_items": [{"sku": "X"}]},
+            {"po_no": "PO-B", "line_items": []},
+        ]
+        mapping = {"header_map": {"po_no": "CustPo"}, "line_map": {"sku": "Item"}}
+        mapped = field_mapper.apply_mapping(result, mapping, schema=po_schema)
+        self.assertIsInstance(mapped, list)
+        self.assertEqual(mapped[0]["CustPo"], "PO-A")
+        self.assertEqual(mapped[0]["line_items"][0]["Item"], "X")
+        self.assertEqual(mapped[1]["CustPo"], "PO-B")
+        self.assertNotIn("vendor_name", mapped[0])
+
+
 class RenameDetectionTests(unittest.TestCase):
     def test_single_position_rename_detected(self):
         old = ["po_number", "vendor", "date"]

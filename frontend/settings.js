@@ -6,9 +6,14 @@
 // Admin  → GET /admin/config/users (all configs) + PUT per user
 // ══════════════════════════════════════════════════════════════════════
 
-let _settingsSSE = null;        // current EventSource
+let _settingsSSE = null;        // AbortController for the active fetch stream
 let _settingsAllConfigs = [];   // admin: list of all user configs
 let _clientOnline = false;      // desktop agent heartbeat status (REST only)
+
+// ── Schema management state ────────────────────────────────────────────
+let _schemas = [];              // [{id, name, slug, is_system, header_fields, line_fields}]
+let _schemaEditId = null;       // null = create mode, int = edit mode
+let _schemaConfirmState = {};   // {id: 'delete'|'reset'} for inline confirmations
 
 // ── Scheduler state ───────────────────────────────────────────────────
 let _schedulerState  = { schedules: [], max_schedules: 3 };
@@ -31,27 +36,69 @@ function _uploadModeLabel(mode) {
 }
 
 // ── SSE connection ─────────────────────────────────────────────────────
+// Uses fetch() + ReadableStream so the JWT travels in the Authorization
+// header instead of a ?token= query param (which would leak to access logs).
+// Reconnect/backoff is implemented manually because fetch() — unlike
+// EventSource — does not retry on its own.
+
+function _setSseStatus(text) {
+    const statusEl = document.getElementById('sseStatus');
+    if (statusEl) statusEl.textContent = text;
+}
 
 function _startConfigSSE(onEvent) {
-    if (_settingsSSE) {
-        _settingsSSE.close();
-        _settingsSSE = null;
-    }
-    const token = localStorage.getItem('auth_token');
-    const url = `/api/config/stream?token=${encodeURIComponent(token || '')}`;
-    const es = new EventSource(url);
-    es.onmessage = (e) => {
-        try { onEvent(JSON.parse(e.data)); } catch (_) {}
-    };
-    es.onerror = () => {
-        // Reconnects automatically — no action needed.
-    };
-    _settingsSSE = es;
+    _stopConfigSSE();
+    const controller = new AbortController();
+    _settingsSSE = controller;
+
+    (async () => {
+        let backoffMs = 1000;
+        while (!controller.signal.aborted) {
+            try {
+                const token = localStorage.getItem('auth_token');
+                const resp = await fetch('/api/config/stream', {
+                    signal: controller.signal,
+                    headers: token ? { 'Authorization': `Bearer ${token}` } : {},
+                });
+                if (resp.status === 401) {
+                    _setSseStatus('Not authenticated');
+                    return;
+                }
+                if (!resp.ok || !resp.body) {
+                    throw new Error(`HTTP ${resp.status}`);
+                }
+                _setSseStatus('Connected');
+                backoffMs = 1000;
+
+                const reader = resp.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop();
+                    for (const line of lines) {
+                        const trimmed = line.trim();
+                        if (!trimmed.startsWith('data: ')) continue;
+                        try { onEvent(JSON.parse(trimmed.slice(6))); } catch (_) {}
+                    }
+                }
+            } catch (err) {
+                if (controller.signal.aborted) return;
+                _setSseStatus('Reconnecting…');
+            }
+            if (controller.signal.aborted) return;
+            await new Promise(r => setTimeout(r, backoffMs));
+            backoffMs = Math.min(backoffMs * 2, 30000);
+        }
+    })();
 }
 
 function _stopConfigSSE() {
     if (_settingsSSE) {
-        _settingsSSE.close();
+        _settingsSSE.abort();
         _settingsSSE = null;
     }
 }
@@ -63,26 +110,26 @@ function _renderAllConfigsTable(configs) {
         return `<div style="color:var(--text-dim);padding:16px;font-size:11px">No users found.</div>`;
     }
     return `
-    <table style="width:100%;border-collapse:collapse;font-size:11px">
+    <table style="width:100%;min-width:900px;border-collapse:collapse;font-size:11px">
         <thead>
             <tr style="border-bottom:1px solid var(--border);color:var(--text-dim);letter-spacing:0.08em">
-                <th style="text-align:left;padding:8px 12px;font-weight:500">USER</th>
-                <th style="text-align:left;padding:8px 12px;font-weight:500">ROLE</th>
-                <th style="text-align:left;padding:8px 12px;font-weight:500">UPLOAD MODE</th>
-                <th style="text-align:left;padding:8px 12px;font-weight:500">INPUT FOLDER</th>
-                <th style="text-align:left;padding:8px 12px;font-weight:500">OUTPUT FOLDER</th>
-                <th style="text-align:left;padding:8px 12px;font-weight:500">DESKTOP AGENT</th>
-                <th style="text-align:left;padding:8px 12px;font-weight:500">SERVER WATCHER</th>
-                <th style="text-align:center;padding:8px 12px;font-weight:500">EDIT</th>
+                <th style="text-align:left;padding:8px 12px;font-weight:500;white-space:nowrap">USER</th>
+                <th style="text-align:left;padding:8px 12px;font-weight:500;white-space:nowrap">ROLE</th>
+                <th style="text-align:left;padding:8px 12px;font-weight:500;white-space:nowrap">UPLOAD MODE</th>
+                <th style="text-align:left;padding:8px 12px;font-weight:500;white-space:nowrap">INPUT FOLDER</th>
+                <th style="text-align:left;padding:8px 12px;font-weight:500;white-space:nowrap">OUTPUT FOLDER</th>
+                <th style="text-align:left;padding:8px 12px;font-weight:500;white-space:nowrap">DESKTOP AGENT</th>
+                <th style="text-align:left;padding:8px 12px;font-weight:500;white-space:nowrap">SERVER WATCHER</th>
+                <th style="text-align:center;padding:8px 12px;font-weight:500;white-space:nowrap">EDIT</th>
             </tr>
         </thead>
         <tbody>
             ${configs.map(u => `
             <tr style="border-bottom:1px solid var(--border)"
                 onmouseover="this.style.background='var(--bg2)'" onmouseout="this.style.background=''">
-                <td style="padding:8px 12px;font-weight:500">${escapeHtml(u.email)}</td>
-                <td style="padding:8px 12px;color:var(--text-dim)">${escapeHtml(u.role || '').toUpperCase()}</td>
-                <td style="padding:8px 12px">${_uploadModeLabel(u.config?.upload_mode)}</td>
+                <td style="padding:8px 12px;font-weight:500;white-space:nowrap">${escapeHtml(u.email)}</td>
+                <td style="padding:8px 12px;color:var(--text-dim);white-space:nowrap">${escapeHtml(u.role || '').toUpperCase()}</td>
+                <td style="padding:8px 12px;white-space:nowrap">${_uploadModeLabel(u.config?.upload_mode)}</td>
                 <td style="padding:8px 12px;color:var(--text-mid);font-family:var(--mono);font-size:10px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
                     title="${escapeHtml(u.config?.input_folder || '')}">
                     ${escapeHtml(u.config?.input_folder || '—')}
@@ -91,10 +138,10 @@ function _renderAllConfigsTable(configs) {
                     title="${escapeHtml(u.config?.output_folder || '')}">
                     ${escapeHtml(u.config?.output_folder || '—')}
                 </td>
-                <td style="padding:8px 12px">
+                <td style="padding:8px 12px;white-space:nowrap">
                     ${_statusDot(u.client_online)}${u.client_online ? 'ACTIVE' : 'OFF'}
                 </td>
-                <td style="padding:8px 12px">
+                <td style="padding:8px 12px;white-space:nowrap">
                     ${_statusDot(u.watcher_active)}${u.watcher_active ? 'ACTIVE' : 'OFF'}
                 </td>
                 <td style="padding:8px 12px;text-align:center">
@@ -133,6 +180,8 @@ function openAdminEditConfig(userId, email) {
 async function submitAdminConfigEdit(userId) {
     const body = _readFormFields();
     const statusEl = document.getElementById('modalStatus');
+    const btn = document.querySelector('[onclick*="submitAdminConfigEdit"]');
+    if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
     try {
         await apiFetch(`/admin/config/users/${encodeURIComponent(userId)}`, {
             method: 'PUT',
@@ -140,13 +189,15 @@ async function submitAdminConfigEdit(userId) {
             body: JSON.stringify(body),
         });
         if (statusEl) statusEl.textContent = 'Saved.';
-        setTimeout(() => closeSettingsModal(), 800);
+        await new Promise(r => setTimeout(r, 600));
+        closeSettingsModal();
         // Refresh table
         _settingsAllConfigs = await apiJSON('/admin/config/users');
         const tbl = document.getElementById('allConfigsTable');
         if (tbl) tbl.innerHTML = _renderAllConfigsTable(_settingsAllConfigs);
     } catch (e) {
         if (statusEl) statusEl.textContent = 'Error: ' + e.message;
+        if (btn) { btn.disabled = false; btn.textContent = 'Save'; }
     }
 }
 
@@ -154,6 +205,14 @@ function closeSettingsModal() {
     const modal = document.getElementById('settingsModal');
     if (modal) { modal.style.display = 'none'; modal.innerHTML = ''; }
 }
+
+// Close settings modal on Escape key
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+        const modal = document.getElementById('settingsModal');
+        if (modal && modal.style.display === 'flex') closeSettingsModal();
+    }
+});
 
 // ── Shared form helpers ────────────────────────────────────────────────
 
@@ -549,7 +608,7 @@ async function _loadAdminSchedules() {
                     <span style="font-size:11px;font-weight:600;color:var(--text)">${escapeHtml(email)}</span>
                     <span style="font-size:9px;color:var(--text-dim);letter-spacing:0.08em">${rows.length} SCHEDULE${rows.length !== 1 ? 'S' : ''}</span>
                 </div>
-                <table style="width:100%;border-collapse:collapse;font-size:11px">
+                <table style="width:100%;min-width:600px;border-collapse:collapse;font-size:11px">
                     <thead>
                         <tr style="border-bottom:1px solid var(--border)">
                             <th style="padding:6px 14px;text-align:left;font-size:9px;font-weight:500;letter-spacing:0.1em;color:var(--text-dim)">LOCAL TIME</th>
@@ -576,6 +635,8 @@ async function _loadAdminSchedules() {
 async function saveOwnConfig() {
     const body = _readFormFields();
     const statusEl = document.getElementById('ownSaveStatus');
+    const btn = document.querySelector('[onclick="saveOwnConfig()"]');
+    if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
     if (statusEl) statusEl.textContent = 'Saving…';
     try {
         await apiFetch('/api/config', {
@@ -587,6 +648,8 @@ async function saveOwnConfig() {
         setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 2000);
     } catch (e) {
         if (statusEl) statusEl.textContent = 'Error: ' + e.message;
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Save'; }
     }
 }
 
@@ -648,7 +711,7 @@ async function renderSettingsPage(app) {
 
         ${isAdmin ? `
         <!-- Admin: all users config table -->
-        <div style="background:var(--bg1);border:1px solid var(--border);border-radius:4px;overflow:hidden;margin-bottom:20px">
+        <div style="background:var(--bg1);border:1px solid var(--border);border-radius:4px;margin-bottom:20px">
             <div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
                 <span style="font-size:9px;letter-spacing:0.14em;color:var(--text-dim)">ALL CLIENT CONFIGURATIONS</span>
                 <button class="small-btn" onclick="refreshAllConfigs()">Refresh</button>
@@ -658,21 +721,34 @@ async function renderSettingsPage(app) {
             </div>
         </div>
         <!-- Admin: all client schedules -->
-        <div style="background:var(--bg1);border:1px solid var(--border);border-radius:4px;overflow:hidden">
+        <div style="background:var(--bg1);border:1px solid var(--border);border-radius:4px;margin-bottom:20px">
             <div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
                 <span style="font-size:9px;letter-spacing:0.14em;color:var(--blue)">ALL CLIENT SCHEDULES</span>
                 <button class="small-btn" onclick="_loadAdminSchedules()">Refresh</button>
             </div>
-            <div id="adminScheduleList">
+            <div id="adminScheduleList" style="overflow-x:auto">
                 <div style="color:var(--text-dim);font-size:11px;padding:12px">Loading…</div>
             </div>
+        </div>
+        <!-- Admin: output schemas -->
+        <div style="background:var(--bg1);border:1px solid var(--border);border-radius:4px">
+            <div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
+                <span style="font-size:9px;letter-spacing:0.14em;color:var(--text-dim)">OUTPUT SCHEMAS</span>
+                <div style="display:flex;gap:8px">
+                    <button class="small-btn" onclick="openSchemaModal(null)">＋ New Schema</button>
+                    <button class="small-btn" onclick="loadSchemasPanel()">Refresh</button>
+                </div>
+            </div>
+            <div id="schemasPanel" style="overflow-x:auto">
+                <div style="color:var(--text-dim);padding:16px;font-size:11px">Loading…</div>
+            </div>
         </div>` : ''}
-    </div>
 
-    <!-- Modal overlay for admin edit -->
-    <div id="settingsModal"
-         style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:900;
-                align-items:center;justify-content:center;padding:20px">
+        <!-- Modal overlay for admin edit -->
+        <div id="settingsModal"
+             style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:900;
+                    align-items:center;justify-content:center;padding:20px">
+        </div>
     </div>
 
     <div class="bottom-bar">
@@ -683,6 +759,7 @@ async function renderSettingsPage(app) {
     // Load own config and render form
     let ownConfig = {};
     let watcherActive = false;
+    let _configLoadFailed = false;
     try {
         const data = await apiJSON('/api/config');
         ownConfig = data.config || {};
@@ -690,10 +767,18 @@ async function renderSettingsPage(app) {
         _clientOnline = !!data.client_online;
     } catch (e) {
         console.warn('Settings load error:', e);
+        _configLoadFailed = true;
     }
     const formEl = document.getElementById('ownConfigForm');
-    if (formEl) formEl.innerHTML = _configFormFields(ownConfig);
-    _refreshOwnConfigDisplay(ownConfig, watcherActive);
+    if (_configLoadFailed) {
+        if (formEl) formEl.innerHTML = `<div style="color:var(--red,#e06c75);font-size:11px;padding:8px 0">&#9888; Configuration could not be loaded. Saving is disabled until the page is refreshed.</div>`;
+        // Disable Save button — it sits outside the form div so we target by onclick
+        const saveBtn = document.querySelector('[onclick="saveOwnConfig()"]');
+        if (saveBtn) { saveBtn.disabled = true; saveBtn.title = 'Config failed to load — refresh the page'; }
+    } else {
+        if (formEl) formEl.innerHTML = _configFormFields(ownConfig);
+        _refreshOwnConfigDisplay(ownConfig, watcherActive);
+    }
 
     // Load scheduler state
     await _loadSchedulerState();
@@ -705,9 +790,9 @@ async function renderSettingsPage(app) {
         if (statusEl) statusEl.textContent = 'Live';
     });
 
-    // Admin: load all configs + schedules
+    // Admin: load all configs + schedules + schemas
     if (isAdmin) {
-        await Promise.all([refreshAllConfigs(), _loadAdminSchedules()]);
+        await Promise.all([refreshAllConfigs(), _loadAdminSchedules(), loadSchemasPanel()]);
     }
 }
 
@@ -719,5 +804,218 @@ async function refreshAllConfigs() {
     } catch (e) {
         const tbl = document.getElementById('allConfigsTable');
         if (tbl) tbl.innerHTML = `<div style="color:var(--red,#e06c75);padding:16px;font-size:11px">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+// ── Output Schema Management ───────────────────────────────────────────
+
+async function loadSchemasPanel() {
+    try {
+        _schemas = await apiJSON('/schemas');
+        _schemaConfirmState = {};
+        renderSchemasPanel();
+    } catch (e) {
+        const el = document.getElementById('schemasPanel');
+        if (el) el.innerHTML = `<div style="color:var(--red,#e06c75);padding:16px;font-size:11px">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function renderSchemasPanel() {
+    const el = document.getElementById('schemasPanel');
+    if (!el) return;
+    if (!_schemas.length) {
+        el.innerHTML = `<div style="color:var(--text-dim);padding:16px;font-size:11px">No schemas yet. Click ＋ New Schema to create one.</div>`;
+        return;
+    }
+    el.innerHTML = `<table style="width:100%;min-width:600px;border-collapse:collapse;font-size:11px">
+        <thead>
+            <tr style="border-bottom:1px solid var(--border);color:var(--text-dim);letter-spacing:0.08em">
+                <th style="text-align:left;padding:8px 14px;font-weight:500;white-space:nowrap">NAME</th>
+                <th style="text-align:left;padding:8px 14px;font-weight:500;white-space:nowrap">HEADER FIELDS</th>
+                <th style="text-align:left;padding:8px 14px;font-weight:500;white-space:nowrap">LINE FIELDS</th>
+                <th style="text-align:left;padding:8px 14px;font-weight:500;white-space:nowrap">TYPE</th>
+                <th style="text-align:center;padding:8px 14px;font-weight:500;white-space:nowrap">ACTIONS</th>
+            </tr>
+        </thead>
+        <tbody>
+            ${_schemas.map(s => _schemaRowHTML(s)).join('')}
+        </tbody>
+    </table>`;
+}
+
+function _schemaRowHTML(s) {
+    const confirm = _schemaConfirmState[s.id];
+    let actionCell;
+    if (confirm === 'delete') {
+        actionCell = `<span style="font-size:10px;color:var(--text-dim)">Delete schema?</span>
+            <button class="small-btn" style="background:var(--red,#e06c75);color:#fff;margin-left:6px"
+                onclick="confirmDeleteSchema(${s.id})">Yes</button>
+            <button class="small-btn" style="margin-left:4px"
+                onclick="_clearSchemaConfirm(${s.id})">No</button>`;
+    } else if (confirm === 'reset') {
+        actionCell = `<span style="font-size:10px;color:var(--text-dim)">Reset to last saved?</span>
+            <button class="small-btn" style="background:var(--amber,#f59e0b);color:#000;margin-left:6px"
+                onclick="confirmResetSchema(${s.id})">Yes</button>
+            <button class="small-btn" style="margin-left:4px"
+                onclick="_clearSchemaConfirm(${s.id})">No</button>`;
+    } else {
+        const editBtn = `<button class="small-btn" title="Edit schema" onclick="openSchemaModal(${s.id})">✏</button>`;
+        const resetBtn = `<button class="small-btn" title="Reset to last saved" onclick="_askSchemaConfirm(${s.id},'reset')" style="margin-left:4px">↺</button>`;
+        const deleteBtn = s.is_system ? '' : `<button class="small-btn" title="Delete schema" onclick="_askSchemaConfirm(${s.id},'delete')" style="margin-left:4px;color:var(--red,#e06c75)">✕</button>`;
+        actionCell = editBtn + resetBtn + deleteBtn;
+    }
+    return `<tr style="border-bottom:1px solid var(--border)"
+        onmouseover="this.style.background='var(--bg2)'" onmouseout="this.style.background=''">
+        <td style="padding:8px 14px;font-weight:600">${escapeHtml(s.name)}</td>
+        <td style="padding:8px 14px;color:var(--text-mid)">${(s.header_fields||[]).length} fields</td>
+        <td style="padding:8px 14px;color:var(--text-mid)">${(s.line_fields||[]).length} fields</td>
+        <td style="padding:8px 14px">
+            ${s.is_system
+                ? `<span style="font-size:8px;letter-spacing:0.12em;padding:2px 6px;border:1px solid var(--blue-dim,#3b82f6);color:var(--blue);border-radius:2px">SYSTEM</span>`
+                : `<span style="font-size:8px;letter-spacing:0.12em;padding:2px 6px;border:1px solid var(--border);color:var(--text-dim);border-radius:2px">CUSTOM</span>`}
+        </td>
+        <td style="padding:8px 14px;text-align:center;white-space:nowrap">${actionCell}</td>
+    </tr>`;
+}
+
+function _askSchemaConfirm(id, action) {
+    _schemaConfirmState = { [id]: action };
+    renderSchemasPanel();
+}
+
+function _clearSchemaConfirm(id) {
+    delete _schemaConfirmState[id];
+    renderSchemasPanel();
+}
+
+async function confirmDeleteSchema(id) {
+    try {
+        await apiFetch(`/schemas/${id}`, { method: 'DELETE' });
+        showToast('Schema deleted');
+        await loadSchemasPanel();
+    } catch (e) {
+        showToast('Delete failed: ' + e.message);
+        _clearSchemaConfirm(id);
+    }
+}
+
+async function confirmResetSchema(id) {
+    try {
+        await apiFetch(`/schemas/${id}/reset`, { method: 'POST' });
+        showToast('Schema reset to last saved state');
+        await loadSchemasPanel();
+    } catch (e) {
+        showToast('Reset failed: ' + e.message);
+        _clearSchemaConfirm(id);
+    }
+}
+
+function openSchemaModal(schemaId) {
+    _schemaEditId = schemaId;
+    const schema = schemaId ? _schemas.find(s => s.id === schemaId) : null;
+    const modal = document.getElementById('settingsModal');
+    if (!modal) return;
+
+    const headerList = (schema ? schema.header_fields || [] : []).map(f => _schemaFieldRow(f)).join('');
+    const lineList = (schema ? schema.line_fields || [] : []).map(f => _schemaFieldRow(f)).join('');
+
+    modal.innerHTML = `
+    <div style="background:var(--bg0);border:1px solid var(--border);border-radius:4px;padding:24px;max-width:560px;width:100%;max-height:80vh;overflow-y:auto">
+        <div style="font-size:10px;letter-spacing:0.14em;color:var(--text-dim);margin-bottom:4px">
+            ${schemaId ? 'EDIT SCHEMA' : 'NEW SCHEMA'}
+        </div>
+        <div style="margin-bottom:16px">
+            <label style="font-size:9px;letter-spacing:0.1em;color:var(--text-dim)">SCHEMA NAME
+                <input id="schemaName" type="text"
+                    value="${escapeHtml((schema && schema.name) || '')}"
+                    placeholder="e.g. My ERP Schema"
+                    style="display:block;width:100%;margin-top:6px;background:var(--bg1);border:1px solid var(--border);color:var(--text);padding:8px 10px;font-family:var(--mono);font-size:12px;box-sizing:border-box">
+            </label>
+        </div>
+        <div style="margin-bottom:16px">
+            <div style="font-size:9px;letter-spacing:0.1em;color:var(--text-dim);margin-bottom:8px">HEADER FIELDS</div>
+            <div id="schemaHeaderFields">${headerList}</div>
+            <button class="small-btn" style="margin-top:6px" onclick="_addSchemaField('schemaHeaderFields')">＋ Add Field</button>
+        </div>
+        <div style="margin-bottom:20px">
+            <div style="font-size:9px;letter-spacing:0.1em;color:var(--text-dim);margin-bottom:8px">LINE ITEM FIELDS</div>
+            <div id="schemaLineFields">${lineList}</div>
+            <button class="small-btn" style="margin-top:6px" onclick="_addSchemaField('schemaLineFields')">＋ Add Field</button>
+        </div>
+        <div style="display:flex;gap:8px">
+            <button class="small-btn" style="background:var(--blue);color:#fff" onclick="submitSchemaModal()">Save</button>
+            <button class="small-btn" onclick="closeSettingsModal()">Cancel</button>
+        </div>
+        <div id="schemaModalStatus" style="margin-top:10px;font-size:10px;color:var(--text-dim)"></div>
+    </div>`;
+    modal.style.display = 'flex';
+}
+
+function _schemaFieldRow(value) {
+    return `<div style="display:flex;align-items:center;gap:6px;margin-bottom:5px">
+        <input type="text" value="${escapeHtml(value)}"
+            placeholder="field_name"
+            style="flex:1;background:var(--bg1);border:1px solid var(--border);color:var(--text);
+                   padding:5px 8px;font-family:var(--mono);font-size:11px">
+        <button class="small-btn" style="color:var(--red,#e06c75);flex-shrink:0"
+            onclick="_removeSchemaFieldRow(this)">✕</button>
+    </div>`;
+}
+
+function _addSchemaField(containerId) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    const div = document.createElement('div');
+    div.innerHTML = _schemaFieldRow('');
+    container.appendChild(div.firstElementChild);
+}
+
+function _removeSchemaFieldRow(btn) {
+    btn.closest('div').remove();
+}
+
+function _readSchemaFields(containerId) {
+    const container = document.getElementById(containerId);
+    if (!container) return [];
+    return Array.from(container.querySelectorAll('input[type=text]'))
+        .map(i => i.value.trim())
+        .filter(v => v.length > 0);
+}
+
+async function submitSchemaModal() {
+    const name = (document.getElementById('schemaName')?.value || '').trim();
+    const headerFields = _readSchemaFields('schemaHeaderFields');
+    const lineFields = _readSchemaFields('schemaLineFields');
+    const statusEl = document.getElementById('schemaModalStatus');
+    const btn = document.querySelector('[onclick="submitSchemaModal()"]');
+
+    if (!name) {
+        if (statusEl) statusEl.textContent = 'Schema name is required.';
+        return;
+    }
+
+    if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+    const body = { name, header_fields: headerFields, line_fields: lineFields };
+    try {
+        if (_schemaEditId) {
+            await apiFetch(`/schemas/${_schemaEditId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            showToast('Schema updated');
+        } else {
+            await apiFetch('/schemas', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            showToast('Schema created');
+        }
+        closeSettingsModal();
+        await loadSchemasPanel();
+    } catch (e) {
+        if (statusEl) statusEl.textContent = 'Error: ' + e.message;
+        if (btn) { btn.disabled = false; btn.textContent = 'Save'; }
     }
 }

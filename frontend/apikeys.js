@@ -16,11 +16,14 @@ async function renderApiKeysPage(app) {
 
         <!-- Header row -->
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px">
-            <div>
-                <div class="page-title" style="margin:0">API Key Management</div>
-                <div style="font-size:10px;color:var(--text-dim);margin-top:4px;letter-spacing:0.06em">
-                    ${active.length} ACTIVE &nbsp;·&nbsp; ${inactive.length} INACTIVE
+            <div style="display:flex;align-items:center;gap:20px">
+                <div>
+                    <div class="page-title" style="margin:0">API Key Management</div>
+                    <div style="font-size:10px;color:var(--text-dim);margin-top:4px;letter-spacing:0.06em">
+                        ${active.length} ACTIVE &nbsp;·&nbsp; ${inactive.length} INACTIVE
+                    </div>
                 </div>
+                ${_adminSubTabsHTML('apikeys')}
             </div>
             <button onclick="openCreateApiKeyModal()" style="
                 display:flex;align-items:center;gap:8px;
@@ -34,25 +37,33 @@ async function renderApiKeysPage(app) {
         </div>
 
         <!-- Stats strip -->
-        <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:24px">
-            ${_akStatCard('Total Keys', keys.length, 'var(--text)')}
-            ${_akStatCard('Active', active.length, 'var(--green,#98c379)')}
-            ${_akStatCard('Total Tokens', keys.reduce((s,k) => s + (k.total_tokens || 0), 0).toLocaleString(), 'var(--blue)')}
-            ${_akStatCard('Total Pages', keys.reduce((s,k) => s + (k.total_pages || 0), 0).toLocaleString(), 'var(--purple,#c678dd)')}
-            ${_akStatCard('Total Docs', keys.reduce((s,k) => s + (k.total_documents || 0), 0).toLocaleString(), 'var(--amber,#e5c07b)')}
+        <div id="akStatsStrip" style="display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:24px">
+            ${_akStatsStripHTML(keys)}
         </div>
 
         <!-- Key cards -->
         <div id="apiKeyTable">${_renderApiKeyCards(keys)}</div>
+        ${_createApiKeyModalHTML()}
+        ${_showRawKeyModalHTML()}
     </div>
 
     <div class="bottom-bar">
         <span style="font-size:10px;color:var(--text-dim);letter-spacing:0.1em">${keys.length} API KEY${keys.length !== 1 ? 'S' : ''} REGISTERED</span>
-    </div>
-    ${_createApiKeyModalHTML()}
-    ${_showRawKeyModalHTML()}`;
+    </div>`;
 
     updateNavActive();
+}
+
+function _akStatsStripHTML(keys) {
+    const active = keys.filter(k => k.is_active);
+    return [
+        _akStatCard('Total Keys',     keys.length,                                                         'var(--text)'),
+        _akStatCard('Active',         active.length,                                                       'var(--green,#98c379)'),
+        _akStatCard('Input Tokens',   keys.reduce((s,k) => s + (k.total_input_tokens  || 0), 0).toLocaleString(), 'var(--blue)'),
+        _akStatCard('Output Tokens',  keys.reduce((s,k) => s + (k.total_output_tokens || 0), 0).toLocaleString(), 'var(--purple,#c678dd)'),
+        _akStatCard('Total Pages',    keys.reduce((s,k) => s + (k.total_pages         || 0), 0).toLocaleString(), 'var(--cyan,#56b6c2)'),
+        _akStatCard('Total Docs',     keys.reduce((s,k) => s + (k.total_documents     || 0), 0).toLocaleString(), 'var(--amber,#e5c07b)'),
+    ].join('');
 }
 
 function _akStatCard(label, value, color) {
@@ -112,7 +123,8 @@ function _renderApiKeyCard(k) {
        </button>`;
 
     const lastUsed = k.last_used_at ? new Date(k.last_used_at).toLocaleString() : 'Never';
-    const tokens = (k.total_tokens || 0).toLocaleString();
+    const tokIn = (k.total_input_tokens || 0).toLocaleString();
+    const tokOut = (k.total_output_tokens || 0).toLocaleString();
     const pages = (k.total_pages || 0).toLocaleString();
     const docs = (k.total_documents || 0).toLocaleString();
 
@@ -164,11 +176,15 @@ function _renderApiKeyCard(k) {
         </div>
 
         <!-- Usage stats -->
-        <div style="text-align:center;padding:0 16px;border-left:1px solid var(--border);border-right:1px solid var(--border);min-width:200px">
-            <div style="display:flex;gap:16px;justify-content:center">
+        <div style="text-align:center;padding:0 16px;border-left:1px solid var(--border);border-right:1px solid var(--border);min-width:240px">
+            <div style="display:flex;gap:14px;justify-content:center">
                 <div>
-                    <div style="font-size:9px;letter-spacing:0.1em;color:var(--text-dim);margin-bottom:2px">TOKENS</div>
-                    <div style="font-size:13px;font-weight:700;font-family:var(--mono);color:var(--text)">${tokens}</div>
+                    <div style="font-size:9px;letter-spacing:0.1em;color:var(--blue);margin-bottom:2px">TOK IN</div>
+                    <div style="font-size:13px;font-weight:700;font-family:var(--mono);color:var(--text)">${tokIn}</div>
+                </div>
+                <div>
+                    <div style="font-size:9px;letter-spacing:0.1em;color:var(--purple,#c678dd);margin-bottom:2px">TOK OUT</div>
+                    <div style="font-size:13px;font-weight:700;font-family:var(--mono);color:var(--text)">${tokOut}</div>
                 </div>
                 <div>
                     <div style="font-size:9px;letter-spacing:0.1em;color:var(--text-dim);margin-bottom:2px">PAGES</div>
@@ -393,6 +409,8 @@ async function _refreshApiKeyTable() {
         const keys = await apiJSON('/admin/api-keys');
         const el = document.getElementById('apiKeyTable');
         if (el) el.innerHTML = _renderApiKeyCards(keys);
+        const strip = document.getElementById('akStatsStrip');
+        if (strip) strip.innerHTML = _akStatsStripHTML(keys);
         const bar = document.querySelector('.bottom-bar span');
         if (bar) bar.textContent = `${keys.length} API KEY${keys.length !== 1 ? 'S' : ''} REGISTERED`;
     } catch (e) { showToast('Refresh failed: ' + e.message); }

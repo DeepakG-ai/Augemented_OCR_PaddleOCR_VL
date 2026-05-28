@@ -37,13 +37,19 @@ LINE_TARGETS: list[str] = [
 ]
 
 
-def _map_document(doc: dict, header_map: dict, line_map: dict) -> dict:
+def _map_document(
+    doc: dict,
+    header_map: dict,
+    line_map: dict,
+    header_targets: list[str],
+    line_targets: list[str],
+) -> dict:
     """Map a single PO document to the canonical shape.
 
-    Output always carries every canonical target key; unmapped targets are
-    null. Source fields with no mapping are dropped.
+    Output always carries every target key; unmapped targets are null.
+    Source fields with no mapping are dropped.
     """
-    out: dict[str, Any] = {t: None for t in HEADER_TARGETS}
+    out: dict[str, Any] = {t: None for t in header_targets}
     for source_field, target_field in header_map.items():
         if target_field in out:
             out[target_field] = doc.get(source_field)
@@ -52,7 +58,7 @@ def _map_document(doc: dict, header_map: dict, line_map: dict) -> dict:
     for raw_item in doc.get("line_items") or []:
         if not isinstance(raw_item, dict):
             continue
-        mapped_item: dict[str, Any] = {t: None for t in LINE_TARGETS}
+        mapped_item: dict[str, Any] = {t: None for t in line_targets}
         for source_field, target_field in line_map.items():
             if target_field in mapped_item:
                 mapped_item[target_field] = raw_item.get(source_field)
@@ -61,23 +67,29 @@ def _map_document(doc: dict, header_map: dict, line_map: dict) -> dict:
     return out
 
 
-def apply_mapping(result: Any, mapping: dict) -> Any:
+def apply_mapping(result: Any, mapping: dict, schema: dict | None = None) -> Any:
     """Apply a stored field mapping to a merged extraction result.
 
     Handles both result shapes:
       - dict  -> single_po_multipage / single_page  (returns a dict)
       - list  -> po_per_page                        (returns a list of dicts)
+
+    schema: optional dict with 'header_fields' and 'line_fields' lists.
+    Falls back to the module-level HEADER_TARGETS / LINE_TARGETS constants.
     """
     header_map = mapping.get("header_map") or {}
     line_map = mapping.get("line_map") or {}
+    header_targets = (schema or {}).get("header_fields") or HEADER_TARGETS
+    line_targets = (schema or {}).get("line_fields") or LINE_TARGETS
 
     if isinstance(result, list):
         return [
-            _map_document(doc if isinstance(doc, dict) else {}, header_map, line_map)
+            _map_document(doc if isinstance(doc, dict) else {}, header_map, line_map,
+                          header_targets, line_targets)
             for doc in result
         ]
     if isinstance(result, dict):
-        return _map_document(result, header_map, line_map)
+        return _map_document(result, header_map, line_map, header_targets, line_targets)
     return result
 
 

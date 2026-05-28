@@ -1,0 +1,36 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "{\n  \"fields\": {\n    \"bill_to\": \"SLACAN\\n145 ROY BLVD.\\nBRANTFORD ON N3T 6E3\",\n    \"ship_to\": \"SLACAN\\n145 ROY BLVD.\\nBRANTFORD ON N3T 6E3\",\n    \"invoice_date\": \"May 13, 2026\",\n    \"invoice_number\": \"INV-AG1008\",\n    \"vendor_name\": \"AEGIS CUSTOM POWDER COATERS\",\n    \"po_number\": \"DP00001008\",\n    \"order_date\": \"28-Apr-25\",\n    \"order_number\": \"0000726633\",\n    \"fob\": \"44648\",\n    \"terms\": \"Net 30 days\",\n    \"freight\": \"19,410.00\",\n    \"invoice_total\": \"$54,335.35\",\n    \"line_items\": [\n      {\n        \"item\": \"AIR SEALED ML\\n7600003 BAG 6 X8 X250\",\n        \"required_qty\": \"1000\",\n        \"ship_qty\": \"680\",\n        \"uom\": \"EA\",\n        \"unit_price\": \"11.50000\",\n        \"line_total\": \"7,820.00\"\n      },\n      {\n        \"item\": \"Glue CR\\nGL-10000 Component Q\",\n        \"required_qty\": \"6000\",\n        \"ship_qty\": \"3500\",\n        \"uom\": \"GA\",\n        \"unit_price\": \"5.64465\",\n        \"line_total\": \"19,756.28\"\n      },\n      {\n        \"item\": \"Ink, Special WER\\nINK-10000 SPECIAL AG\",\n        \"required_qty\": \"4000\",\n        \"ship_qty\": \"1500\",\n        \"uom\": \"GA\",\n        \"unit_price\": \"3.52976\",\n        \"line_total\": \"5,294.64\"\n      }\n    ]\n  },\n  \"boxes\": {\n    \"bill_to\": [81, 170, 300, 232],\n    \"ship_to\": [622, 170, 840, 232],\n    \"invoice_date\": [704, 52, 839, 68],\n    \"invoice_number\": [704, 71, 858, 87],\n    \"vendor_name\": [32, 25, 544, 43],\n    \"po_number\": [114, 316, 229, 330],\n    \"order_date\": [570, 316, 684, 330],\n    \"order_number\": [839, 316, 952, 330],\n    \"fob\": [114, 368, 178, 383],\n    \"terms\": [707, 368, 821, 383],\n    \"freight\": [745, 849, 858, 864],\n    \"invoice_total\": [765, 909, 879, 925],\n    \"item\": [41, 423, 230, 438],\n    \"required_qty\": [515, 423, 559, 438],\n    \"ship_qty\": [596, 423, 639, 438],\n    \"uom\": [397, 423, 421, 438],\n    \"unit_price\": [752, 423, 807, 438],\n    \"line_total\": [889, 423, 956, 438]\n  }\n}"
+      }
+    }
+  ],
+  "created": 1779954506,
+  "model": "Qwen3.5-9B-UD-Q4_K_XL.gguf",
+  "system_fingerprint": "b9294-0f3cb3fc8",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 995,
+    "prompt_tokens": 2385,
+    "total_tokens": 3380,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "id": "chatcmpl-csg8kAgycTwaaxJ23SNa3tJMiVqcPVt7",
+  "timings": {
+    "cache_n": 0,
+    "prompt_n": 2385,
+    "prompt_ms": 7967.481,
+    "prompt_per_token_ms": 3.340662893081761,
+    "prompt_per_second": 299.341786946213,
+    "predicted_n": 995,
+    "predicted_ms": 26497.53,
+    "predicted_per_token_ms": 26.630683417085425,
+    "predicted_per_second": 37.55066981714899
+  }
+}

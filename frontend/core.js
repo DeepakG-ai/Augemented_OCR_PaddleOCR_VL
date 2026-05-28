@@ -86,10 +86,24 @@ async function apiFetch(path, opts = {}) {
         throw new Error('HTTP 401: not authenticated');
     }
     if (!res.ok) {
-        const b = await res.text();
-        let msg = b;
-        try { const j = JSON.parse(b); if (j.detail) msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail); } catch (_) {}
-        throw new Error(`HTTP ${res.status}: ${msg}`);
+        const bodyText = await res.text();
+        let payload = null;
+        try { payload = JSON.parse(bodyText); } catch (_) {}
+        const errorPayload = payload && payload.error
+            ? payload.error
+            : payload && payload.detail
+                ? payload.detail
+                : null;
+        const structured = errorPayload && typeof errorPayload === 'object' ? errorPayload : {};
+        const message = typeof errorPayload === 'string'
+            ? errorPayload
+            : structured.message || bodyText || res.statusText || `HTTP ${res.status}`;
+        const err = new Error(`HTTP ${res.status}: ${message}`);
+        err.status = res.status;
+        err.payload = payload;
+        err.error = structured;
+        err.body = bodyText;
+        throw err;
     }
     return res;
 }
@@ -191,7 +205,9 @@ async function router() {
     // Update nav active state
     document.querySelectorAll('.nav-tab').forEach(t => {
         t.classList.remove('active');
-        if (t.dataset.route && route.startsWith(t.dataset.route)) t.classList.add('active');
+        const r = t.dataset.route;
+        if (r === '/admin/users' && route === '/admin/api-keys') t.classList.add('active');
+        else if (r && route.startsWith(r)) t.classList.add('active');
     });
 
     if (route === '/login') {
@@ -220,7 +236,7 @@ async function router() {
         await renderMapperPage(app);
     } else if (route === '/history') {
         app.className = 'app';
-        await renderHistoryPage(app);
+        await renderHistoryPage(app, 1);
     } else if (route === '/dashboard') {
         app.className = 'app';
         await renderDashboardPage(app);
@@ -310,7 +326,6 @@ function headerHTML() {
             <a class="nav-tab" data-route="/dashboard" href="#/dashboard">Dashboard</a>
             <a class="nav-tab" data-route="/settings" href="#/settings">Settings</a>
             ${isAdmin ? `<a class="nav-tab" data-route="/admin/users" href="#/admin/users">Users</a>` : ''}
-            ${isAdmin ? `<a class="nav-tab" data-route="/admin/api-keys" href="#/admin/api-keys">API Keys</a>` : ''}
             ${isAdmin ? `<a class="nav-tab" data-route="/admin/corrections" href="#/admin/corrections">Saved Regions</a>` : ''}
         </nav>
         <div class="header-right">
@@ -332,6 +347,7 @@ function updateNavActive() {
         const r = t.dataset.route;
         if (r === '/vendors' && (route === '/' || route === '/vendors')) t.classList.add('active');
         else if (r === '/dashboard' && route.startsWith('/admin/client/')) t.classList.add('active');
+        else if (r === '/admin/users' && route === '/admin/api-keys') t.classList.add('active');
         else if (r && route.startsWith(r)) t.classList.add('active');
     });
 }

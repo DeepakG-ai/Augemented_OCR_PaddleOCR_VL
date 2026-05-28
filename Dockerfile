@@ -17,11 +17,13 @@ COPY backend/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r /tmp/requirements.txt
 
-ARG PADDLEOCR_PREWARM=1
-RUN if [ "$PADDLEOCR_PREWARM" = "1" ]; then \
-      python -c "import numpy as np; from paddleocr import PaddleOCR; ocr = PaddleOCR(text_detection_model_name='PP-OCRv5_mobile_det', text_recognition_model_name='PP-OCRv5_mobile_rec', use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False, device='cpu', enable_mkldnn=True, cpu_threads=4, return_word_box=True); img = np.full((96, 320, 3), 255, dtype=np.uint8); ocr.predict(img); print('PaddleOCR models prewarmed')" ; \
-    fi
+# Pre-download PaddleOCR models AND run a dummy inference to warm CUDA/MKL JIT caches at build time
+RUN python -c "import numpy as np; from paddleocr import PaddleOCR; ocr = PaddleOCR(text_detection_model_name='PP-OCRv5_mobile_det', text_recognition_model_name='PP-OCRv5_mobile_rec', use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False, device='cpu', enable_mkldnn=True, cpu_threads=4, return_word_box=True); img = np.full((96, 320, 3), 255, dtype=np.uint8); ocr.predict(img); print('PaddleOCR models prewarmed')" \
+    && rm -rf /root/.cache/pip
 
 COPY . /app
 
 EXPOSE 8000
+
+# Default entrypoint for standalone runs (e.g. AWS ECS)
+CMD ["python", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]

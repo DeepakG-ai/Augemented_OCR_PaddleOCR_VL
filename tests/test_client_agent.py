@@ -22,7 +22,7 @@ from datetime import UTC, datetime, timedelta
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -42,6 +42,32 @@ def _mock_response(status_code: int, body: dict | None = None) -> MagicMock:
     resp.json.return_value = body or {}
     resp.text = json.dumps(body or {})
     return resp
+
+
+def _fixed_datetime(now: datetime):
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+
+    return FixedDateTime
+
+
+# ---------------------------------------------------------------------------
+# App path resolution
+# ---------------------------------------------------------------------------
+
+class AppDirTests(unittest.TestCase):
+
+    def test_app_dir_uses_source_folder_when_not_frozen(self):
+        with patch.object(ca.sys, "frozen", False, create=True):
+            self.assertEqual(ca._app_dir(), Path(ca.__file__).resolve().parent)
+
+    def test_app_dir_uses_exe_folder_when_frozen(self):
+        exe = str(ROOT / "client" / "dist" / "augocr-agent.exe")
+        with patch.object(ca.sys, "frozen", True, create=True), \
+             patch.object(ca.sys, "executable", exe):
+            self.assertEqual(ca._app_dir(), Path(exe).resolve().parent)
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +360,49 @@ class IterSseTests(unittest.TestCase):
     def test_empty_stream_yields_nothing(self):
         resp = self._make_response([])
         self.assertEqual(list(ca._iter_sse(resp)), [])
+
+
+# ---------------------------------------------------------------------------
+# _ScheduleState()
+# ---------------------------------------------------------------------------
+
+class ScheduleStateTests(unittest.TestCase):
+
+    def test_schedule_not_due_before_configured_time(self):
+        now = datetime(2026, 5, 27, 16, 20, tzinfo=UTC)
+        state = ca._ScheduleState()
+        with patch.object(ca, "datetime", _fixed_datetime(now)):
+            state.update_from_server([
+                {"id": 1, "enabled": True, "utc_hour": 16, "utc_minute": 30}
+            ])
+            self.assertEqual(state.claim_due(), ("none", []))
+            self.assertEqual(state.next_fire_time(), datetime(2026, 5, 27, 16, 30, tzinfo=UTC))
+
+    def test_schedule_due_at_configured_time(self):
+        now = datetime(2026, 5, 27, 16, 30, 5, tzinfo=UTC)
+        state = ca._ScheduleState()
+        with patch.object(ca, "datetime", _fixed_datetime(now)):
+            state.update_from_server([
+                {"id": 1, "enabled": True, "utc_hour": 16, "utc_minute": 30}
+            ])
+            self.assertEqual(state.claim_due(), ("start", [1]))
+            state.finish_batch()
+            self.assertEqual(state.claim_due(), ("none", []))
+
+    def test_last_ran_prevents_same_slot_from_running_again(self):
+        now = datetime(2026, 5, 27, 16, 40, tzinfo=UTC)
+        state = ca._ScheduleState()
+        with patch.object(ca, "datetime", _fixed_datetime(now)):
+            state.update_from_server([
+                {
+                    "id": 1,
+                    "enabled": True,
+                    "utc_hour": 16,
+                    "utc_minute": 30,
+                    "last_ran_at": "2026-05-27T16:31:00+00:00",
+                }
+            ])
+            self.assertEqual(state.claim_due(), ("none", []))
 
 
 # ---------------------------------------------------------------------------

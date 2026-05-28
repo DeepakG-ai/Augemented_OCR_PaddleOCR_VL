@@ -63,11 +63,18 @@ from .models import (
     JobOut,
     JobStatusOut,
     LoginRequest,
+    SubscriptionCreate,
+    SubscriptionOut,
     TemplateSaveResponse,
     TemplateCreate,
     TemplateListOut,
     TemplateOut,
     TokenOut,
+    TopupCreate,
+    TopupOut,
+    TopupRequestCreate,
+    TopupRequestOut,
+    TopupRequestResolve,
     UserCreate,
     UserOut,
     UserResetPassword,
@@ -77,10 +84,7 @@ from .models import (
     VendorOut,
 )
 from .object_store import ARTIFACTS_BUCKET, DOCUMENTS_BUCKET, get_store
-from .scheduler import (
-    init_scheduler, shutdown_scheduler, sync_job, remove_job,
-    get_next_run_times, reload_all_schedules, set_context,
-)
+from .scheduler import compute_next_run
 from .mlflow_tracing import (
     setup_mlflow,
     get_current_context,
@@ -104,6 +108,18 @@ from .config import PIPELINE_LOG_DIR
 
 from pydantic import BaseModel
 
+# DB connection error classes for clean 503 mapping.
+# Imported defensively so the app can start even if asyncpg isn't installed.
+try:
+    import asyncpg as _asyncpg
+    _DB_CONNECTION_ERRORS: tuple = (
+        _asyncpg.PostgresConnectionError,
+        _asyncpg.TooManyConnectionsError,
+        _asyncpg.exceptions.ConnectionDoesNotExistError,
+    )
+except (ImportError, AttributeError):
+    _DB_CONNECTION_ERRORS = ()
+
 
 class ScheduleCreate(BaseModel):
     cron_expr: str
@@ -124,14 +140,17 @@ logger = logging.getLogger(__name__)
 
 
 async def render_page_1_for_detection(file_bytes: bytes, filename: str) -> list[dict]:
-    """
-    Renders the first page of the file for vendor detection.
-    """
-    filename_lower = filename.lower()
-    if filename_lower.endswith(".pdf"):
-        return await processor.pdf_to_images(file_bytes, max_pages=1)
-    else:
-        return await processor.image_file_to_b64(file_bytes)
+    """Renders the first page of an uploaded PDF for vendor detection.
+
+    All upstream callers run `_require_pdf` first, so non-PDFs cannot reach
+    this function in normal operation. The assertion here is a safety net for
+    new code paths that forget the guard."""
+    if not filename.lower().endswith(".pdf") or not file_bytes.startswith(b"%PDF"):
+        raise ValueError(
+            f"render_page_1_for_detection received non-PDF: '{filename}'. "
+            "Caller must invoke _require_pdf before reaching this function."
+        )
+    return await processor.pdf_to_images(file_bytes, max_pages=1)
 
 
 # -- Config SSE state -------------------------------------------------------
@@ -150,7 +169,21 @@ def _broadcast_config_event(user_id: str, data: dict) -> None:
             pass
 
 
-async def _folder_ingest_callback(user_id: str, pdf_path: str) -> None:
+def _folder_ingest_result(ok: bool, pdf_path: str, reason: str | None = None, **extra) -> dict:
+    result = {"ok": ok, "path": pdf_path}
+    if reason:
+        result["reason"] = reason
+    result.update(extra)
+    return result
+
+
+def _folder_ingest_error(user_id: str, pdf_path: str, reason: str, **extra) -> dict:
+    payload = {"type": "folder_ingest_error", "path": pdf_path, "reason": reason, **extra}
+    _broadcast_config_event(user_id, payload)
+    return _folder_ingest_result(False, pdf_path, reason, **extra)
+
+
+async def _folder_ingest_callback(user_id: str, pdf_path: str) -> dict:
     """Called by the watchdog thread (via asyncio bridge) when a new PDF lands."""
     # app is defined at module level after the routes section; access via the
     # global name — safe because this only runs after startup.
@@ -160,7 +193,7 @@ async def _folder_ingest_callback(user_id: str, pdf_path: str) -> None:
         import pathlib
         path = pathlib.Path(pdf_path)
         if not path.is_file():
-            return
+            return _folder_ingest_result(False, pdf_path, "file_not_found")
         file_bytes = path.read_bytes()
         filename = path.name
 
@@ -170,43 +203,40 @@ async def _folder_ingest_callback(user_id: str, pdf_path: str) -> None:
                 pdf_page_count = processor.count_pdf_pages(file_bytes)
             except ValueError:
                 logger.warning("folder_ingest: unreadable PDF path=%s", pdf_path)
-                _broadcast_config_event(user_id, {
-                    "type": "folder_ingest_error",
-                    "path": pdf_path,
-                    "reason": "unreadable_pdf",
-                })
-                return
+                return _folder_ingest_error(user_id, pdf_path, "unreadable_pdf")
             if pdf_page_count > MAX_DOCUMENT_PAGES:
                 logger.warning(
                     "folder_ingest: PDF too large (%d pages, max %d) path=%s",
                     pdf_page_count, MAX_DOCUMENT_PAGES, pdf_path,
                 )
-                _broadcast_config_event(user_id, {
-                    "type": "folder_ingest_error",
-                    "path": pdf_path,
-                    "reason": "document_too_large",
-                    "pages": pdf_page_count,
-                    "max_pages": MAX_DOCUMENT_PAGES,
-                })
-                return
+                return _folder_ingest_error(
+                    user_id,
+                    pdf_path,
+                    "document_too_large",
+                    pages=pdf_page_count,
+                    max_pages=MAX_DOCUMENT_PAGES,
+                )
         else:
             pdf_page_count = 1
 
         # Quota reservation — atomic, same as /ingest/ui
-        quota = await db_mod.reserve_quota(pool, user_id, pdf_page_count)
+        try:
+            quota = await db_mod.reserve_quota(pool, user_id, pdf_page_count)
+        except Exception as exc:
+            logger.exception("folder_ingest: quota check failed user=%s path=%s", user_id, pdf_path)
+            return _folder_ingest_error(user_id, pdf_path, "quota_check_failed", error=str(exc))
         if not quota["allowed"]:
             logger.warning(
                 "folder_ingest: quota exceeded user=%s used=%d limit=%d incoming=%d",
                 user_id, quota["used"], quota["limit"], pdf_page_count,
             )
-            _broadcast_config_event(user_id, {
-                "type": "folder_ingest_error",
-                "path": pdf_path,
-                "reason": "quota_exceeded",
-                "used": quota["used"],
-                "limit": quota["limit"],
-            })
-            return
+            return _folder_ingest_error(
+                user_id,
+                pdf_path,
+                "quota_exceeded",
+                used=quota["used"],
+                limit=quota["limit"],
+            )
 
         # Lazy imports to avoid circular import at module load time.
         from . import geometry as geo_mod
@@ -219,7 +249,7 @@ async def _folder_ingest_callback(user_id: str, pdf_path: str) -> None:
             rendered = await render_page_1_for_detection(file_bytes, filename)
             if not rendered:
                 logger.warning("folder_ingest: no pages rendered path=%s", pdf_path)
-                return
+                return _folder_ingest_error(user_id, pdf_path, "no_pages_rendered")
             page1 = rendered[0]
             page1_meta = {"page_number": 1, "width": page1.get("width", 0), "height": page1.get("height", 0)}
             geo_pages = geo_mod.compute_pdf_geometry(file_bytes, [page1_meta])
@@ -230,28 +260,26 @@ async def _folder_ingest_callback(user_id: str, pdf_path: str) -> None:
                     "image_b64": page1["image_b64"],
                     "mime_type": page1.get("mime_type", "image/jpeg"),
                 }])
-                page_words = ocr_pages[0].get("words", []) if ocr_pages else []
+                ocr_page = ocr_pages[0] if ocr_pages else {}
+                if ocr_page.get("_ocr_error"):
+                    return _folder_ingest_error(
+                        user_id,
+                        pdf_path,
+                        "ocr_failed",
+                        page=ocr_page.get("page_number", 1),
+                        error=ocr_page.get("_ocr_error"),
+                    )
+                page_words = ocr_page.get("words", [])
 
             match = await vd_mod.detect_vendor(pool, page_words, user_id=user_id)
             if match is None:
                 logger.warning("folder_ingest: vendor not detected path=%s user=%s", pdf_path, user_id)
-                _broadcast_config_event(user_id, {
-                    "type": "folder_ingest_error",
-                    "path": pdf_path,
-                    "reason": "vendor_not_detected",
-                })
-                return
+                return _folder_ingest_error(user_id, pdf_path, "vendor_not_detected")
 
             tmpl = await db_mod.get_template(pool, match.vendor_id)
             if not tmpl:
                 logger.warning("folder_ingest: no template for vendor=%s", match.vendor_id)
-                _broadcast_config_event(user_id, {
-                    "type": "folder_ingest_error",
-                    "path": pdf_path,
-                    "reason": "no_template",
-                    "vendor_id": match.vendor_id,
-                })
-                return
+                return _folder_ingest_error(user_id, pdf_path, "no_template", vendor_id=match.vendor_id)
 
             # Whoever logins (owns the watcher), bill to them.
             billing_user_id = user_id
@@ -275,8 +303,14 @@ async def _folder_ingest_callback(user_id: str, pdf_path: str) -> None:
             if not _job_submitted:
                 try:
                     await db_mod.release_quota_reservation(pool, user_id, pdf_page_count)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning(
+                        "folder_ingest: quota release failed user=%s path=%s pages=%s: %s",
+                        user_id,
+                        pdf_path,
+                        pdf_page_count,
+                        exc,
+                    )
         _broadcast_config_event(user_id, {
             "type": "folder_ingest_started",
             "path": pdf_path,
@@ -289,13 +323,17 @@ async def _folder_ingest_callback(user_id: str, pdf_path: str) -> None:
             "folder_ingest: queued path=%s vendor=%s job=%s",
             pdf_path, match.vendor_id, result["job"]["id"],
         )
+        return _folder_ingest_result(
+            True,
+            pdf_path,
+            vendor_id=match.vendor_id,
+            vendor_name=match.vendor_name,
+            job_id=result["job"]["id"],
+            extraction_id=result["extraction"]["id"],
+        )
     except Exception as exc:
         logger.exception("folder_ingest: unexpected error path=%s: %s", pdf_path, exc)
-        _broadcast_config_event(user_id, {
-            "type": "folder_ingest_error",
-            "path": pdf_path,
-            "reason": str(exc),
-        })
+        return _folder_ingest_error(user_id, pdf_path, "ingest_error", error=str(exc))
 
 
 async def _reconfigure_user_watcher(app_ref, user_id: str) -> None:
@@ -399,14 +437,8 @@ async def lifespan(app: FastAPI):
                 except Exception as exc:
                     logger.warning("Failed to bootstrap admin user %s: %s", admin_email, exc)
 
-    # Folder watchers are disabled
+    # Folder watchers are disabled — the client agent handles folder scanning
     app.state.watcher_mgr = None
-
-    # Start APScheduler
-    from .config import DATABASE_URL as _DB_URL
-    await init_scheduler(_DB_URL)
-    set_context(app.state.pool, _folder_ingest_callback)
-    await reload_all_schedules(app.state.pool)
 
     # Suppress uvicorn access log noise for high-frequency polling routes
     # (heartbeat, config-poll, scheduler-poll). Errors/warnings still surface.
@@ -426,7 +458,6 @@ async def lifespan(app: FastAPI):
     logger.info("DB pool, object store, and MLflow ready")
     yield
     logger.info("Shutting down -- closing connections")
-    shutdown_scheduler()
     if getattr(app.state, "watcher_mgr", None):
         app.state.watcher_mgr.stop_all()
     await app.state.pool.close()
@@ -437,6 +468,28 @@ async def lifespan(app: FastAPI):
 def _guess_mime_type(filename: str) -> str:
     guessed, _ = mimetypes.guess_type(filename)
     return guessed or "application/octet-stream"
+
+
+def _require_pdf(filename: str, file_bytes: bytes) -> None:
+    """Hard-block any upload that isn't a real PDF.
+
+    Checks both the extension and the magic bytes (%PDF) so a renamed
+    .docx/.csv/.xlsx can't sneak through. Raises 415 with a clear message
+    listing what's allowed."""
+    name = (filename or "").strip().lower()
+    if not name.endswith(".pdf") or not file_bytes.startswith(b"%PDF"):
+        raise HTTPException(
+            status_code=415,
+            detail={
+                "code": "UNSUPPORTED_FILE_TYPE",
+                "message": (
+                    f"Only PDF files are accepted. '{filename or 'unknown'}' "
+                    "was rejected. Word (.docx), Excel (.xlsx), CSV and other "
+                    "formats are not supported — please upload a .pdf."
+                ),
+                "allowed_extensions": [".pdf"],
+            },
+        )
 
 
 async def _load_page_payloads(pool, extraction_id: int) -> list[dict]:
@@ -564,7 +617,9 @@ def _peek_user(request: Request) -> str:
     """Best-effort caller id for the access line — no DB, never raises."""
     try:
         auth = request.headers.get("authorization", "")
-        raw = auth[7:] if auth.lower().startswith("bearer ") else request.query_params.get("token")
+        if not auth.lower().startswith("bearer "):
+            return "-"
+        raw = auth[7:]
         if not raw:
             return "-"
         from .auth import decode_token
@@ -675,7 +730,12 @@ def _error_body(status: int, detail) -> dict:
     if isinstance(detail, dict):
         # Already structured — promote to top-level error object as-is.
         # Callers must include at least 'code' and 'message'.
-        error = detail
+        error = dict(detail)
+        error.setdefault("code", _HTTP_CODE_NAMES.get(status, "ERROR"))
+        error.setdefault(
+            "message",
+            str(error.get("hint") or error.get("reason") or _HTTP_CODE_NAMES.get(status, "ERROR")),
+        )
     else:
         error = {
             "code": _HTTP_CODE_NAMES.get(status, "ERROR"),
@@ -693,6 +753,28 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     )
 
 
+def _serialisable_validation_errors(exc: RequestValidationError) -> list:
+    """Return Pydantic v2 error dicts with all values JSON-serialisable.
+
+    Pydantic v2 field_validator errors include ctx={'error': <ExceptionInstance>}
+    which is not JSON-serialisable.  Convert any Exception in ctx to its str()
+    representation so JSONResponse can encode the payload without crashing.
+
+    Note: FastAPI's RequestValidationError.errors() does not accept keyword
+    arguments — call it bare and sanitise the result ourselves.
+    """
+    safe: list[dict] = []
+    for err in exc.errors():
+        err_copy = dict(err)
+        if "ctx" in err_copy and isinstance(err_copy["ctx"], dict):
+            err_copy["ctx"] = {
+                k: str(v) if isinstance(v, Exception) else v
+                for k, v in err_copy["ctx"].items()
+            }
+        safe.append(err_copy)
+    return safe
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     return JSONResponse(
@@ -701,7 +783,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "error": {
                 "code": "VALIDATION_ERROR",
                 "message": "Request validation failed",
-                "fields": exc.errors(),
+                "fields": _serialisable_validation_errors(exc),
             }
         },
     )
@@ -722,6 +804,34 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+    # Map DB connection/pool failures to a clean 503 before falling through to 500.
+    if _DB_CONNECTION_ERRORS and isinstance(exc, _DB_CONNECTION_ERRORS):
+        logger.error(
+            "DB connection unavailable %s %s: %s",
+            request.method, request.url.path, type(exc).__name__,
+        )
+        request.state.err_reason = "DATABASE_UNAVAILABLE"
+        return JSONResponse(
+            status_code=503,
+            content={"error": {
+                "code": "DATABASE_UNAVAILABLE",
+                "message": "Service temporarily unavailable. Please retry.",
+            }},
+        )
+    from .ocr_runner import OCRUnavailable
+    if isinstance(exc, OCRUnavailable):
+        logger.error(
+            "PaddleOCR unavailable %s %s: %s",
+            request.method, request.url.path, exc,
+        )
+        request.state.err_reason = "OCR_UNAVAILABLE"
+        return JSONResponse(
+            status_code=503,
+            content={"error": {
+                "code": "OCR_UNAVAILABLE",
+                "message": "PaddleOCR is temporarily unavailable. Please retry.",
+            }},
+        )
     ref = plog.error(
         f"{request.method} {request.url.path}",
         exc=exc, logger="api",
@@ -792,6 +902,7 @@ async def login(request: Request, body: LoginRequest):
             email=user["email"],
             role=user["role"],
             is_active=user.get("is_active", True),
+            subscription_limit=user.get("subscription_limit", 0),
             created_at=user.get("created_at"),
         ),
     )
@@ -809,6 +920,7 @@ async def auth_me(request: Request, user: dict = Depends(get_current_user)):
         email=record["email"],
         role=record["role"],
         is_active=record.get("is_active", True),
+        subscription_limit=record.get("subscription_limit", 0),
         created_at=record.get("created_at"),
     )
 
@@ -831,18 +943,50 @@ async def get_my_usage(request: Request, user: dict = Depends(get_current_user))
 @app.get("/admin/users", response_model=list[UserOut])
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def admin_list_users(request: Request, user: dict = Depends(require_admin)):
-    rows = await db_mod.list_users(request.app.state.pool)
-    return [
-        UserOut(
+    pool = request.app.state.pool
+    await db_mod.expire_due_subscriptions(pool)
+    rows = await db_mod.list_users(pool)
+    out: list[UserOut] = []
+    for r in rows:
+        pending = r.get("pending_pages") or 0
+        if r.get("sub_id") is not None:
+            base_limit = r.get("base_limit") or 0
+            topup_total = r.get("topup_total") or 0
+            effective_limit = base_limit + topup_total
+            used = r.get("used") or 0
+            remaining = max(effective_limit - used - pending, 0)
+            
+            period_fields = {
+                "period_start": r.get("period_start"),
+                "period_end": r.get("period_end"),
+                "base_limit": base_limit,
+                "topup_total": topup_total,
+                "effective_limit": effective_limit,
+                "pages_used": used,
+                "pages_remaining": remaining,
+                "period_status": "active",
+            }
+        else:
+            period_fields = {
+                "period_start": None,
+                "period_end": None,
+                "base_limit": 0,
+                "topup_total": 0,
+                "effective_limit": 0,
+                "pages_used": 0,
+                "pages_remaining": 0,
+                "period_status": "none",
+            }
+        out.append(UserOut(
             id=str(r["id"]),
             email=r["email"],
             role=r["role"],
             is_active=r.get("is_active", True),
             subscription_limit=r.get("subscription_limit", 0),
             created_at=r.get("created_at"),
-        )
-        for r in rows
-    ]
+            **period_fields,
+        ))
+    return out
 
 
 @app.post("/admin/users", response_model=UserOut, status_code=201)
@@ -973,6 +1117,301 @@ async def admin_update_subscription_limit(
     return {"status": "updated", "user_id": user_id, "subscription_limit": new_limit}
 
 
+# -- Admin: Subscriptions & Top-ups -----------------------------------------
+
+@app.get("/admin/users/{user_id}/subscription")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_get_subscription(
+    request: Request,
+    user_id: str,
+    user: dict = Depends(require_admin),
+):
+    """Return the user's current active subscription with usage details, or
+    a 'none' shape if none exists."""
+    pool = request.app.state.pool
+    target = await db_mod.get_user_by_id(pool, user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    quota = await db_mod.get_user_quota_v2(pool, user_id)
+    return {
+        "user_id": user_id,
+        "email": target["email"],
+        **quota,
+    }
+
+
+@app.post("/admin/users/{user_id}/subscriptions", status_code=201)
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_create_subscription(
+    request: Request,
+    user_id: str,
+    body: SubscriptionCreate,
+    user: dict = Depends(require_admin),
+):
+    """Create (or replace) the user's active subscription. The new row gets
+    status='active'; any prior active row is marked 'superseded' in the same
+    transaction. Period length is arbitrary — admin picks 1 month, 6 months,
+    1 year, or any custom range."""
+    from datetime import datetime as _dt, timezone as _tz
+
+    pool = request.app.state.pool
+    target = await db_mod.get_user_by_id(pool, user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    period_start = body.period_start or _dt.now(_tz.utc)
+    if body.period_end <= period_start:
+        raise HTTPException(
+            status_code=400,
+            detail="period_end must be after period_start",
+        )
+
+    try:
+        sub = await db_mod.create_subscription(
+            pool,
+            user_id=user_id,
+            page_limit=body.page_limit,
+            period_start=period_start,
+            period_end=body.period_end,
+            note=body.note,
+            created_by=user["id"],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not sub:
+        raise HTTPException(status_code=404, detail="User not found")
+    logger.info(
+        "Admin %s created subscription %d for user %s: %d pages, %s → %s",
+        user["id"], sub["id"], user_id, body.page_limit,
+        period_start.isoformat(), body.period_end.isoformat(),
+    )
+    return sub
+
+
+@app.patch("/admin/users/{user_id}/subscriptions/{subscription_id}/cancel")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_cancel_subscription(
+    request: Request,
+    user_id: str,
+    subscription_id: int,
+    user: dict = Depends(require_admin),
+):
+    """Cancel an active subscription. After cancellation the user has no
+    active subscription, so further uploads are blocked until a new period
+    is created."""
+    pool = request.app.state.pool
+    ok = await db_mod.cancel_subscription(pool, user_id, subscription_id)
+    if not ok:
+        raise HTTPException(
+            status_code=404,
+            detail="Active subscription not found for this user",
+        )
+    logger.info("Admin %s cancelled subscription %d for user %s",
+                user["id"], subscription_id, user_id)
+    return {"status": "cancelled", "user_id": user_id, "subscription_id": subscription_id}
+
+
+@app.post("/admin/users/{user_id}/topups", status_code=201)
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_add_topup(
+    request: Request,
+    user_id: str,
+    body: TopupCreate,
+    user: dict = Depends(require_admin),
+):
+    """Grant extra pages to the user's CURRENT active subscription. These
+    pages vanish when the subscription period ends, same as the base."""
+    pool = request.app.state.pool
+    target = await db_mod.get_user_by_id(pool, user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    try:
+        topup = await db_mod.add_topup(
+            pool,
+            user_id=user_id,
+            pages=body.pages,
+            note=body.note,
+            created_by=user["id"],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not topup:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "User has no active subscription. Create a subscription period "
+                "before adding top-ups."
+            ),
+        )
+    logger.info(
+        "Admin %s added %d-page top-up to user %s (subscription %d)",
+        user["id"], body.pages, user_id, topup["subscription_id"],
+    )
+    return topup
+
+
+@app.get("/admin/users/{user_id}/history")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_get_user_history(
+    request: Request,
+    user_id: str,
+    user: dict = Depends(require_admin),
+):
+    """Full subscription + top-up history for a single user, used by the
+    'View History' modal in the admin UI."""
+    pool = request.app.state.pool
+    target = await db_mod.get_user_by_id(pool, user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    history = await db_mod.get_user_history(pool, user_id)
+    return {
+        "user_id": user_id,
+        "email": target["email"],
+        **history,
+    }
+
+
+# -- Top-up Requests ---------------------------------------------------------
+
+@app.post("/me/topup-requests", status_code=201)
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def create_topup_request(
+    request: Request,
+    body: TopupRequestCreate,
+    user: dict = Depends(get_current_user),
+):
+    """User submits a top-up page request to the admin."""
+    if user.get("role") == "admin":
+        raise HTTPException(status_code=403, detail="Admins do not submit top-up requests")
+    pool = request.app.state.pool
+    req = await db_mod.create_topup_request(
+        pool,
+        user_id=user["id"],
+        requested_pages=body.requested_pages,
+        requested_period=body.requested_period,
+        note=body.note,
+    )
+    logger.info(
+        "User %s submitted topup request: %d pages for %s",
+        user["id"], body.requested_pages, body.requested_period,
+    )
+    return req
+
+
+@app.get("/me/topup-requests")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def list_my_topup_requests(
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    """Return all top-up requests the calling user has submitted."""
+    pool = request.app.state.pool
+    reqs = await db_mod.list_topup_requests_for_user(pool, user["id"])
+    return reqs
+
+
+@app.get("/admin/topup-requests")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_list_topup_requests(
+    request: Request,
+    status: str | None = None,
+    user: dict = Depends(require_admin),
+):
+    """Admin: list all top-up requests, optionally filtered by status."""
+    pool = request.app.state.pool
+    reqs = await db_mod.list_topup_requests(pool, status=status)
+    return reqs
+
+
+@app.get("/admin/topup-requests/count")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_pending_topup_count(
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """Admin: return count of pending top-up requests (for notification badge)."""
+    pool = request.app.state.pool
+    count = await db_mod.get_pending_topup_request_count(pool)
+    return {"pending": count}
+
+
+@app.post("/admin/topup-requests/{request_id}/approve", status_code=200)
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_approve_topup_request(
+    request: Request,
+    request_id: int,
+    body: TopupRequestResolve,
+    user: dict = Depends(require_admin),
+):
+    """Admin: approve a pending top-up request and automatically apply the top-up."""
+    pool = request.app.state.pool
+    req = await db_mod.get_topup_request(pool, request_id)
+    if not req:
+        raise HTTPException(status_code=404, detail="Top-up request not found")
+    if req["status"] != "pending":
+        raise HTTPException(status_code=409, detail=f"Request is already {req['status']}")
+
+    # Apply the top-up to the user's active subscription
+    try:
+        topup = await db_mod.add_topup(
+            pool,
+            user_id=req["user_id"],
+            pages=req["requested_pages"],
+            note=f"Approved top-up request #{request_id}" + (f": {body.resolution_note}" if body.resolution_note else ""),
+            created_by=user["id"],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not topup:
+        raise HTTPException(
+            status_code=409,
+            detail="User has no active subscription. Create a subscription period before approving.",
+        )
+
+    resolved = await db_mod.resolve_topup_request(
+        pool,
+        request_id=request_id,
+        resolved_by=user["id"],
+        status="approved",
+        resolution_note=body.resolution_note,
+    )
+    logger.info(
+        "Admin %s approved topup request #%d for user %s (%d pages)",
+        user["id"], request_id, req["user_id"], req["requested_pages"],
+    )
+    return {"request": resolved, "topup": topup}
+
+
+@app.post("/admin/topup-requests/{request_id}/reject", status_code=200)
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_reject_topup_request(
+    request: Request,
+    request_id: int,
+    body: TopupRequestResolve,
+    user: dict = Depends(require_admin),
+):
+    """Admin: reject a pending top-up request."""
+    pool = request.app.state.pool
+    req = await db_mod.get_topup_request(pool, request_id)
+    if not req:
+        raise HTTPException(status_code=404, detail="Top-up request not found")
+    if req["status"] != "pending":
+        raise HTTPException(status_code=409, detail=f"Request is already {req['status']}")
+
+    resolved = await db_mod.resolve_topup_request(
+        pool,
+        request_id=request_id,
+        resolved_by=user["id"],
+        status="rejected",
+        resolution_note=body.resolution_note,
+    )
+    logger.info(
+        "Admin %s rejected topup request #%d for user %s",
+        user["id"], request_id, req["user_id"],
+    )
+    return resolved
+
+
 # -- Admin: API Key Management -----------------------------------------------
 
 @app.post("/admin/api-keys", status_code=201)
@@ -1061,6 +1500,8 @@ async def admin_list_api_keys(
             prefix=r["prefix"],
             is_active=r.get("is_active", True),
             owner_email=r.get("owner_email"),
+            total_input_tokens=int(r.get("total_input_tokens") or 0),
+            total_output_tokens=int(r.get("total_output_tokens") or 0),
             total_tokens=int(r.get("total_tokens") or 0),
             total_documents=int(r.get("total_documents") or 0),
             total_pages=int(r.get("total_pages") or 0),
@@ -1258,6 +1699,7 @@ async def detect_vendor_endpoint(
     pool = request.app.state.pool
     file_bytes = await file.read()
     filename = (file.filename or "unknown").lower()
+    _require_pdf(filename, file_bytes)
 
     # Render page 1 only
     rendered = await render_page_1_for_detection(file_bytes, filename)
@@ -1566,6 +2008,102 @@ async def save_template(
         raise
 
 
+# -- Output Schemas ---------------------------------------------------------
+
+@app.get("/schemas")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def list_schemas(request: Request, user: dict = Depends(get_current_user)):
+    """List all output schemas (any authenticated user — needed for mapper dropdown)."""
+    schemas = await db_mod.get_all_schemas(request.app.state.pool)
+    return schemas
+
+
+@app.post("/schemas")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def create_schema(
+    request: Request,
+    body: dict = Body(...),
+    user: dict = Depends(require_admin),
+):
+    """Create a new output schema (admin only)."""
+    name = (body.get("name") or "").strip()
+    header_fields = body.get("header_fields") or []
+    line_fields = body.get("line_fields") or []
+    if not name:
+        raise HTTPException(400, detail="name is required")
+    if not isinstance(header_fields, list) or not isinstance(line_fields, list):
+        raise HTTPException(400, detail="header_fields and line_fields must be arrays")
+    try:
+        schema = await db_mod.create_schema(
+            request.app.state.pool,
+            name=name,
+            header_fields=[str(f) for f in header_fields],
+            line_fields=[str(f) for f in line_fields],
+        )
+    except Exception as exc:
+        raise HTTPException(400, detail=str(exc))
+    return schema
+
+
+@app.put("/schemas/{schema_id}")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def update_schema(
+    request: Request,
+    schema_id: int,
+    body: dict = Body(...),
+    user: dict = Depends(require_admin),
+):
+    """Edit a schema's name and fields; commits a new snapshot (admin only)."""
+    name = (body.get("name") or "").strip()
+    header_fields = body.get("header_fields") or []
+    line_fields = body.get("line_fields") or []
+    if not name:
+        raise HTTPException(400, detail="name is required")
+    if not isinstance(header_fields, list) or not isinstance(line_fields, list):
+        raise HTTPException(400, detail="header_fields and line_fields must be arrays")
+    try:
+        schema = await db_mod.update_schema(
+            request.app.state.pool,
+            schema_id,
+            name=name,
+            header_fields=[str(f) for f in header_fields],
+            line_fields=[str(f) for f in line_fields],
+        )
+    except ValueError as exc:
+        raise HTTPException(404, detail=str(exc))
+    return schema
+
+
+@app.delete("/schemas/{schema_id}")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def delete_schema(
+    request: Request,
+    schema_id: int,
+    user: dict = Depends(require_admin),
+):
+    """Delete a non-system schema (admin only)."""
+    try:
+        await db_mod.delete_schema(request.app.state.pool, schema_id)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
+    return {"status": "ok"}
+
+
+@app.post("/schemas/{schema_id}/reset")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def reset_schema(
+    request: Request,
+    schema_id: int,
+    user: dict = Depends(require_admin),
+):
+    """Restore a schema's fields from the last-saved snapshot (admin only)."""
+    try:
+        schema = await db_mod.reset_schema(request.app.state.pool, schema_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail=str(exc))
+    return schema
+
+
 # -- ERP Field Mapping -----------------------------------------------------
 
 @app.get("/vendors/{vendor_id}/mapping")
@@ -1573,21 +2111,40 @@ async def save_template(
 async def get_vendor_mapping(
     request: Request, vendor_id: str, user: dict = Depends(get_current_user),
 ):
-    """Return the ERP field mapping for a vendor plus the canonical targets."""
+    """Return the ERP field mapping for a vendor plus the assigned schema targets."""
     pool = request.app.state.pool
     await assert_vendor_access(pool, vendor_id, user)
     from . import field_mapper as _fm
 
     tmpl = await db_mod.get_template(pool, vendor_id)
     mapping = await db_mod.get_field_mapping(pool, vendor_id)
+    all_schemas = await db_mod.get_all_schemas(pool)
+
+    # Resolve schema: use assigned, or fall back to AP Automation (first system schema)
+    schema_id = (mapping or {}).get("schema_id")
+    schema = None
+    if schema_id:
+        schema = next((s for s in all_schemas if s["id"] == schema_id), None)
+    if not schema:
+        schema = next((s for s in all_schemas if s["slug"] == "ap_automation"), None)
+    if not schema and all_schemas:
+        schema = all_schemas[0]
+
     return {
         "vendor_id": vendor_id,
         "template_id": (tmpl or {}).get("id"),
         "has_template": tmpl is not None,
         "source_header_fields": (tmpl or {}).get("header_fields") or [],
         "source_line_fields": (tmpl or {}).get("line_item_fields") or [],
-        "target_header_fields": _fm.HEADER_TARGETS,
-        "target_line_fields": _fm.LINE_TARGETS,
+        "target_header_fields": (schema or {}).get("header_fields") or _fm.HEADER_TARGETS,
+        "target_line_fields": (schema or {}).get("line_fields") or _fm.LINE_TARGETS,
+        "schema_id": (schema or {}).get("id"),
+        "schema_name": (schema or {}).get("name", "AP Automation"),
+        "schemas": [{"id": s["id"], "name": s["name"], "slug": s["slug"],
+                     "is_system": s["is_system"],
+                     "header_fields": s.get("header_fields") or [],
+                     "line_fields": s.get("line_fields") or []}
+                    for s in all_schemas],
         "header_map": (mapping or {}).get("header_map") or {},
         "line_map": (mapping or {}).get("line_map") or {},
         "pending_notices": (mapping or {}).get("pending_notices") or [],
@@ -1601,12 +2158,11 @@ async def save_vendor_mapping(
     request: Request,
     vendor_id: str,
     body: dict = Body(...),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(require_admin),
 ):
-    """Save (upsert) a vendor's ERP field mapping. One mapping per vendor."""
+    """Save (upsert) a vendor's ERP field mapping. Admin only."""
     pool = request.app.state.pool
     await assert_vendor_access(pool, vendor_id, user)
-    from . import field_mapper as _fm
 
     tmpl = await db_mod.get_template(pool, vendor_id)
     if not tmpl:
@@ -1620,23 +2176,40 @@ async def save_vendor_mapping(
     if not isinstance(header_map, dict) or not isinstance(line_map, dict):
         raise HTTPException(400, detail="header_map and line_map must be objects.")
 
-    # Keep only entries that point at a known canonical target field.
-    header_map = {str(k): v for k, v in header_map.items() if v in _fm.HEADER_TARGETS}
-    line_map = {str(k): v for k, v in line_map.items() if v in _fm.LINE_TARGETS}
+    # Resolve the assigned schema so we can validate target field names.
+    schema_id = body.get("schema_id")
+    if schema_id is not None:
+        schema_id = int(schema_id)
+    schema = None
+    if schema_id:
+        schema = await db_mod.get_schema_by_id(pool, schema_id)
+    if not schema:
+        schema = await db_mod.get_schema_by_slug(pool, "ap_automation")
+
+    header_targets = set((schema or {}).get("header_fields") or [])
+    line_targets = set((schema or {}).get("line_fields") or [])
+
+    # Keep only entries that point at a known target field in the selected schema.
+    header_map = {str(k): v for k, v in header_map.items()
+                  if not header_targets or v in header_targets}
+    line_map = {str(k): v for k, v in line_map.items()
+                if not line_targets or v in line_targets}
 
     existing = await db_mod.get_field_mapping(pool, vendor_id)
     saved = await db_mod.upsert_field_mapping(
         pool, vendor_id, tmpl["id"], header_map, line_map,
         tmpl.get("header_fields") or [], tmpl.get("line_item_fields") or [],
         (existing or {}).get("pending_notices") or [],
+        schema_id=(schema or {}).get("id"),
     )
     logger.info(
-        "ERP mapping saved: vendor=%s header=%d line=%d",
-        vendor_id, len(header_map), len(line_map),
+        "ERP mapping saved: vendor=%s schema=%s header=%d line=%d",
+        vendor_id, (schema or {}).get("name"), len(header_map), len(line_map),
     )
     return {
         "status": "ok",
         "vendor_id": vendor_id,
+        "schema_id": saved.get("schema_id"),
         "header_map": saved["header_map"],
         "line_map": saved["line_map"],
     }
@@ -1679,9 +2252,13 @@ async def get_vendor_mapping_sample(
     if not isinstance(doc, dict):
         return {"has_data": False}
 
-    header = {k: v for k, v in doc.items() if k != "line_items"}
+    # Strip leading-underscore meta keys (_page, _total_pages, _error) — these
+    # are internal merge bookkeeping, never mappable, must not show in the UI.
+    header = {k: v for k, v in doc.items()
+              if k != "line_items" and not k.startswith("_")}
     line_items = doc.get("line_items") or []
-    line_item = line_items[0] if line_items and isinstance(line_items[0], dict) else {}
+    raw_line_item = line_items[0] if line_items and isinstance(line_items[0], dict) else {}
+    line_item = {k: v for k, v in raw_line_item.items() if not k.startswith("_")}
     return {
         "has_data": True,
         "extraction_id": chosen.get("id"),
@@ -1780,6 +2357,7 @@ async def ingest_document(
         await assert_vendor_access(pool, vendor_id, user)
     file_bytes = await file.read()
     filename = file.filename or "unknown"
+    _require_pdf(filename, file_bytes)
     detected_vendor = None
     try:
         req_header = json.loads(header_fields) if header_fields else []
@@ -1891,6 +2469,19 @@ async def ingest_document(
                 "remaining": quota["remaining"],
             }
 
+    reservation_user_id = user["id"] if user.get("role") != "admin" else None
+    reservation_released = False
+
+    async def _release_reserved_quota_once() -> None:
+        nonlocal reservation_released
+        if not reservation_user_id or reservation_released:
+            return
+        try:
+            await db_mod.release_quota_reservation(pool, reservation_user_id, incoming_pages)
+        except Exception as exc:
+            logger.warning("quota release failed before job submission user=%s: %s", reservation_user_id, exc)
+        reservation_released = True
+
     logger.info("File received: %s (%d bytes, source=%s, vendor=%s)",
                 filename, len(file_bytes), source_type, vendor_id)
 
@@ -1916,17 +2507,27 @@ async def ingest_document(
                 from . import ocr_runner as _ocr
 
                 # Render page 1 only for detection
-                with plog.timed("render_p1") as t:
-                    rendered = await render_page_1_for_detection(file_bytes, filename)
+                try:
+                    with plog.timed("render_p1") as t:
+                        rendered = await render_page_1_for_detection(file_bytes, filename)
+                except HTTPException:
+                    await _release_reserved_quota_once()
+                    raise
+                except Exception as exc:
+                    await _release_reserved_quota_once()
+                    logger.warning("Vendor detection render failed for %s: %s", filename, exc)
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "code": "PDF_RENDER_FAILED",
+                            "message": "Could not render the first page for vendor detection.",
+                        },
+                    ) from exc
                 logger.info("Rendered page-1 for vendor detection (%d pages, %.0fms)", len(rendered), t["ms"])
 
                 if not rendered:
                     logger.warning("Vendor detection failed: no rendered pages")
-                    if user.get("role") != "admin":
-                        try:
-                            await db_mod.release_quota_reservation(pool, user["id"], incoming_pages)
-                        except Exception:
-                            pass
+                    await _release_reserved_quota_once()
                     raise HTTPException(400, detail="Could not render any pages from the uploaded file")
 
                 page1 = rendered[0]
@@ -1934,14 +2535,22 @@ async def ingest_document(
 
                 # Digital-first text extraction
                 if filename.lower().endswith(".pdf"):
-                    with plog.timed("geometry_p1") as t:
-                        geo_pages = _geo.compute_pdf_geometry(file_bytes, [page1_meta])
-                        geo_page = geo_pages[0] if geo_pages else {}
-                    logger.info("Page-1 text: source=%s, %d chars, %d words (%.0fms)",
-                                geo_page.get("source"), geo_page.get("char_count", 0),
-                                len(geo_page.get("words", []) or []), t["ms"])
-                    page_words = geo_pages[0].get("words", []) if geo_pages else []
-                    page_source = (geo_pages[0].get("source") if geo_pages else None) or "paddleocr"
+                    try:
+                        with plog.timed("geometry_p1") as t:
+                            geo_pages = _geo.compute_pdf_geometry(file_bytes, [page1_meta])
+                            geo_page = geo_pages[0] if geo_pages else {}
+                        logger.info("Page-1 text: source=%s, %d chars, %d words (%.0fms)",
+                                    geo_page.get("source"), geo_page.get("char_count", 0),
+                                    len(geo_page.get("words", []) or []), t["ms"])
+                        page_words = geo_pages[0].get("words", []) if geo_pages else []
+                        page_source = (geo_pages[0].get("source") if geo_pages else None) or "paddleocr"
+                    except Exception as exc:
+                        logger.warning(
+                            "Page-1 PDF geometry failed for %s: %s; falling back to PaddleOCR",
+                            filename, exc,
+                        )
+                        page_words = []
+                        page_source = "paddleocr"
                 else:
                     page_words = []
                     page_source = "paddleocr"
@@ -1949,14 +2558,25 @@ async def ingest_document(
                 # Scanned fallback if needed
                 if not page_words:
                     logger.info("Page-1 has no digital text — falling back to PaddleOCR")
-                    with plog.timed("paddleocr_p1") as t:
-                        ocr_pages = await _ocr.run_ocr_on_pages([{
-                            "page_number": 1,
-                            "image_b64": page1["image_b64"],
-                            "mime_type": page1.get("mime_type", "image/jpeg"),
-                        }])
-                        if ocr_pages:
-                            page_words = ocr_pages[0].get("words", [])
+                    try:
+                        with plog.timed("paddleocr_p1") as t:
+                            ocr_pages = await _ocr.run_ocr_on_pages([{
+                                "page_number": 1,
+                                "image_b64": page1["image_b64"],
+                                "mime_type": page1.get("mime_type", "image/jpeg"),
+                            }])
+                            if ocr_pages:
+                                page_words = ocr_pages[0].get("words", [])
+                    except Exception as exc:
+                        await _release_reserved_quota_once()
+                        logger.warning("Page-1 PaddleOCR failed for %s: %s", filename, exc)
+                        raise HTTPException(
+                            status_code=503,
+                            detail={
+                                "code": "OCR_UNAVAILABLE",
+                                "message": "PaddleOCR failed during vendor detection. Please retry.",
+                            },
+                        ) from exc
                     logger.info("PaddleOCR fallback: %d words (%.0fms)", len(page_words), t["ms"])
                     page_source = "paddleocr"
 
@@ -1981,8 +2601,19 @@ async def ingest_document(
                         )
                 else:
                     _detect_uid = user["id"]
-                with plog.timed("vendor_match") as t:
-                    match = await _vd.detect_vendor(pool, page_words, user_id=_detect_uid)
+                try:
+                    with plog.timed("vendor_match") as t:
+                        match = await _vd.detect_vendor(pool, page_words, user_id=_detect_uid)
+                except Exception as exc:
+                    await _release_reserved_quota_once()
+                    logger.warning("Vendor detection failed for %s: %s", filename, exc)
+                    raise HTTPException(
+                        status_code=503,
+                        detail={
+                            "code": "VENDOR_DETECTION_UNAVAILABLE",
+                            "message": "Vendor detection failed. Please retry.",
+                        },
+                    ) from exc
                 if match:
                     logger.info("Vendor matched: %s (id=%s, score=%.2f, %.0fms)",
                                 match.vendor_name, match.vendor_id, match.score, t["ms"])
@@ -2007,11 +2638,7 @@ async def ingest_document(
                         "status": "blocked_unknown_vendor",
                         "errors": None,
                     })
-                    if user.get("role") != "admin":
-                        try:
-                            await db_mod.release_quota_reservation(pool, user["id"], incoming_pages)
-                        except Exception:
-                            pass
+                    await _release_reserved_quota_once()
                     raise HTTPException(
                         status_code=409,
                         detail={
@@ -2024,7 +2651,11 @@ async def ingest_document(
                 # Enforce ownership on the detected vendor — clients can't
                 # ingest into a vendor they don't own, even if the document
                 # text matches that vendor's aliases.
-                await assert_vendor_access(pool, vendor_id, user)
+                try:
+                    await assert_vendor_access(pool, vendor_id, user)
+                except Exception:
+                    await _release_reserved_quota_once()
+                    raise
                 detected_vendor = {
                     "vendor_id": match.vendor_id,
                     "vendor_name": match.vendor_name,
@@ -2061,11 +2692,7 @@ async def ingest_document(
                 reserved_pages=incoming_pages if user.get("role") != "admin" else None,
             )
         except Exception:
-            if user.get("role") != "admin":
-                try:
-                    await db_mod.release_quota_reservation(pool, user["id"], incoming_pages)
-                except Exception:
-                    pass
+            await _release_reserved_quota_once()
             raise
         resp = ExtractionJobStartOut(
             job_id=submitted["job"]["id"],
@@ -2501,11 +3128,11 @@ async def list_all_templates(request: Request, user: dict = Depends(get_current_
 @app.get("/extractions", response_model=list[ExtractionOut])
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def list_all_extractions(
-    request: Request, limit: int = 50, user: dict = Depends(get_current_user),
+    request: Request, limit: int = 10, offset: int = 0, user: dict = Depends(get_current_user),
 ):
     filter_user = None if user["role"] == "admin" else user["id"]
     rows = await db_mod.list_all_extractions(
-        request.app.state.pool, limit, user_id=filter_user,
+        request.app.state.pool, limit, offset, user_id=filter_user,
     )
     return [ExtractionOut(**r) for r in rows]
 
@@ -2527,14 +3154,9 @@ async def upload_preview(
     """
     file_bytes = await file.read()
     filename = file.filename or "unknown"
+    _require_pdf(filename, file_bytes)
 
-    if filename.lower().endswith(".pdf"):
-        pages = await processor.pdf_to_images(file_bytes, max_pages=max_pages)
-    elif filename.lower().endswith((".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".webp")):
-        pages = await processor.image_file_to_b64(file_bytes)
-    else:
-        raise HTTPException(400, detail=f"Unsupported file type: {filename}")
-
+    pages = await processor.pdf_to_images(file_bytes, max_pages=max_pages)
     total_pages = pages[0].get("doc_total_pages", len(pages)) if pages else 0
     return {"filename": filename, "total_pages": total_pages, "pages": pages}
 
@@ -2965,10 +3587,6 @@ async def get_pipeline_log(
         raise HTTPException(500, detail=f"Failed to read pipeline log: {exc}")
 
 
-USAGE_INPUT_USD_PER_1K = float(os.getenv("USAGE_INPUT_USD_PER_1K", "0.006"))
-USAGE_OUTPUT_USD_PER_1K = float(os.getenv("USAGE_OUTPUT_USD_PER_1K", "0.018"))
-
-
 def _parse_usage_date(value: str | None, name: str) -> date | None:
     if not value:
         return None
@@ -3003,12 +3621,6 @@ def _usage_date_range(
     )
 
 
-def _usage_cost_estimate(input_tokens: int | float | None, output_tokens: int | float | None) -> float:
-    input_cost = (float(input_tokens or 0) / 1000.0) * USAGE_INPUT_USD_PER_1K
-    output_cost = (float(output_tokens or 0) / 1000.0) * USAGE_OUTPUT_USD_PER_1K
-    return round(input_cost + output_cost, 6)
-
-
 @app.get("/user/stats")
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def get_user_stats(request: Request, user: dict = Depends(get_current_user)):
@@ -3022,8 +3634,8 @@ async def get_user_stats(request: Request, user: dict = Depends(get_current_user
     if uid is not None:
         try:
             response["subscription"] = await db_mod.get_user_billable_pages(pool, uid)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("stats: failed to fetch subscription info for uid=%s: %s", uid, exc)
     return response
 
 
@@ -3120,8 +3732,8 @@ async def get_client_usage_dashboard(
     subscription = {}
     try:
         subscription = await db_mod.get_user_billable_pages(pool, client_user_id)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("admin stats: failed to fetch subscription info for user=%s: %s", client_user_id, exc)
 
     return {
         "client": {
@@ -3145,8 +3757,6 @@ async def get_client_usage_dashboard(
             "output_tokens": output_tokens,
             "grand_total": int(stats.get("grand_total") or 0),
             "llm_calls": int(stats.get("total_llm_calls") or 0),
-            "cost_estimate": _usage_cost_estimate(input_tokens, output_tokens),
-            "currency": "USD",
         },
         "days": days,
         "documents": documents,
@@ -3524,8 +4134,6 @@ async def create_schedule(
     row = await db_mod.create_user_schedule(
         request.app.state.pool, user["id"], body.cron_expr, body.timezone, body.label
     )
-    if row:
-        sync_job(row)
     return row
 
 
@@ -3555,8 +4163,6 @@ async def update_schedule_route(
         request.app.state.pool, schedule_id,
         **{k: v for k, v in body.model_dump().items() if v is not None},
     )
-    if row:
-        sync_job(row)
     return row
 
 
@@ -3569,7 +4175,6 @@ async def delete_schedule_route(
     if not existing or str(existing.get("user_id")) != user["id"]:
         raise HTTPException(status_code=404, detail="Schedule not found")
     await db_mod.delete_user_schedule(request.app.state.pool, schedule_id)
-    remove_job(schedule_id)
 
 
 @app.get("/api/schedules/{schedule_id}/next")
@@ -3583,7 +4188,15 @@ async def schedule_next_runs(
     existing = await db_mod.get_schedule(request.app.state.pool, schedule_id)
     if not existing or str(existing.get("user_id")) != user["id"]:
         raise HTTPException(status_code=404, detail="Schedule not found")
-    return {"schedule_id": schedule_id, "next_runs": get_next_run_times(schedule_id, count)}
+    cron_expr = existing.get("cron_expr", "")
+    next_runs = []
+    t = None
+    for _ in range(count):
+        t = compute_next_run(cron_expr, after=t)
+        if t is None:
+            break
+        next_runs.append(t.isoformat())
+    return {"schedule_id": schedule_id, "next_runs": next_runs}
 
 
 @app.get("/admin/schedules")
@@ -3602,7 +4215,8 @@ def _row_to_sched(row: dict) -> dict:
     parts = (row.get("cron_expr") or "").split()
     utc_hour   = int(parts[1]) if len(parts) >= 2 else None
     utc_minute = int(parts[0]) if len(parts) >= 1 else None
-    next_runs  = get_next_run_times(row["id"], 1)
+    next_run_dt = compute_next_run(row.get("cron_expr", ""))
+    next_run_str = next_run_dt.isoformat() if next_run_dt and row.get("enabled") else None
     last_ran   = row.get("last_ran_at")
     last_ran_str = last_ran.isoformat() if last_ran else None
     return {
@@ -3611,7 +4225,7 @@ def _row_to_sched(row: dict) -> dict:
         "is_executing": row.get("is_executing", False),
         "utc_hour":     utc_hour,
         "utc_minute":   utc_minute,
-        "next_run":     next_runs[0] if next_runs else None,
+        "next_run":     next_run_str,
         "last_ran_at":  last_ran_str,
     }
 
@@ -3649,8 +4263,6 @@ async def start_user_scheduler(request: Request, user: dict = Depends(get_curren
             raise HTTPException(400, detail=f"Maximum {_SCHED_MAX} schedules allowed per user")
         row = await db_mod.create_user_schedule(pool, user["id"], cron_expr, "UTC", "daily run")
 
-    if row:
-        sync_job(row)
     return _row_to_sched(row)
 
 
@@ -3667,8 +4279,6 @@ async def stop_user_scheduler(request: Request, user: dict = Depends(get_current
     if not existing or str(existing.get("user_id")) != str(user["id"]):
         raise HTTPException(404, detail="Schedule not found")
     row = await db_mod.update_user_schedule(pool, int(schedule_id), enabled=False)
-    if row:
-        sync_job(row)
     return _row_to_sched(row)
 
 
@@ -3682,7 +4292,6 @@ async def delete_user_schedule(
     existing = await db_mod.get_schedule(pool, schedule_id)
     if not existing or str(existing.get("user_id")) != str(user["id"]):
         raise HTTPException(404, detail="Schedule not found")
-    remove_job(schedule_id)
     await db_mod.delete_user_schedule(pool, schedule_id)
     return {"deleted": True, "schedule_id": schedule_id}
 
@@ -3726,6 +4335,7 @@ async def extract_via_api_key(
 
     file_bytes = await file.read()
     filename = file.filename or "unknown.pdf"
+    _require_pdf(filename, file_bytes)
 
     # Compute file hash
     file_sha256 = hashlib.sha256(file_bytes).hexdigest()

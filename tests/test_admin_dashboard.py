@@ -123,11 +123,6 @@ class ClientDashboardEndpointTests(unittest.TestCase):
         self.assertEqual(body["days"], days)
         self.assertEqual(body["documents"], documents)
 
-    def test_client_dashboard_cost_estimate(self) -> None:
-        with patch.object(main, "USAGE_INPUT_USD_PER_1K", 0.006), \
-             patch.object(main, "USAGE_OUTPUT_USD_PER_1K", 0.018):
-            self.assertEqual(main._usage_cost_estimate(1000, 1000), 0.024)
-
     def test_date_filter_defaults_to_today(self) -> None:
         user_id = "00000000-0000-0000-0000-000000000001"
 

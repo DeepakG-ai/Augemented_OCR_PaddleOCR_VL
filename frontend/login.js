@@ -50,9 +50,18 @@ async function renderLoginPage(app) {
             });
             if (!res.ok) {
                 const body = await res.json().catch(() => ({}));
-                throw new Error(body.detail || `Login failed (${res.status})`);
+                const detail = body.error || body.detail || {};
+                const message = typeof detail === 'string' ? detail : detail.message;
+                throw new Error(message || `Login failed (${res.status})`);
             }
             const data = await res.json();
+            // Validate response shape before trusting it
+            if (typeof data.access_token !== 'string' || !data.access_token) {
+                throw new Error('Unexpected server response — no access token received');
+            }
+            if (!data.user || typeof data.user !== 'object') {
+                throw new Error('Unexpected server response — no user info received');
+            }
             localStorage.setItem('auth_token', data.access_token);
             localStorage.setItem('auth_user', JSON.stringify(data.user));
             window.location.hash = '#/vendors';

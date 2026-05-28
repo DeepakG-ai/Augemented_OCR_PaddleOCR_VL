@@ -450,120 +450,128 @@ async def apply_to_extraction(
     Returns:
         (updated_result, updated_field_locations, fields_applied_count)
     """
-    extraction = await db_mod.get_extraction(pool, extraction_id)
-    if not extraction:
-        return result, field_locations, 0
+    try:
+        extraction = await db_mod.get_extraction(pool, extraction_id)
+        if not extraction:
+            return result, field_locations, 0
 
-    if isinstance(result, list):
-        return await _apply_to_po_per_page(
-            pool, extraction_id, extraction, result, field_locations, page_geometry
-        )
-
-    if isinstance(field_locations, list):
-        logger.debug("Skipping spatial memory apply: field_locations is list but result is not.")
-        return result, field_locations, 0
-
-    vendor_id = extraction.get("vendor_id")
-    template_id = extraction.get("template_id")
-    page_results = extraction.get("page_results") or []
-
-    if not vendor_id:
-        return result, field_locations, 0
-
-    # Compute layout key
-    lk = compute_layout_key(vendor_id, template_id, page_results)
-    base = {
-        "extraction_id": extraction_id,
-        "vendor_id": vendor_id,
-        "vendor_name": extraction.get("vendor_name"),
-        "filename": extraction.get("filename"),
-    }
-
-    # Load spatial memory for this vendor+layout
-    memories = await db_mod.get_spatial_memory_for_layout(pool, vendor_id, lk)
-    logger.info("Spatial memory loaded: layout=%s, %d regions", lk, len(memories))
-    if not memories:
-        return result, field_locations, 0
-
-    configured_header_fields = await _load_configured_header_fields(pool, extraction, vendor_id)
-
-    # Load page dimensions
-    pages = await db_mod.get_pages(pool, extraction_id)
-    page_dims = {p["page_number"]: (p.get("width", 0), p.get("height", 0)) for p in pages}
-
-    # Load page geometry (words) if not provided
-    if page_geometry is None:
-        ocr_data = extraction.get("ocr_data") or []
-        page_geometry = ocr_data
-
-    words_by_page = {}
-    for entry in page_geometry:
-        pn = entry.get("page_number", 0)
-        words_by_page[pn] = entry.get("words", [])
-
-    applied = 0
-    for mem in memories:
-        field_key = mem["field_key"]
-        if not configured_header_fields or field_key not in configured_header_fields:
-            logger.debug("Spatial memory skip: field=%s not in template (or template unavailable)", field_key)
-            continue
-
-        page_num = mem["page_number"]
-        normalized = mem["normalized_box"]
-
-        dims = page_dims.get(page_num)
-        if not dims or dims[0] <= 0 or dims[1] <= 0:
-            continue
-
-        # Convert normalized box to current pixel coords
-        pixel_box = _denormalize_box(normalized, dims[0], dims[1])
-
-        # Find current words in the region
-        current_words = words_by_page.get(page_num, [])
-        matched_words = _reading_order(_words_in_box(current_words, pixel_box))
-        current_text = " ".join(w.get("text", "") for w in matched_words).strip()
-
-        # Skip if empty or too short (staleness guard per risk register)
-        if len(current_text) < 2:
-            logger.debug(
-                "Spatial memory skip: field=%s text too short (%d chars)",
-                field_key, len(current_text),
+        if isinstance(result, list):
+            return await _apply_to_po_per_page(
+                pool, extraction_id, extraction, result, field_locations, page_geometry
             )
 
-            continue
+        if isinstance(field_locations, list):
+            logger.debug("Skipping spatial memory apply: field_locations is list but result is not.")
+            return result, field_locations, 0
 
-        # Override result value
-        if isinstance(result, dict) and field_key in result:
-            old_val = result[field_key]
-            result[field_key] = current_text
+        vendor_id = extraction.get("vendor_id")
+        template_id = extraction.get("template_id")
+        page_results = extraction.get("page_results") or []
 
-            logger.info(
-                "Spatial memory applied: field=%s old='%s' new='%s' (from region on page %d)",
-                field_key, str(old_val)[:50], current_text[:50], page_num,
-            )
-        elif isinstance(result, dict):
-            # Field exists in memory but not in result — add it
-            result[field_key] = current_text
+        if not vendor_id:
+            return result, field_locations, 0
 
-            logger.info(
-                "Spatial memory added: field=%s value='%s' (from region on page %d)",
-                field_key, current_text[:50], page_num,
-            )
-
-        # Update field_locations
-        field_locations[field_key] = {
-            "page": page_num,
-            "box": pixel_box,
-            "strategy": "spatial_memory",
-            "confidence": "high",
-            "matched_text": current_text,
+        # Compute layout key
+        lk = compute_layout_key(vendor_id, template_id, page_results)
+        base = {
+            "extraction_id": extraction_id,
+            "vendor_id": vendor_id,
+            "vendor_name": extraction.get("vendor_name"),
+            "filename": extraction.get("filename"),
         }
-        applied += 1
 
-    if applied:
-        logger.info(
-            "Spatial memory: %d field(s) applied for extraction %d (vendor=%s, layout=%s)",
-            applied, extraction_id, vendor_id, lk,
+        # Load spatial memory for this vendor+layout
+        memories = await db_mod.get_spatial_memory_for_layout(pool, vendor_id, lk)
+        logger.info("Spatial memory loaded: layout=%s, %d regions", lk, len(memories))
+        if not memories:
+            return result, field_locations, 0
+
+        configured_header_fields = await _load_configured_header_fields(pool, extraction, vendor_id)
+
+        # Load page dimensions
+        pages = await db_mod.get_pages(pool, extraction_id)
+        page_dims = {p["page_number"]: (p.get("width", 0), p.get("height", 0)) for p in pages}
+
+        # Load page geometry (words) if not provided
+        if page_geometry is None:
+            ocr_data = extraction.get("ocr_data") or []
+            page_geometry = ocr_data
+
+        words_by_page = {}
+        for entry in page_geometry:
+            pn = entry.get("page_number", 0)
+            words_by_page[pn] = entry.get("words", [])
+
+        applied = 0
+        for mem in memories:
+            field_key = mem["field_key"]
+            if not configured_header_fields or field_key not in configured_header_fields:
+                logger.debug("Spatial memory skip: field=%s not in template (or template unavailable)", field_key)
+                continue
+
+            page_num = mem["page_number"]
+            normalized = mem["normalized_box"]
+
+            dims = page_dims.get(page_num)
+            if not dims or dims[0] <= 0 or dims[1] <= 0:
+                continue
+
+            # Convert normalized box to current pixel coords
+            pixel_box = _denormalize_box(normalized, dims[0], dims[1])
+
+            # Find current words in the region
+            current_words = words_by_page.get(page_num, [])
+            matched_words = _reading_order(_words_in_box(current_words, pixel_box))
+            current_text = " ".join(w.get("text", "") for w in matched_words).strip()
+
+            # Skip if empty or too short (staleness guard per risk register)
+            if len(current_text) < 2:
+                logger.debug(
+                    "Spatial memory skip: field=%s text too short (%d chars)",
+                    field_key, len(current_text),
+                )
+
+                continue
+
+            # Override result value
+            if isinstance(result, dict) and field_key in result:
+                old_val = result[field_key]
+                result[field_key] = current_text
+
+                logger.info(
+                    "Spatial memory applied: field=%s old='%s' new='%s' (from region on page %d)",
+                    field_key, str(old_val)[:50], current_text[:50], page_num,
+                )
+            elif isinstance(result, dict):
+                # Field exists in memory but not in result — add it
+                result[field_key] = current_text
+
+                logger.info(
+                    "Spatial memory added: field=%s value='%s' (from region on page %d)",
+                    field_key, current_text[:50], page_num,
+                )
+
+            # Update field_locations
+            field_locations[field_key] = {
+                "page": page_num,
+                "box": pixel_box,
+                "strategy": "spatial_memory",
+                "confidence": "high",
+                "matched_text": current_text,
+            }
+            applied += 1
+
+        if applied:
+            logger.info(
+                "Spatial memory: %d field(s) applied for extraction %d (vendor=%s, layout=%s)",
+                applied, extraction_id, vendor_id, lk,
+            )
+
+        return result, field_locations, applied
+    except Exception as exc:
+        logger.error(
+            "Spatial memory application failed due to database or query error (falling back to raw OCR/LLM results): %s",
+            exc,
+            exc_info=True,
         )
-
-    return result, field_locations, applied
+        return result, field_locations, 0

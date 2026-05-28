@@ -193,11 +193,57 @@ CREATE TABLE IF NOT EXISTS field_mappings (
     updated_at      TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(vendor_id)
 );
+
+CREATE TABLE IF NOT EXISTS output_schemas (
+    id                      SERIAL PRIMARY KEY,
+    name                    TEXT NOT NULL UNIQUE,
+    slug                    TEXT NOT NULL UNIQUE,
+    is_system               BOOLEAN DEFAULT FALSE,
+    header_fields           TEXT[] NOT NULL DEFAULT '{}',
+    line_fields             TEXT[] NOT NULL DEFAULT '{}',
+    header_fields_snapshot  TEXT[] NOT NULL DEFAULT '{}',
+    line_fields_snapshot    TEXT[] NOT NULL DEFAULT '{}',
+    created_at              TIMESTAMPTZ DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ DEFAULT NOW()
+);
 """
 
 
 async def init(pool: asyncpg.Pool) -> None:
-    """Create tables if they don't exist, then run migrations."""
+    """Create tables if they don't exist, then run migrations with a retry loop for parallel worker boot."""
+    import random
+    import asyncio
+    import logging
+    logger = logging.getLogger("db")
+    
+    max_retries = 8
+    for attempt in range(max_retries):
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute("SELECT pg_advisory_lock(hashtext('augocr_db_init'))")
+                try:
+                    await _init_db(pool)
+                finally:
+                    await conn.execute("SELECT pg_advisory_unlock(hashtext('augocr_db_init'))")
+            return
+        except Exception as e:
+            err_str = str(e).lower()
+            is_lock_issue = any(k in err_str for k in ("deadlock", "lock", "unique", "duplicate"))
+            if is_lock_issue and attempt < max_retries - 1:
+                sleep_time = random.uniform(1.5, 4.0)
+                logger.warning(
+                    "Database migration lock conflict or deadlock detected: %s. "
+                    "Retrying in %.2fs (Attempt %d/%d)...",
+                    type(e).__name__, sleep_time, attempt + 1, max_retries
+                )
+                await asyncio.sleep(sleep_time)
+            else:
+                logger.error("Database migration failed on attempt %d: %s", attempt + 1, e)
+                raise
+
+
+async def _init_db(pool: asyncpg.Pool) -> None:
+    """Actual schema bootstrap and migrations."""
     async with pool.acquire() as conn:
         await conn.execute(_SCHEMA_SQL)
         # Migration: add mime_type to pages if missing (existing DBs)
@@ -654,6 +700,44 @@ async def init(pool: asyncpg.Pool) -> None:
                 ON field_mappings (vendor_id);
         """)
 
+        # Migration: output_schemas — schema_id FK on field_mappings + seed defaults
+        await conn.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='field_mappings' AND column_name='schema_id'
+                ) THEN
+                    ALTER TABLE field_mappings ADD COLUMN schema_id INT
+                        REFERENCES output_schemas(id) ON DELETE SET NULL;
+                END IF;
+            END $$;
+        """)
+        await conn.execute("""
+            INSERT INTO output_schemas (name, slug, is_system, header_fields, line_fields,
+                                        header_fields_snapshot, line_fields_snapshot)
+            VALUES (
+                'AP Automation', 'ap_automation', TRUE,
+                ARRAY['vendor_name','vendor_address','invoice_number','invoice_date','po_number',
+                      'invoice_total','invoice_subtotal','tax_amount','freight_amount','terms'],
+                ARRAY['item','line_description','quantity_ordered','quantity_received',
+                      'unit_price','line_total','uom'],
+                ARRAY['vendor_name','vendor_address','invoice_number','invoice_date','po_number',
+                      'invoice_total','invoice_subtotal','tax_amount','freight_amount','terms'],
+                ARRAY['item','line_description','quantity_ordered','quantity_received',
+                      'unit_price','line_total','uom']
+            ) ON CONFLICT (slug) DO NOTHING;
+
+            INSERT INTO output_schemas (name, slug, is_system, header_fields, line_fields,
+                                        header_fields_snapshot, line_fields_snapshot)
+            VALUES (
+                'PO Automation', 'po_automation', TRUE,
+                ARRAY['CustNum','Client','CustPo','Zip','Addr1','ShipToaddr','OrderDate'],
+                ARRAY['Line','Item','ItemVariant','CustItem','QtyOrdered','Price','UM','DueDate'],
+                ARRAY['CustNum','Client','CustPo','Zip','Addr1','ShipToaddr','OrderDate'],
+                ARRAY['Line','Item','ItemVariant','CustItem','QtyOrdered','Price','UM','DueDate']
+            ) ON CONFLICT (slug) DO NOTHING;
+        """)
+
         # Migration: idempotency claims table for deduplication
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS idempotency_claims (
@@ -669,6 +753,81 @@ async def init(pool: asyncpg.Pool) -> None:
             CREATE INDEX IF NOT EXISTS idx_idempotency_claims_key ON idempotency_claims(user_id, idempotency_key);
         """)
 
+        # ── Subscriptions & top-ups ────────────────────────────────────────────
+        # Admin grants a subscription period (custom from/to dates) with a base
+        # page_limit. Admin can later add top-ups (extra pages) that attach to
+        # the *current* active subscription. On period_end everything vanishes —
+        # base + topups (use-it-or-lose-it). One active subscription per user is
+        # enforced via partial unique index.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id            SERIAL PRIMARY KEY,
+                user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                page_limit    INT  NOT NULL CHECK (page_limit >= 0),
+                period_start  TIMESTAMPTZ NOT NULL,
+                period_end    TIMESTAMPTZ NOT NULL,
+                status        TEXT NOT NULL DEFAULT 'active'
+                              CHECK (status IN ('active','expired','cancelled','superseded')),
+                note          TEXT,
+                created_by    UUID REFERENCES users(id) ON DELETE SET NULL,
+                created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CHECK (period_end > period_start)
+            );
+            CREATE INDEX IF NOT EXISTS subscriptions_user_idx
+                ON subscriptions (user_id, status, created_at DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS subscriptions_one_active_per_user
+                ON subscriptions (user_id) WHERE status = 'active';
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS topups (
+                id              SERIAL PRIMARY KEY,
+                user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                subscription_id INT  NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+                pages           INT  NOT NULL CHECK (pages > 0),
+                note            TEXT,
+                created_by      UUID REFERENCES users(id) ON DELETE SET NULL,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS topups_subscription_idx
+                ON topups (subscription_id);
+            CREATE INDEX IF NOT EXISTS topups_user_idx
+                ON topups (user_id, created_at DESC);
+        """)
+        # One-time backfill: every client with the legacy subscription_limit > 0
+        # gets a 1-year subscription starting today, so quota math keeps working.
+        # Admins can override later via POST /admin/users/{id}/subscriptions.
+        await conn.execute("""
+            INSERT INTO subscriptions (user_id, page_limit, period_start, period_end, status, note)
+            SELECT u.id, u.subscription_limit, NOW(), NOW() + INTERVAL '365 days', 'active',
+                   'Auto-migrated from legacy subscription_limit'
+            FROM users u
+            WHERE u.subscription_limit > 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM subscriptions s
+                  WHERE s.user_id = u.id AND s.status = 'active'
+              );
+        """)
+        # Migration: user-initiated top-up requests. Users submit these when quota
+        # is exhausted; admins see them as pending notifications and approve/reject.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS topup_requests (
+                id               SERIAL PRIMARY KEY,
+                user_id          UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                requested_pages  INT  NOT NULL CHECK (requested_pages > 0),
+                requested_period TEXT NOT NULL,
+                note             TEXT,
+                status           TEXT NOT NULL DEFAULT 'pending'
+                                 CHECK (status IN ('pending','approved','rejected')),
+                resolution_note  TEXT,
+                resolved_by      UUID REFERENCES users(id) ON DELETE SET NULL,
+                resolved_at      TIMESTAMPTZ,
+                created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS topup_requests_user_idx
+                ON topup_requests (user_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS topup_requests_status_idx
+                ON topup_requests (status, created_at DESC);
+        """)
 
 
 # -- Helpers ---------------------------------------------------------------
@@ -1309,8 +1468,32 @@ async def list_users(pool: asyncpg.Pool) -> list[dict]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, email, role, is_active, created_at, subscription_limit
-            FROM users ORDER BY created_at DESC
+            SELECT
+                u.id, u.email, u.role, u.is_active, u.created_at, u.subscription_limit,
+                COALESCE(u.pending_pages, 0)::INT AS pending_pages,
+                s.id AS sub_id,
+                s.page_limit AS base_limit,
+                s.period_start,
+                s.period_end,
+                s.status AS sub_status,
+                COALESCE(
+                    (SELECT SUM(t.pages) FROM topups t WHERE t.subscription_id = s.id),
+                    0
+                )::INT AS topup_total,
+                COALESCE(
+                    (
+                        SELECT COUNT(DISTINCT (lu.extraction_id, lu.page_num))
+                        FROM llm_usage lu
+                        WHERE lu.user_id = u.id
+                          AND lu.call_type = 'extraction'
+                          AND lu.page_num IS NOT NULL
+                          AND lu.ts >= s.period_start AND lu.ts < s.period_end
+                    ),
+                    0
+                )::INT AS used
+            FROM users u
+            LEFT JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active'
+            ORDER BY u.created_at DESC
             """
         )
         return [_stringify_uuid_fields(dict(r), "id") for r in rows]
@@ -1858,7 +2041,7 @@ async def list_all_templates(pool: asyncpg.Pool, user_id: str | None = None) -> 
 # -- Field mapping queries -------------------------------------------------
 
 _FIELD_MAPPING_COLS = """
-    id, vendor_id, template_id, header_map, line_map,
+    id, vendor_id, template_id, schema_id, header_map, line_map,
     header_snapshot, line_snapshot, pending_notices, created_at, updated_at
 """
 
@@ -1887,17 +2070,19 @@ async def upsert_field_mapping(
     header_snapshot: list[str],
     line_snapshot: list[str],
     pending_notices: list[dict],
+    schema_id: int | None = None,
 ) -> dict:
     """Insert or update a vendor's ERP field mapping (one per vendor)."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             f"""
             INSERT INTO field_mappings
-                (vendor_id, template_id, header_map, line_map,
+                (vendor_id, template_id, schema_id, header_map, line_map,
                  header_snapshot, line_snapshot, pending_notices, updated_at)
-            VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, NOW())
+            VALUES ($1, $2, $8, $3::jsonb, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, NOW())
             ON CONFLICT (vendor_id) DO UPDATE SET
                 template_id     = EXCLUDED.template_id,
+                schema_id       = EXCLUDED.schema_id,
                 header_map      = EXCLUDED.header_map,
                 line_map        = EXCLUDED.line_map,
                 header_snapshot = EXCLUDED.header_snapshot,
@@ -1909,7 +2094,7 @@ async def upsert_field_mapping(
             vendor_id, template_id,
             json.dumps(header_map), json.dumps(line_map),
             json.dumps(header_snapshot), json.dumps(line_snapshot),
-            json.dumps(pending_notices),
+            json.dumps(pending_notices), schema_id,
         )
         d = dict(row)
         _parse_jsonb(d, "header_map", "line_map", "header_snapshot",
@@ -2138,7 +2323,8 @@ async def list_extractions(
 
 async def list_all_extractions(
     pool: asyncpg.Pool,
-    limit: int = 50,
+    limit: int = 10,
+    offset: int = 0,
     user_id: str | None = None,
 ) -> list[dict]:
     """Global extraction history with vendor_name joined."""
@@ -2150,10 +2336,10 @@ async def list_all_extractions(
             FROM extractions e
             LEFT JOIN vendors v ON v.id = e.vendor_id
             LEFT JOIN documents d ON d.id = e.document_id
-            WHERE ($2::UUID IS NULL OR COALESCE((d.metadata->>'billing_user_id')::UUID, v.user_id) = $2)
-            ORDER BY e.created_at DESC LIMIT $1
+            WHERE ($3::UUID IS NULL OR COALESCE((d.metadata->>'billing_user_id')::UUID, v.user_id) = $3)
+            ORDER BY e.created_at DESC LIMIT $1 OFFSET $2
             """,
-            limit, uid,
+            limit, offset, uid,
         )
         results = []
         for r in rows:
@@ -2783,6 +2969,24 @@ async def complete_job(pool: asyncpg.Pool, job_id: int, progress: dict | None = 
         )
 
 
+async def cancel_job(pool: asyncpg.Pool, job_id: int, progress: dict | None = None, error: str | None = None) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE jobs
+            SET status = 'cancelled',
+                progress = COALESCE($2::jsonb, progress),
+                finished_at = NOW(),
+                updated_at = NOW(),
+                error = COALESCE($3, error, 'Cancelled')
+            WHERE id = $1
+            """,
+            job_id,
+            json.dumps(progress) if progress is not None else None,
+            error,
+        )
+
+
 async def fail_job(pool: asyncpg.Pool, job_id: int, error: str, retryable: bool = True) -> None:
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT attempts, max_attempts FROM jobs WHERE id = $1", job_id)
@@ -2817,8 +3021,8 @@ async def recover_stale_jobs(pool: asyncpg.Pool, stage: str, stale_minutes: int 
         # Purge expired idempotency claims older than 24 hours
         try:
             await conn.execute("DELETE FROM idempotency_claims WHERE created_at < NOW() - INTERVAL '24 hours'")
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.getLogger("db").warning("recover_stale_jobs: idempotency prune failed: %s", exc)
 
         async with conn.transaction():
             rows = await conn.fetch(
@@ -3037,41 +3241,51 @@ async def get_user_billable_pages(
     pool: asyncpg.Pool,
     user_id: str,
 ) -> dict:
-    """Return current billable page count and subscription limit for a user.
+    """Return current billable pages, effective subscription limit, and
+    remaining pages for a user.
 
-    Billable pages = COUNT(DISTINCT (extraction_id, page_num))
-                     WHERE call_type = 'extraction'
-                     scoped to the user's vendors.
+    Uses the v2 quota model:
+      * billable_pages = COUNT(DISTINCT (extraction_id, page_num)) within the
+        active subscription's window. Falls back to all-time when there is no
+        active subscription so admins can still see total usage history.
+      * subscription_limit = active subscription base + topups, or 0 when none.
+      * Extra fields (period_start/end, topup_total) included so callers (UI,
+        warning banners) don't need a second round-trip.
     """
     uid = _uuid_or_none(user_id)
+    blank = {
+        "billable_pages": 0, "subscription_limit": 0, "remaining": 0,
+        "base_limit": 0, "topup_total": 0,
+        "period_start": None, "period_end": None,
+        "has_active_subscription": False,
+    }
     if uid is None:
-        return {"billable_pages": 0, "subscription_limit": 0, "remaining": 0}
+        return blank
+    quota = await get_user_quota_v2(pool, user_id)
+    if quota["has_active_subscription"]:
+        return {
+            "billable_pages": quota["used"],
+            "subscription_limit": quota["effective_limit"],
+            "remaining": quota["effective_limit"] - quota["used"],
+            "base_limit": quota["base_limit"],
+            "topup_total": quota["topup_total"],
+            "period_start": quota["period_start"],
+            "period_end": quota["period_end"],
+            "has_active_subscription": True,
+        }
+    # No active subscription — report lifetime usage so the admin UI is still useful.
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
+        used = int(await conn.fetchval(
             """
-            SELECT
-                COALESCE(u.subscription_limit, 0) AS subscription_limit,
-                (
-                    SELECT COUNT(DISTINCT (lu.extraction_id, lu.page_num))
-                    FROM llm_usage lu
-                    WHERE lu.user_id = $1
-                      AND lu.call_type = 'extraction'
-                      AND lu.page_num IS NOT NULL
-                )::INT AS billable_pages
-            FROM users u
-            WHERE u.id = $1
+            SELECT COUNT(DISTINCT (lu.extraction_id, lu.page_num))
+            FROM llm_usage lu
+            WHERE lu.user_id = $1
+              AND lu.call_type = 'extraction'
+              AND lu.page_num IS NOT NULL
             """,
             uid,
-        )
-    if not row:
-        return {"billable_pages": 0, "subscription_limit": 0, "remaining": 0}
-    limit_val = int(row["subscription_limit"])
-    used = int(row["billable_pages"])
-    return {
-        "billable_pages": used,
-        "subscription_limit": limit_val,
-        "remaining": limit_val - used,
-    }
+        ) or 0)
+    return {**blank, "billable_pages": used, "remaining": -used}
 
 
 async def reserve_quota(
@@ -3087,50 +3301,93 @@ async def reserve_quota(
     If allowed, increments pending_pages by incoming_pages — this acts as a
     reservation that future concurrent checks will see immediately.
 
-    Returns:
-        allowed  – True if the upload may proceed
-        reason   – "ok" | "grace" | "exceeded"
-        used     – current billable pages (does not include pending)
-        limit    – subscription limit
-        remaining – max(limit - used - pending, 0)
-        pending  – pages already reserved by other in-flight uploads
+    Quota source is the v2 model:
+        effective_limit = active_subscription.page_limit + SUM(topups)
+        used            = pages billed within [period_start, period_end]
+
+    Behavior matrix:
+        active subscription, fits          → allowed, reason='ok'
+        active subscription, near overage  → allowed (if ≤ grace_pages),
+                                              reason='grace'
+        active subscription, over          → blocked, reason='exceeded'
+        no active subscription (expired,
+            cancelled, never set)          → blocked, reason='no_subscription'
+
+    Returns: allowed, reason, used, limit, remaining, pending.
     """
     uid = _uuid_or_none(user_id)
+    blocked = {"allowed": False, "reason": "exceeded", "used": 0, "limit": 0,
+               "remaining": 0, "pending": 0}
     if uid is None:
-        return {"allowed": False, "reason": "exceeded", "used": 0, "limit": 0, "remaining": 0, "pending": 0}
+        return blocked
     async with pool.acquire() as conn:
         async with conn.transaction():
-            row = await conn.fetchrow(
+            # Lazy expiry inside the txn so concurrent uploads see the same view.
+            await conn.execute(
                 """
-                SELECT
-                    COALESCE(u.subscription_limit, 0)  AS subscription_limit,
-                    COALESCE(u.pending_pages, 0)        AS pending_pages,
-                    (
-                        SELECT COUNT(DISTINCT (lu.extraction_id, lu.page_num))
-                        FROM llm_usage lu
-                        WHERE lu.user_id = $1
-                          AND lu.call_type = 'extraction'
-                          AND lu.page_num IS NOT NULL
-                    )::INT AS billable_pages
-                FROM users u
-                WHERE u.id = $1
-                FOR UPDATE
+                WITH expired AS (
+                    UPDATE subscriptions
+                       SET status = 'expired'
+                     WHERE user_id = $1 AND status = 'active' AND period_end < NOW()
+                     RETURNING user_id
+                )
+                UPDATE users
+                   SET subscription_limit = 0
+                 WHERE id IN (SELECT user_id FROM expired)
                 """,
                 uid,
             )
-            if not row:
-                return {"allowed": False, "reason": "exceeded", "used": 0, "limit": 0, "remaining": 0, "pending": 0}
+            # Lock the user row so concurrent reserves serialise on the
+            # pending_pages counter.
+            user_row = await conn.fetchrow(
+                "SELECT COALESCE(pending_pages, 0) AS pending FROM users WHERE id = $1 FOR UPDATE",
+                uid,
+            )
+            if not user_row:
+                return blocked
+            pending = int(user_row["pending"])
 
-            limit_val = int(row["subscription_limit"])
-            used = int(row["billable_pages"])
-            pending = int(row["pending_pages"])
+            sub = await conn.fetchrow(
+                """
+                SELECT id, page_limit, period_start, period_end
+                FROM subscriptions
+                WHERE user_id = $1 AND status = 'active'
+                LIMIT 1
+                """,
+                uid,
+            )
+            if not sub:
+                return {**blocked, "reason": "no_subscription", "pending": pending}
+
+            sub_id = int(sub["id"])
+            base_limit = int(sub["page_limit"])
+            period_start = sub["period_start"]
+            period_end = sub["period_end"]
+            topup_total = int(await conn.fetchval(
+                "SELECT COALESCE(SUM(pages), 0) FROM topups WHERE subscription_id = $1",
+                sub_id,
+            ) or 0)
+            effective_limit = base_limit + topup_total
+
+            used = int(await conn.fetchval(
+                """
+                SELECT COUNT(DISTINCT (lu.extraction_id, lu.page_num))
+                FROM llm_usage lu
+                WHERE lu.user_id = $1
+                  AND lu.call_type = 'extraction'
+                  AND lu.page_num IS NOT NULL
+                  AND lu.ts >= $2 AND lu.ts < $3
+                """,
+                uid, period_start, period_end,
+            ) or 0)
+
             committed = used + pending
-            remaining = max(limit_val - committed, 0)
-            would_exceed = (committed + incoming_pages) > limit_val
+            remaining = max(effective_limit - committed, 0)
+            would_exceed = (committed + incoming_pages) > effective_limit
 
             if not would_exceed:
                 reason, allowed = "ok", True
-            elif committed < limit_val and incoming_pages <= grace_pages:
+            elif committed < effective_limit and incoming_pages <= grace_pages:
                 reason, allowed = "grace", True
             else:
                 reason, allowed = "exceeded", False
@@ -3144,7 +3401,7 @@ async def reserve_quota(
                 "allowed": allowed,
                 "reason": reason,
                 "used": used,
-                "limit": limit_val,
+                "limit": effective_limit,
                 "remaining": remaining,
                 "pending": pending,
             }
@@ -3186,6 +3443,449 @@ async def update_user_subscription_limit(
             uid,
         )
         return result == "UPDATE 1"
+
+
+# -- Subscriptions + top-ups (v2 quota model) ------------------------------
+#
+# Quota model:
+#   effective_limit  = active_subscription.page_limit + SUM(topups in same sub)
+#   used             = pages billed within [period_start, period_end]
+#   remaining        = max(effective_limit - used, 0)
+#
+# On period_end pass: status flips active → expired (lazy on read + endpoint).
+# Topups are bound to their subscription via FK, so they vanish with it.
+
+def _row_subscription(row) -> dict | None:
+    if not row:
+        return None
+    d = dict(row)
+    if d.get("user_id") is not None:
+        d["user_id"] = str(d["user_id"])
+    if d.get("created_by") is not None:
+        d["created_by"] = str(d["created_by"])
+    return d
+
+
+async def expire_due_subscriptions(pool: asyncpg.Pool) -> int:
+    """Flip any active subscription past its period_end to status='expired'.
+    Returns number of rows flipped. Safe to call repeatedly."""
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            WITH expired AS (
+                UPDATE subscriptions
+                   SET status = 'expired'
+                 WHERE status = 'active' AND period_end < NOW()
+                 RETURNING user_id
+            )
+            UPDATE users
+               SET subscription_limit = 0
+             WHERE id IN (SELECT user_id FROM expired)
+            """
+        )
+    try:
+        return int(result.rsplit(" ", 1)[-1])
+    except (ValueError, IndexError):
+        return 0
+
+
+async def create_subscription(
+    pool: asyncpg.Pool,
+    user_id: str,
+    page_limit: int,
+    period_start,
+    period_end,
+    note: str | None = None,
+    created_by: str | None = None,
+) -> dict | None:
+    """Create a new active subscription. Any prior active subscription for the
+    same user is marked 'superseded' in the same transaction so the partial
+    unique index (one active per user) is respected."""
+    uid = _uuid_or_none(user_id)
+    if uid is None:
+        return None
+    if page_limit < 0:
+        raise ValueError("page_limit must be non-negative")
+    if period_end <= period_start:
+        raise ValueError("period_end must be after period_start")
+    creator_uuid = _uuid_or_none(created_by) if created_by else None
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                UPDATE subscriptions
+                   SET status = 'superseded'
+                 WHERE user_id = $1 AND status = 'active'
+                """,
+                uid,
+            )
+            row = await conn.fetchrow(
+                """
+                INSERT INTO subscriptions
+                    (user_id, page_limit, period_start, period_end, status, note, created_by)
+                VALUES ($1, $2, $3, $4, 'active', $5, $6)
+                RETURNING id, user_id, page_limit, period_start, period_end,
+                          status, note, created_by, created_at
+                """,
+                uid, int(page_limit), period_start, period_end, note, creator_uuid,
+            )
+            # Keep the legacy users.subscription_limit in sync so any code path
+            # that still reads it sees the new base.
+            await conn.execute(
+                "UPDATE users SET subscription_limit = $1 WHERE id = $2",
+                int(page_limit), uid,
+            )
+    return _row_subscription(row)
+
+
+async def cancel_subscription(
+    pool: asyncpg.Pool,
+    user_id: str,
+    subscription_id: int,
+) -> bool:
+    """Mark a subscription as cancelled (admin action). Only affects rows
+    belonging to this user; idempotent if already cancelled."""
+    uid = _uuid_or_none(user_id)
+    if uid is None:
+        return False
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await conn.execute(
+                """
+                UPDATE subscriptions
+                   SET status = 'cancelled'
+                 WHERE id = $1 AND user_id = $2 AND status = 'active'
+                """,
+                int(subscription_id), uid,
+            )
+            is_cancelled = result == "UPDATE 1"
+            if is_cancelled:
+                await conn.execute(
+                    "UPDATE users SET subscription_limit = 0 WHERE id = $1",
+                    uid,
+                )
+            return is_cancelled
+
+
+async def get_active_subscription(
+    pool: asyncpg.Pool,
+    user_id: str,
+) -> dict | None:
+    """Return the user's currently active subscription, or None.
+    Auto-expires stale rows before reading."""
+    uid = _uuid_or_none(user_id)
+    if uid is None:
+        return None
+    async with pool.acquire() as conn:
+        # Lazy expiry — keeps reads correct even if a background job hasn't run.
+        await conn.execute(
+            """
+            WITH expired AS (
+                UPDATE subscriptions
+                   SET status = 'expired'
+                 WHERE user_id = $1 AND status = 'active' AND period_end < NOW()
+                 RETURNING user_id
+            )
+            UPDATE users
+               SET subscription_limit = 0
+             WHERE id IN (SELECT user_id FROM expired)
+            """,
+            uid,
+        )
+        row = await conn.fetchrow(
+            """
+            SELECT id, user_id, page_limit, period_start, period_end,
+                   status, note, created_by, created_at
+            FROM subscriptions
+            WHERE user_id = $1 AND status = 'active'
+            LIMIT 1
+            """,
+            uid,
+        )
+    return _row_subscription(row)
+
+
+async def list_user_subscriptions(
+    pool: asyncpg.Pool,
+    user_id: str,
+) -> list[dict]:
+    """All subscriptions for this user, newest first."""
+    uid = _uuid_or_none(user_id)
+    if uid is None:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, user_id, page_limit, period_start, period_end,
+                   status, note, created_by, created_at
+            FROM subscriptions
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+            """,
+            uid,
+        )
+    return [_row_subscription(r) for r in rows]
+
+
+async def add_topup(
+    pool: asyncpg.Pool,
+    user_id: str,
+    pages: int,
+    note: str | None = None,
+    created_by: str | None = None,
+) -> dict | None:
+    """Attach pages to the user's current active subscription.
+    Returns None if there is no active subscription (admin must create
+    a subscription period first)."""
+    uid = _uuid_or_none(user_id)
+    if uid is None:
+        return None
+    if pages <= 0:
+        raise ValueError("topup pages must be positive")
+    creator_uuid = _uuid_or_none(created_by) if created_by else None
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                WITH expired AS (
+                    UPDATE subscriptions
+                       SET status = 'expired'
+                     WHERE user_id = $1 AND status = 'active' AND period_end < NOW()
+                     RETURNING user_id
+                )
+                UPDATE users
+                   SET subscription_limit = 0
+                 WHERE id IN (SELECT user_id FROM expired)
+                """,
+                uid,
+            )
+            sub = await conn.fetchrow(
+                "SELECT id FROM subscriptions WHERE user_id = $1 AND status = 'active' LIMIT 1",
+                uid,
+            )
+            if not sub:
+                return None
+            row = await conn.fetchrow(
+                """
+                INSERT INTO topups (user_id, subscription_id, pages, note, created_by)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id, user_id, subscription_id, pages, note, created_by, created_at
+                """,
+                uid, int(sub["id"]), int(pages), note, creator_uuid,
+            )
+    return _row_subscription(row)
+
+
+async def list_topups_for_subscription(
+    pool: asyncpg.Pool,
+    subscription_id: int,
+) -> list[dict]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, user_id, subscription_id, pages, note, created_by, created_at
+            FROM topups
+            WHERE subscription_id = $1
+            ORDER BY created_at DESC
+            """,
+            int(subscription_id),
+        )
+    return [_row_subscription(r) for r in rows]
+
+
+async def list_topups_for_user(
+    pool: asyncpg.Pool,
+    user_id: str,
+) -> list[dict]:
+    uid = _uuid_or_none(user_id)
+    if uid is None:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, user_id, subscription_id, pages, note, created_by, created_at
+            FROM topups
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+            """,
+            uid,
+        )
+    return [_row_subscription(r) for r in rows]
+
+
+async def get_user_quota_v2(
+    pool: asyncpg.Pool,
+    user_id: str,
+) -> dict:
+    """Compute the current page quota for a user using the new model.
+
+    Returns:
+        {
+          has_active_subscription: bool,
+          subscription_id: int | None,
+          period_start: datetime | None,
+          period_end: datetime | None,
+          base_limit: int,        # subscription.page_limit
+          topup_total: int,       # sum of topups for this subscription
+          effective_limit: int,   # base + topups
+          used: int,              # pages billed within window
+          pending: int,           # pages reserved by in-flight uploads (legacy)
+          remaining: int,         # max(effective_limit - used - pending, 0)
+          status: str,            # 'active' | 'expired' | 'none'
+        }
+
+    For users with no active subscription we still return a shape so callers
+    don't need null-checks; effective_limit/remaining are 0.
+    """
+    uid = _uuid_or_none(user_id)
+    blank = {
+        "has_active_subscription": False,
+        "subscription_id": None,
+        "period_start": None,
+        "period_end": None,
+        "base_limit": 0,
+        "topup_total": 0,
+        "effective_limit": 0,
+        "used": 0,
+        "pending": 0,
+        "remaining": 0,
+        "status": "none",
+    }
+    if uid is None:
+        return blank
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            WITH expired AS (
+                UPDATE subscriptions
+                   SET status = 'expired'
+                 WHERE user_id = $1 AND status = 'active' AND period_end < NOW()
+                 RETURNING user_id
+            )
+            UPDATE users
+               SET subscription_limit = 0
+             WHERE id IN (SELECT user_id FROM expired)
+            """,
+            uid,
+        )
+        sub = await conn.fetchrow(
+            """
+            SELECT id, page_limit, period_start, period_end
+            FROM subscriptions
+            WHERE user_id = $1 AND status = 'active'
+            LIMIT 1
+            """,
+            uid,
+        )
+        pending_row = await conn.fetchrow(
+            "SELECT COALESCE(pending_pages, 0) AS pending FROM users WHERE id = $1",
+            uid,
+        )
+        pending = int(pending_row["pending"]) if pending_row else 0
+        if not sub:
+            return {**blank, "pending": pending}
+        sub_id = int(sub["id"])
+        base_limit = int(sub["page_limit"])
+        period_start = sub["period_start"]
+        period_end = sub["period_end"]
+        topup_total = int(await conn.fetchval(
+            "SELECT COALESCE(SUM(pages), 0) FROM topups WHERE subscription_id = $1",
+            sub_id,
+        ) or 0)
+        used = int(await conn.fetchval(
+            """
+            SELECT COUNT(DISTINCT (lu.extraction_id, lu.page_num))
+            FROM llm_usage lu
+            WHERE lu.user_id = $1
+              AND lu.call_type = 'extraction'
+              AND lu.page_num IS NOT NULL
+              AND lu.ts >= $2 AND lu.ts < $3
+            """,
+            uid, period_start, period_end,
+        ) or 0)
+    effective_limit = base_limit + topup_total
+    remaining = max(effective_limit - used - pending, 0)
+    return {
+        "has_active_subscription": True,
+        "subscription_id": sub_id,
+        "period_start": period_start,
+        "period_end": period_end,
+        "base_limit": base_limit,
+        "topup_total": topup_total,
+        "effective_limit": effective_limit,
+        "used": used,
+        "pending": pending,
+        "remaining": remaining,
+        "status": "active",
+    }
+
+
+async def get_user_history(
+    pool: asyncpg.Pool,
+    user_id: str,
+) -> dict:
+    """Return all subscriptions + all topups for a user (admin history view).
+    Topups carry their subscription's period dates so the UI can show them
+    on the same timeline."""
+    uid = _uuid_or_none(user_id)
+    if uid is None:
+        return {"subscriptions": [], "topups": []}
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            WITH expired AS (
+                UPDATE subscriptions
+                   SET status = 'expired'
+                 WHERE user_id = $1 AND status = 'active' AND period_end < NOW()
+                 RETURNING user_id
+            )
+            UPDATE users
+               SET subscription_limit = 0
+             WHERE id IN (SELECT user_id FROM expired)
+            """,
+            uid,
+        )
+        subs = await conn.fetch(
+            """
+            SELECT s.id, s.page_limit, s.period_start, s.period_end,
+                   s.status, s.note, s.created_at,
+                   admin.email AS created_by_email,
+                   COALESCE((SELECT SUM(pages) FROM topups WHERE subscription_id = s.id), 0)::INT
+                       AS topup_total,
+                   (
+                       SELECT COUNT(DISTINCT (lu.extraction_id, lu.page_num))
+                       FROM llm_usage lu
+                       WHERE lu.user_id = s.user_id
+                         AND lu.call_type = 'extraction'
+                         AND lu.page_num IS NOT NULL
+                         AND lu.ts >= s.period_start AND lu.ts < s.period_end
+                   )::INT AS pages_used
+            FROM subscriptions s
+            LEFT JOIN users admin ON admin.id = s.created_by
+            WHERE s.user_id = $1
+            ORDER BY s.created_at DESC
+            """,
+            uid,
+        )
+        tops = await conn.fetch(
+            """
+            SELECT t.id, t.subscription_id, t.pages, t.note, t.created_at,
+                   admin.email AS created_by_email,
+                   s.period_start AS sub_period_start,
+                   s.period_end   AS sub_period_end,
+                   s.status       AS sub_status
+            FROM topups t
+            JOIN subscriptions s ON s.id = t.subscription_id
+            LEFT JOIN users admin ON admin.id = t.created_by
+            WHERE t.user_id = $1
+            ORDER BY t.created_at DESC
+            """,
+            uid,
+        )
+    return {
+        "subscriptions": [dict(r) for r in subs],
+        "topups": [dict(r) for r in tops],
+    }
 
 
 # -- User config -----------------------------------------------------------
@@ -3518,6 +4218,8 @@ async def list_api_keys(pool: asyncpg.Pool) -> list[dict]:
             SELECT ak.id, ak.user_id, ak.label, ak.prefix, ak.is_active,
                    ak.created_at, ak.last_used_at, ak.expires_at,
                    u.email AS owner_email,
+                   COALESCE(SUM(lu.prompt_tokens), 0)::BIGINT AS total_input_tokens,
+                   COALESCE(SUM(lu.completion_tokens), 0)::BIGINT AS total_output_tokens,
                    COALESCE(SUM(lu.total_tokens), 0)::BIGINT AS total_tokens,
                    COALESCE(COUNT(DISTINCT (lu.extraction_id, lu.page_num)) FILTER (WHERE lu.call_type = 'extraction' AND lu.page_num IS NOT NULL), 0)::BIGINT AS total_pages,
                    COUNT(DISTINCT lu.doc_id)::INT AS total_documents
@@ -3650,4 +4352,270 @@ async def delete_idempotency_claim(pool: asyncpg.Pool, user_id: str, idempotency
             "DELETE FROM idempotency_claims WHERE user_id=$1 AND idempotency_key=$2",
             _uuid_or_none(user_id), idempotency_key,
         )
+
+
+# -- Output schema helpers -------------------------------------------------
+
+def _schema_row(row: asyncpg.Record) -> dict:
+    d = dict(row)
+    for k in ("header_fields", "line_fields", "header_fields_snapshot", "line_fields_snapshot"):
+        if d.get(k) is None:
+            d[k] = []
+        elif isinstance(d[k], str):
+            import json as _json
+            d[k] = _json.loads(d[k])
+    return d
+
+
+async def get_all_schemas(pool: asyncpg.Pool) -> list[dict]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM output_schemas ORDER BY is_system DESC, id ASC"
+        )
+    return [_schema_row(r) for r in rows]
+
+
+async def get_schema_by_id(pool: asyncpg.Pool, schema_id: int) -> dict | None:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM output_schemas WHERE id=$1", schema_id)
+    return _schema_row(row) if row else None
+
+
+async def get_schema_by_slug(pool: asyncpg.Pool, slug: str) -> dict | None:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM output_schemas WHERE slug=$1", slug)
+    return _schema_row(row) if row else None
+
+
+async def create_schema(
+    pool: asyncpg.Pool,
+    *,
+    name: str,
+    header_fields: list[str],
+    line_fields: list[str],
+) -> dict:
+    async with pool.acquire() as conn:
+        import re as _re
+        slug = _re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "schema"
+        # ensure slug uniqueness by appending sequence if needed
+        base_slug = slug
+        for suffix in [""] + [f"_{i}" for i in range(2, 100)]:
+            candidate = base_slug + suffix
+            exists = await conn.fetchval(
+                "SELECT 1 FROM output_schemas WHERE slug=$1", candidate
+            )
+            if not exists:
+                slug = candidate
+                break
+        row = await conn.fetchrow(
+            """INSERT INTO output_schemas
+                   (name, slug, is_system, header_fields, line_fields,
+                    header_fields_snapshot, line_fields_snapshot)
+               VALUES ($1,$2,FALSE,$3::text[],$4::text[],$3::text[],$4::text[])
+               RETURNING *""",
+            name, slug, header_fields, line_fields,
+        )
+    return _schema_row(row)
+
+
+async def update_schema(
+    pool: asyncpg.Pool,
+    schema_id: int,
+    *,
+    name: str,
+    header_fields: list[str],
+    line_fields: list[str],
+) -> dict:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """UPDATE output_schemas
+               SET name=$2,
+                   header_fields=$3::text[], line_fields=$4::text[],
+                   header_fields_snapshot=$3::text[], line_fields_snapshot=$4::text[],
+                   updated_at=NOW()
+               WHERE id=$1
+               RETURNING *""",
+            schema_id, name, header_fields, line_fields,
+        )
+    if not row:
+        raise ValueError(f"Schema {schema_id} not found")
+    return _schema_row(row)
+
+
+async def delete_schema(pool: asyncpg.Pool, schema_id: int) -> None:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT is_system FROM output_schemas WHERE id=$1", schema_id
+        )
+        if not row:
+            raise ValueError(f"Schema {schema_id} not found")
+        if row["is_system"]:
+            raise ValueError("System schemas cannot be deleted")
+        await conn.execute("DELETE FROM output_schemas WHERE id=$1", schema_id)
+
+
+async def reset_schema(pool: asyncpg.Pool, schema_id: int) -> dict:
+    """Restore header_fields / line_fields from their last-saved snapshot."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """UPDATE output_schemas
+               SET header_fields = header_fields_snapshot,
+                   line_fields   = line_fields_snapshot,
+                   updated_at    = NOW()
+               WHERE id=$1
+               RETURNING *""",
+            schema_id,
+        )
+    if not row:
+        raise ValueError(f"Schema {schema_id} not found")
+    return _schema_row(row)
+
+
+async def get_schema_for_vendor(pool: asyncpg.Pool, vendor_id: str) -> dict | None:
+    """Return the output schema assigned to a vendor's field mapping, or None."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT s.* FROM output_schemas s
+               JOIN field_mappings fm ON fm.schema_id = s.id
+               WHERE fm.vendor_id = $1""",
+            vendor_id,
+        )
+    return _schema_row(row) if row else None
+
+
+# -- Top-up requests -------------------------------------------------------
+
+def _row_topup_request(row: asyncpg.Record) -> dict:
+    d = dict(row)
+    for k in ("user_id", "resolved_by"):
+        if d.get(k) is not None:
+            d[k] = str(d[k])
+    return d
+
+
+async def create_topup_request(
+    pool: asyncpg.Pool,
+    user_id: str,
+    requested_pages: int,
+    requested_period: str,
+    note: str | None = None,
+) -> dict:
+    uid = _uuid_or_none(user_id)
+    if uid is None:
+        raise ValueError("Invalid user_id")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO topup_requests (user_id, requested_pages, requested_period, note)
+            VALUES ($1, $2, $3, $4)
+            RETURNING *
+            """,
+            uid, requested_pages, requested_period, note,
+        )
+    return _row_topup_request(row)
+
+
+async def list_topup_requests(
+    pool: asyncpg.Pool,
+    status: str | None = None,
+) -> list[dict]:
+    """List all top-up requests, optionally filtered by status. Joins user email."""
+    async with pool.acquire() as conn:
+        if status:
+            rows = await conn.fetch(
+                """
+                SELECT tr.*, u.email AS user_email,
+                       ru.email AS resolved_by_email
+                FROM topup_requests tr
+                JOIN users u ON u.id = tr.user_id
+                LEFT JOIN users ru ON ru.id = tr.resolved_by
+                WHERE tr.status = $1
+                ORDER BY tr.created_at DESC
+                """,
+                status,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT tr.*, u.email AS user_email,
+                       ru.email AS resolved_by_email
+                FROM topup_requests tr
+                JOIN users u ON u.id = tr.user_id
+                LEFT JOIN users ru ON ru.id = tr.resolved_by
+                ORDER BY tr.created_at DESC
+                """,
+            )
+    return [_row_topup_request(r) for r in rows]
+
+
+async def list_topup_requests_for_user(
+    pool: asyncpg.Pool,
+    user_id: str,
+) -> list[dict]:
+    uid = _uuid_or_none(user_id)
+    if uid is None:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT tr.*, ru.email AS resolved_by_email
+            FROM topup_requests tr
+            LEFT JOIN users ru ON ru.id = tr.resolved_by
+            WHERE tr.user_id = $1
+            ORDER BY tr.created_at DESC
+            """,
+            uid,
+        )
+    return [_row_topup_request(r) for r in rows]
+
+
+async def get_topup_request(
+    pool: asyncpg.Pool,
+    request_id: int,
+) -> dict | None:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT tr.*, u.email AS user_email,
+                   ru.email AS resolved_by_email
+            FROM topup_requests tr
+            JOIN users u ON u.id = tr.user_id
+            LEFT JOIN users ru ON ru.id = tr.resolved_by
+            WHERE tr.id = $1
+            """,
+            request_id,
+        )
+    return _row_topup_request(row) if row else None
+
+
+async def resolve_topup_request(
+    pool: asyncpg.Pool,
+    request_id: int,
+    resolved_by: str,
+    status: str,  # 'approved' | 'rejected'
+    resolution_note: str | None = None,
+) -> dict | None:
+    admin_uid = _uuid_or_none(resolved_by)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE topup_requests
+               SET status = $1,
+                   resolution_note = $2,
+                   resolved_by = $3,
+                   resolved_at = NOW()
+             WHERE id = $4 AND status = 'pending'
+             RETURNING *
+            """,
+            status, resolution_note, admin_uid, request_id,
+        )
+    return _row_topup_request(row) if row else None
+
+
+async def get_pending_topup_request_count(pool: asyncpg.Pool) -> int:
+    async with pool.acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT COUNT(*) FROM topup_requests WHERE status = 'pending'"
+        )
+    return int(val or 0)
 

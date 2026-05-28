@@ -100,6 +100,43 @@ class WorkerPipelineTests(unittest.IsolatedAsyncioTestCase):
             {"stage": "ocr", "pages_processed": 1, "scanned_pages": 1},
         )
 
+    async def test_ocr_page_error_fails_stage_instead_of_saving_blank_page(self) -> None:
+        pool = object()
+        job = {"id": 13, "extraction_id": 23, "document_id": 33}
+        extraction = {"id": 23}
+        ocr_pages = [{"page_number": 1, "words": [], "_ocr_error": "model missing"}]
+
+        with patch.object(worker.db_mod, "get_extraction", new=AsyncMock(return_value=extraction)), \
+             patch.object(worker.db_mod, "update_extraction_progress", new=AsyncMock()), \
+             patch.object(worker.db_mod, "get_pages", new=AsyncMock(return_value=[{"page_number": 1, "source": "scanned", "char_count": 0, "word_geometry": []}])), \
+             patch.object(worker, "_load_pages", new=AsyncMock(return_value=[{"page_number": 1, "image_b64": "abc"}])), \
+             patch.object(worker.ocr_runner, "run_ocr_on_pages", new=AsyncMock(return_value=ocr_pages)), \
+             patch.object(worker.db_mod, "save_ocr_data", new=AsyncMock()) as mock_save_ocr:
+            with self.assertRaisesRegex(RuntimeError, "PaddleOCR failed"):
+                await worker._process_ocr(pool, job)
+
+        mock_save_ocr.assert_not_awaited()
+
+    async def test_cancelled_ocr_job_raises_sentinel_before_postprocess(self) -> None:
+        pool = object()
+        job = {"id": 14, "extraction_id": 24, "document_id": 34}
+        extraction = {"id": 24, "document_id": 34, "result": None, "page_results": []}
+        page_rows = [{"page_number": 1, "source": "pypdfium", "char_count": 10, "word_geometry": [{"text": "A"}]}]
+
+        with patch.object(worker.db_mod, "get_extraction", new=AsyncMock(return_value=extraction)), \
+             patch.object(worker.db_mod, "get_document", new=AsyncMock(return_value=None)), \
+             patch.object(worker.db_mod, "set_extraction_status", new=AsyncMock()), \
+             patch.object(worker.db_mod, "update_extraction_progress", new=AsyncMock()), \
+             patch.object(worker.db_mod, "get_pages", new=AsyncMock(return_value=page_rows)), \
+             patch.object(worker.db_mod, "save_ocr_data", new=AsyncMock()), \
+             patch.object(worker.db_mod, "is_cancel_requested", new=AsyncMock(return_value=True)), \
+             patch.object(worker.db_mod, "update_job_progress", new=AsyncMock()), \
+             patch.object(worker, "_maybe_enqueue_postprocess", new=AsyncMock()) as mock_enqueue:
+            with self.assertRaises(worker.JobCancelled):
+                await worker._process_ocr(pool, job)
+
+        mock_enqueue.assert_not_awaited()
+
 
 if __name__ == "__main__":
     unittest.main()

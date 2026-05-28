@@ -1,29 +1,33 @@
 """
-test_scheduler_edge_cases.py — Edge cases for the new scheduler features.
+test_scheduler_edge_cases.py — Edge cases for the scheduler features.
+
+Now that APScheduler has been removed, the server stores schedule metadata in
+the user_schedules table and computes next_run with datetime math. The client
+agent handles all timing and folder scanning.
 
 Covers:
   - set_schedule_executing / get_user_is_executing (DB layer)
-  - _run_schedule is_executing lifecycle (set True → finally False, every code path)
   - Upload conflict: get_user_is_executing blocks UI upload
-  - max_instances=1 / coalesce=True enforced in sync_job
   - Multi-schedule: max-3 limit via DB count checks
   - Timezone: cron_expr stores UTC values
+  - compute_next_run edge cases
 
-All DB, APScheduler, and filesystem calls are mocked — no live services.
+All DB calls are mocked — no live services.
 """
 from __future__ import annotations
 
 import sys
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backend import db as db_mod
-from backend import scheduler as sched_mod
+from backend.scheduler import compute_next_run
 
 
 # ---------------------------------------------------------------------------
@@ -55,34 +59,6 @@ def _sched_row(schedule_id: int, user_id: str,
         "timezone": "UTC", "label": "", "enabled": enabled,
         "is_executing": is_executing, "last_ran_at": None,
     }
-
-
-def _mock_apscheduler():
-    s = MagicMock()
-    s.running = True
-    s.add_job  = MagicMock()
-    s.remove_job = MagicMock()
-    s.get_job  = MagicMock(return_value=None)
-    return s
-
-
-class _FakePath:
-    def __init__(self, path_str, *, is_dir=True, pdfs=None):
-        self._s   = path_str
-        self._dir = is_dir
-        self._pdfs = list(pdfs or [])
-
-    def is_dir(self):   return self._dir
-    def glob(self, pat): return iter(self._pdfs if pat == "*.pdf" else [])
-    def __str__(self):   return self._s
-    def __fspath__(self): return self._s
-
-
-def _path_factory(configs: dict):
-    def make(p):
-        cfg = configs.get(str(p), {})
-        return _FakePath(str(p), is_dir=cfg.get("is_dir", False), pdfs=cfg.get("pdfs", []))
-    return make
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +143,6 @@ class GetUserIsExecutingTests(unittest.IsolatedAsyncioTestCase):
     async def test_different_users_independent(self):
         """User A executing must not influence check for user B."""
         uid_a, uid_b = _uid(1), _uid(2)
-        # user A pool returns True, user B pool returns False
         pool_a, _ = _make_pool(fetchrow_val={"running": True})
         pool_b, _ = _make_pool(fetchrow_val={"running": False})
         self.assertTrue(await db_mod.get_user_is_executing(pool_a, uid_a))
@@ -175,240 +150,7 @@ class GetUserIsExecutingTests(unittest.IsolatedAsyncioTestCase):
 
 
 # ---------------------------------------------------------------------------
-# 3. _run_schedule is_executing lifecycle
-# ---------------------------------------------------------------------------
-
-class RunScheduleIsExecutingTests(unittest.IsolatedAsyncioTestCase):
-    """
-    Verify that is_executing is set True before ingesting and always cleared
-    to False in the finally block, across every code path.
-    """
-
-    def setUp(self):
-        sched_mod._ctx.clear()
-
-    async def _fire(self, schedule_id, user_id, config, path_configs=None,
-                    ingest_raises=False):
-        mock_pool = MagicMock()
-        exec_calls = []   # captures (sid, bool)
-        ingest_calls = []
-
-        async def ingest_cb(uid, path):
-            if ingest_raises:
-                raise RuntimeError("ingest failed")
-            ingest_calls.append((str(uid), path))
-
-        async def set_executing(pool, sid, val):
-            exec_calls.append((sid, val))
-
-        sched_mod.set_context(mock_pool, ingest_cb)
-
-        async def get_config(pool, uid):
-            return config
-
-        factory = _path_factory(path_configs or {})
-
-        with patch("backend.db.get_user_config",      side_effect=get_config), \
-             patch("backend.db.mark_schedule_ran",    new_callable=AsyncMock), \
-             patch("backend.db.set_schedule_executing", side_effect=set_executing), \
-             patch("pathlib.Path", side_effect=factory):
-            await sched_mod._run_schedule(schedule_id=schedule_id, user_id=user_id)
-
-        return ingest_calls, exec_calls
-
-    async def test_sets_executing_true_before_ingesting(self):
-        """is_executing=True must be set BEFORE any ingest_cb call."""
-        uid = _uid(1)
-        folder = "/data/c1"
-        pdfs   = [f"{folder}/a.pdf", f"{folder}/b.pdf"]
-        ingest_calls, exec_calls = await self._fire(
-            1, uid,
-            config={"input_folder": folder},
-            path_configs={folder: {"is_dir": True, "pdfs": pdfs}},
-        )
-        self.assertIn((1, True), exec_calls,
-                      "set_schedule_executing(True) must be called when PDFs exist")
-        # True must appear before any ingest work happens (exec_calls list order)
-        self.assertEqual(exec_calls[0], (1, True))
-
-    async def test_clears_executing_after_success(self):
-        """After successful run, is_executing must be set back to False."""
-        uid = _uid(2)
-        folder = "/data/c2"
-        pdfs = [f"{folder}/doc.pdf"]
-        _, exec_calls = await self._fire(
-            2, uid,
-            config={"input_folder": folder},
-            path_configs={folder: {"is_dir": True, "pdfs": pdfs}},
-        )
-        self.assertIn((2, False), exec_calls,
-                      "set_schedule_executing(False) must always be called in finally")
-        # Last call must be False (cleanup)
-        self.assertEqual(exec_calls[-1], (2, False))
-
-    async def test_order_is_true_then_false(self):
-        """True is set first, False is set last — no inversion."""
-        uid = _uid(3)
-        folder = "/data/c3"
-        pdfs = [f"{folder}/x.pdf"]
-        _, exec_calls = await self._fire(
-            3, uid,
-            config={"input_folder": folder},
-            path_configs={folder: {"is_dir": True, "pdfs": pdfs}},
-        )
-        self.assertEqual(len(exec_calls), 2)
-        self.assertEqual(exec_calls[0], (3, True))
-        self.assertEqual(exec_calls[1], (3, False))
-
-    async def test_clears_executing_even_when_ingest_raises(self):
-        """If ingest throws, finally must still clear is_executing."""
-        uid = _uid(4)
-        folder = "/data/c4"
-        pdfs = [f"{folder}/fail.pdf"]
-        _, exec_calls = await self._fire(
-            4, uid,
-            config={"input_folder": folder},
-            path_configs={folder: {"is_dir": True, "pdfs": pdfs}},
-            ingest_raises=True,
-        )
-        # True was set before the failing ingest
-        self.assertIn((4, True), exec_calls)
-        # False must be called in finally even though ingest raised
-        self.assertIn((4, False), exec_calls)
-        self.assertEqual(exec_calls[-1], (4, False))
-
-    async def test_no_pdfs_never_sets_executing_true(self):
-        """Empty folder → returns early before set(True). Only finally set(False) runs."""
-        uid = _uid(5)
-        folder = "/data/empty"
-        _, exec_calls = await self._fire(
-            5, uid,
-            config={"input_folder": folder},
-            path_configs={folder: {"is_dir": True, "pdfs": []}},
-        )
-        true_calls  = [c for c in exec_calls if c == (5, True)]
-        self.assertEqual(len(true_calls), 0,
-                         "set_executing(True) must NOT be called when no PDFs found")
-
-    async def test_missing_folder_never_sets_executing_true(self):
-        """Non-existent folder → early return before set(True)."""
-        uid = _uid(6)
-        folder = "/data/gone"
-        _, exec_calls = await self._fire(
-            6, uid,
-            config={"input_folder": folder},
-            path_configs={folder: {"is_dir": False, "pdfs": []}},
-        )
-        true_calls = [c for c in exec_calls if c == (6, True)]
-        self.assertEqual(len(true_calls), 0)
-
-    async def test_no_input_folder_config_never_sets_executing_true(self):
-        """No input_folder in config → earliest return, no set(True) call."""
-        uid = _uid(7)
-        _, exec_calls = await self._fire(7, uid, config={})
-        true_calls = [c for c in exec_calls if c == (7, True)]
-        self.assertEqual(len(true_calls), 0)
-
-    async def test_no_context_makes_zero_executing_calls(self):
-        """Pool=None → returns before the try block; set_executing never called."""
-        sched_mod._ctx.clear()
-        exec_calls = []
-
-        async def set_executing(pool, sid, val):
-            exec_calls.append((sid, val))
-
-        with patch("backend.db.set_schedule_executing", side_effect=set_executing):
-            await sched_mod._run_schedule(schedule_id=1, user_id=_uid(1))
-
-        self.assertEqual(exec_calls, [],
-                         "No set_executing calls when context is missing")
-
-    async def test_multiple_pdfs_sets_true_only_once(self):
-        """is_executing=True should be set exactly once regardless of PDF count."""
-        uid = _uid(8)
-        folder = "/data/many"
-        pdfs = [f"{folder}/f{i}.pdf" for i in range(10)]
-        _, exec_calls = await self._fire(
-            8, uid,
-            config={"input_folder": folder},
-            path_configs={folder: {"is_dir": True, "pdfs": pdfs}},
-        )
-        true_calls = [c for c in exec_calls if c[1] is True]
-        self.assertEqual(len(true_calls), 1,
-                         "set_executing(True) must be called exactly once")
-
-
-# ---------------------------------------------------------------------------
-# 4. sync_job — APScheduler job configuration
-# ---------------------------------------------------------------------------
-
-class SyncJobConfigTests(unittest.IsolatedAsyncioTestCase):
-    """Verify that sync_job passes the right options to APScheduler."""
-
-    def setUp(self):
-        self._orig = sched_mod._scheduler
-        sched_mod._scheduler = _mock_apscheduler()
-
-    def tearDown(self):
-        sched_mod._scheduler = self._orig
-
-    def test_max_instances_is_1(self):
-        """max_instances=1 prevents the same schedule running twice concurrently."""
-        row = _sched_row(1, _uid(1))
-        sched_mod.sync_job(row)
-        kwargs = sched_mod._scheduler.add_job.call_args[1]
-        self.assertEqual(kwargs.get("max_instances"), 1)
-
-    def test_coalesce_is_true(self):
-        """coalesce=True means missed fires run once, not N times."""
-        row = _sched_row(2, _uid(2))
-        sched_mod.sync_job(row)
-        kwargs = sched_mod._scheduler.add_job.call_args[1]
-        self.assertTrue(kwargs.get("coalesce"))
-
-    def test_replace_existing_is_true(self):
-        """replace_existing=True prevents duplicate job registration on reload."""
-        row = _sched_row(3, _uid(3))
-        sched_mod.sync_job(row)
-        kwargs = sched_mod._scheduler.add_job.call_args[1]
-        self.assertTrue(kwargs.get("replace_existing"))
-
-    def test_job_kwargs_embed_schedule_id_and_user_id(self):
-        """APScheduler job kwargs must carry schedule_id and user_id exactly."""
-        uid = _uid(4)
-        row = _sched_row(10, uid)
-        sched_mod.sync_job(row)
-        job_kwargs = sched_mod._scheduler.add_job.call_args[1]["kwargs"]
-        self.assertEqual(job_kwargs["schedule_id"], 10)
-        self.assertEqual(str(job_kwargs["user_id"]).replace("-", ""),
-                         uid.replace("-", ""))
-
-    def test_disabled_schedule_removes_job(self):
-        """sync_job for a disabled row must remove — not add — the job."""
-        sched_mod._scheduler.remove_job = MagicMock()
-        row = _sched_row(5, _uid(5), enabled=False)
-        sched_mod.sync_job(row)
-        sched_mod._scheduler.add_job.assert_not_called()
-        sched_mod._scheduler.remove_job.assert_called_once()
-
-    def test_invalid_cron_does_not_call_add_job(self):
-        """A malformed cron_expr must be silently skipped — no add_job call."""
-        row = {**_sched_row(6, _uid(6)), "cron_expr": "bad cron"}
-        sched_mod.sync_job(row)
-        sched_mod._scheduler.add_job.assert_not_called()
-
-    def test_two_schedules_same_user_get_different_job_ids(self):
-        """Two schedule rows for the same user must produce distinct job IDs."""
-        uid = _uid(7)
-        sched_mod.sync_job(_sched_row(1, uid, "0 10 * * *"))
-        sched_mod.sync_job(_sched_row(2, uid, "0 20 * * *"))
-        calls = sched_mod._scheduler.add_job.call_args_list
-        ids = [c[1]["id"] for c in calls]
-        self.assertEqual(len(set(ids)), 2, "Job IDs must be distinct per schedule row")
-
-
-# ---------------------------------------------------------------------------
-# 5. Upload conflict: get_user_is_executing used to block UI uploads
+# 3. Upload conflict: get_user_is_executing used to block UI uploads
 # ---------------------------------------------------------------------------
 
 class UploadConflictLogicTests(unittest.IsolatedAsyncioTestCase):
@@ -430,12 +172,8 @@ class UploadConflictLogicTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result)
 
     async def test_scheduler_completes_then_upload_allowed(self):
-        """
-        Simulate: scheduler sets True → runs → sets False.
-        After False, upload check returns False (allowed).
-        """
+        """After scheduler finishes, upload check returns False (allowed)."""
         uid = _uid(3)
-        # Simulate DB state after scheduler finishes
         pool, _ = _make_pool(fetchrow_val={"running": False})
         result = await db_mod.get_user_is_executing(pool, uid)
         self.assertFalse(result)
@@ -457,15 +195,10 @@ class UploadConflictLogicTests(unittest.IsolatedAsyncioTestCase):
 
 
 # ---------------------------------------------------------------------------
-# 6. Multi-schedule: max-3 per user — DB-level validation
+# 4. Multi-schedule: max-3 per user — DB-level validation
 # ---------------------------------------------------------------------------
 
 class MultiScheduleTests(unittest.IsolatedAsyncioTestCase):
-    """
-    Back-end creates schedules via create_user_schedule.
-    The API layer enforces max 3 by counting get_user_schedules before creating.
-    These tests verify the DB functions behave correctly under that constraint.
-    """
 
     async def test_user_can_have_three_independent_schedules(self):
         """Three distinct cron times must produce three rows — no deduplication."""
@@ -482,7 +215,6 @@ class MultiScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(crons, {"0 10 * * *", "0 13 * * *", "0 19 * * *"})
 
     async def test_get_user_schedules_returns_correct_count(self):
-        """API reads count from get_user_schedules to enforce max-3 guard."""
         uid = _uid(2)
         rows = [_sched_row(i, uid) for i in range(1, 4)]
         pool, _ = _make_pool(rows)
@@ -490,19 +222,16 @@ class MultiScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result), 3)
 
     async def test_create_schedule_passes_cron_correctly(self):
-        """Newly created schedule must store the supplied cron expression."""
         uid = _uid(3)
         cron = "30 13 * * *"
         row = _sched_row(4, uid, cron)
         pool, conn = _make_pool(fetchrow_val=row)
         result = await db_mod.create_user_schedule(pool, uid, cron, "UTC", "afternoon")
         self.assertEqual(result["cron_expr"], cron)
-        # Verify the cron was passed as a positional arg to fetchrow
         args = conn.fetchrow.call_args[0]
         self.assertIn(cron, args)
 
     async def test_each_schedule_has_unique_id(self):
-        """Three schedules for the same user must have three distinct IDs."""
         uid = _uid(4)
         rows = [_sched_row(i, uid) for i in range(10, 13)]
         pool, _ = _make_pool(rows)
@@ -511,18 +240,14 @@ class MultiScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(set(ids)), 3)
 
     async def test_stop_one_schedule_leaves_others_enabled(self):
-        """Disabling schedule #2 must pass schedule_id=2 and only schedule_id=2."""
         uid = _uid(5)
         pool, conn = _make_pool(fetchrow_val=_sched_row(2, uid, enabled=False))
         await db_mod.update_user_schedule(pool, 2, enabled=False)
-        # The UPDATE statement was called with schedule_id=2 as the WHERE arg
         args = conn.fetchrow.call_args[0]
-        # Call shape: fetchrow(sql, schedule_id, *values) — schedule_id is args[1]
         self.assertEqual(args[1], 2, "WHERE clause must target schedule_id=2 only")
         self.assertIn("WHERE id", args[0])
 
     async def test_delete_one_schedule_only_calls_execute_once(self):
-        """Deleting schedule 5 must execute exactly one DELETE statement."""
         pool, conn = _make_pool(execute_val="DELETE 1")
         await db_mod.delete_user_schedule(pool, schedule_id=5)
         conn.execute.assert_called_once()
@@ -530,20 +255,13 @@ class MultiScheduleTests(unittest.IsolatedAsyncioTestCase):
 
 
 # ---------------------------------------------------------------------------
-# 7. UTC cron expression storage
+# 5. UTC cron expression storage
 # ---------------------------------------------------------------------------
 
 class CronUTCStorageTests(unittest.IsolatedAsyncioTestCase):
-    """
-    The frontend converts local time → UTC before sending hour/minute.
-    The backend stores and returns UTC values in cron_expr.
-    These tests verify the cron format stored is correct UTC.
-    """
 
     async def test_cron_expr_format_is_minute_hour_stars(self):
-        """cron_expr must follow 'M H * * *' format (standard APScheduler cron)."""
         uid = _uid(1)
-        # Simulate: frontend sent UTC hour=14, minute=51 (e.g. 20:21 IST)
         utc_hour, utc_minute = 14, 51
         cron = f"{utc_minute} {utc_hour} * * *"
         row = _sched_row(1, uid, cron)
@@ -552,7 +270,6 @@ class CronUTCStorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["cron_expr"], "51 14 * * *")
 
     async def test_midnight_utc_cron_format(self):
-        """Midnight UTC → '0 0 * * *'."""
         uid = _uid(2)
         cron = "0 0 * * *"
         pool, _ = _make_pool(fetchrow_val=_sched_row(2, uid, cron))
@@ -560,7 +277,6 @@ class CronUTCStorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["cron_expr"], "0 0 * * *")
 
     async def test_three_utc_schedules_stored_independently(self):
-        """Three daily UTC times stored as three separate cron rows."""
         uid = _uid(3)
         crons = ["0 4 * * *", "30 9 * * *", "0 15 * * *"]
         rows = [_sched_row(i + 1, uid, crons[i]) for i in range(3)]
@@ -570,7 +286,6 @@ class CronUTCStorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored_crons, crons)
 
     def test_cron_parts_parse_back_to_utc(self):
-        """Verify cron '51 14 * * *' parses back to utc_hour=14, utc_minute=51."""
         cron = "51 14 * * *"
         parts = cron.split()
         utc_minute = int(parts[0])
@@ -579,7 +294,6 @@ class CronUTCStorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(utc_minute, 51)
 
     def test_multiple_cron_exprs_parse_correctly(self):
-        """Various hour:minute values round-trip through cron format."""
         cases = [
             (0, 0,   "0 0 * * *"),
             (8, 30,  "30 8 * * *"),
@@ -591,6 +305,44 @@ class CronUTCStorageTests(unittest.IsolatedAsyncioTestCase):
             cron = f"{utc_m} {utc_h} * * *"
             self.assertEqual(cron, expected,
                              f"UTC {utc_h}:{utc_m:02d} → expected '{expected}', got '{cron}'")
+
+
+# ---------------------------------------------------------------------------
+# 6. compute_next_run — additional edge cases
+# ---------------------------------------------------------------------------
+
+class ComputeNextRunEdgeCases(unittest.TestCase):
+    """Additional edge cases beyond test_scheduler_isolation.py."""
+
+    def test_just_before_midnight_returns_today(self):
+        now = datetime(2026, 5, 27, 23, 58, 0, tzinfo=timezone.utc)
+        result = compute_next_run("59 23 * * *", after=now)
+        self.assertEqual(result.day, 27)
+        self.assertEqual(result.hour, 23)
+        self.assertEqual(result.minute, 59)
+
+    def test_just_after_midnight_schedule_returns_today(self):
+        now = datetime(2026, 5, 27, 0, 0, 1, tzinfo=timezone.utc)
+        result = compute_next_run("30 10 * * *", after=now)
+        self.assertEqual(result.day, 27)
+
+    def test_none_input_returns_none(self):
+        self.assertIsNone(compute_next_run(None))
+
+    def test_empty_string_returns_none(self):
+        self.assertIsNone(compute_next_run(""))
+
+    def test_single_token_returns_none(self):
+        self.assertIsNone(compute_next_run("30"))
+
+    def test_negative_hour_returns_none(self):
+        self.assertIsNone(compute_next_run("0 -1 * * *"))
+
+    def test_hour_24_returns_none(self):
+        self.assertIsNone(compute_next_run("0 24 * * *"))
+
+    def test_minute_60_returns_none(self):
+        self.assertIsNone(compute_next_run("60 10 * * *"))
 
 
 if __name__ == "__main__":

@@ -40,6 +40,10 @@ logger = logging.getLogger(__name__)
 setup_mlflow()
 
 
+class JobCancelled(Exception):
+    """Internal sentinel used to stop a worker job without marking it done."""
+
+
 def _pipeline_base(
     *,
     extraction: dict | None = None,
@@ -170,6 +174,26 @@ async def _stop_if_cancelled(pool, extraction_id: int, stage: str, message: str)
     return True
 
 
+async def _release_failed_job_quota(pool, job: dict) -> None:
+    """Release any pending page reservation for a job that will not complete."""
+    extraction_id = job.get("extraction_id")
+    if not extraction_id:
+        return
+    try:
+        extraction_row = await db_mod.get_extraction(pool, extraction_id)
+        if not extraction_row:
+            return
+        document_id = extraction_row.get("document_id") or job.get("document_id")
+        document = await db_mod.get_document(pool, document_id) if document_id else None
+        metadata = (document or {}).get("metadata") or {}
+        billing_uid = metadata.get("billing_user_id")
+        pages = extraction_row.get("total_pages") or metadata.get("reserved_pages") or 0
+        if billing_uid and pages:
+            await db_mod.release_quota_reservation(pool, billing_uid, pages)
+    except Exception as exc:
+        logger.warning("quota release failed (job failure) ext=%s: %s", extraction_id, exc)
+
+
 async def _maybe_enqueue_postprocess(
     pool,
     extraction_id: int,
@@ -214,7 +238,15 @@ async def _process_normalize(pool, job: dict) -> None:
         raw = store.get_bytes(DOCUMENTS_BUCKET, document["object_key"])
     logger.info("Downloaded %s (%d bytes, %.0fms)", document["filename"], len(raw), t["ms"])
     filename = document["filename"].lower()
-    is_pdf = filename.endswith(".pdf")
+    is_pdf = filename.endswith(".pdf") and raw.startswith(b"%PDF")
+    if not is_pdf:
+        # Defense-in-depth: every entry point already runs _require_pdf, so a
+        # non-PDF reaching the worker means a new upload path was added without
+        # the guard. Fail loudly instead of silently processing as an image.
+        raise ValueError(
+            f"Worker received non-PDF document: '{document['filename']}'. "
+            "Only PDFs are supported — check that the upload endpoint enforces _require_pdf."
+        )
 
     # PDF rendering with MLflow tracing
     with trace_span(
@@ -224,14 +256,11 @@ async def _process_normalize(pool, job: dict) -> None:
         attributes=base,
     ) as render_trace:
         with plog.timed("render") as t:
-            if is_pdf:
-                rendered_pages = await processor.pdf_to_images(raw)
-            else:
-                rendered_pages = await processor.image_file_to_b64(raw)
-        logger.info("Rendered %d %s page(s) (%.0fms)", len(rendered_pages), "PDF" if is_pdf else "image", t["ms"])
+            rendered_pages = await processor.pdf_to_images(raw)
+        logger.info("Rendered %d PDF page(s) (%.0fms)", len(rendered_pages), t["ms"])
         render_trace["output"] = {
             "pages_rendered": len(rendered_pages),
-            "document_type": "pdf" if is_pdf else "image",
+            "document_type": "pdf",
             "page_dimensions": [
                 {"page": p["page_number"], "w": p.get("width", 0), "h": p.get("height", 0)}
                 for p in rendered_pages[:5]  # first 5 for brevity
@@ -367,7 +396,7 @@ async def _process_normalize(pool, job: dict) -> None:
                 extraction_id, len(page_rows),
                 len(page_rows) - len(scanned_page_numbers), len(scanned_page_numbers))
     if await _stop_if_cancelled(pool, extraction_id, "normalize", "Cancelled during page rendering"):
-        return
+        raise JobCancelled("Cancelled during page rendering")
     # Run OCR (scanned pages only) and LLM in parallel
     await db_mod.ensure_job(
         pool, extraction_id, document["id"], "ocr",
@@ -474,6 +503,13 @@ async def _process_ocr(pool, job: dict) -> None:
         ) as ocr_trace:
             with plog.timed("paddleocr") as t:
                 ocr_pages = await ocr_runner.run_ocr_on_pages(scanned_pages)
+            failed_ocr_pages = [p for p in ocr_pages if p.get("_ocr_error")]
+            if failed_ocr_pages:
+                details = ", ".join(
+                    f"page {p.get('page_number')}: {p.get('_ocr_error')}"
+                    for p in failed_ocr_pages
+                )
+                raise RuntimeError(f"PaddleOCR failed for scanned page(s): {details}")
             total_w = sum(len(p.get("words") or []) for p in ocr_pages)
             logger.info("PaddleOCR completed: %d scanned pages, %d words (%.0fms)",
                         len(scanned_page_numbers), total_w, t["ms"])
@@ -515,7 +551,7 @@ async def _process_ocr(pool, job: dict) -> None:
         )
 
     if await _stop_if_cancelled(pool, extraction_id, "ocr", "Cancelled during OCR"):
-        return
+        raise JobCancelled("Cancelled during OCR")
     logger.info("── OCR completed ── ext=%s", extraction_id)
     await _maybe_enqueue_postprocess(pool, extraction_id, job["document_id"], _job_trace_context(job))
 
@@ -802,6 +838,21 @@ async def _process_llm(pool, job: dict) -> None:
         }
     logger.info("LLM result persisted: status=%s elapsed=%dms", status, elapsed_ms)
 
+    if output.get("cancelled") and await db_mod.is_cancel_requested(pool, extraction_id):
+        billing_uid = base.get("billing_user_id")
+        if billing_uid:
+            try:
+                _pages = (
+                    extraction_row.get("total_pages")
+                    or ((document_row or {}).get("metadata") or {}).get("reserved_pages")
+                    or 0
+                )
+                if _pages:
+                    await db_mod.release_quota_reservation(pool, billing_uid, _pages)
+            except Exception as exc:
+                logger.warning("quota release failed (llm cancel) ext=%s: %s", extraction_id, exc)
+        raise JobCancelled("Cancelled during LLM extraction")
+
     if status == "processing":
         await _maybe_enqueue_postprocess(pool, extraction_id, job["document_id"], _job_trace_context(job))
 
@@ -954,7 +1005,10 @@ async def _process_postprocess(pool, job: dict) -> None:
 
         mapping = await db_mod.get_field_mapping(pool, vendor_id) if vendor_id else None
         if mapping and (mapping.get("header_map") or mapping.get("line_map")):
-            mapped = _fm.apply_mapping(result, mapping)
+            schema = None
+            if mapping.get("schema_id"):
+                schema = await db_mod.get_schema_by_id(pool, mapping["schema_id"])
+            mapped = _fm.apply_mapping(result, mapping, schema=schema)
             await db_mod.update_extraction_mapped_result(pool, extraction_id, mapped)
             logger.info("ERP field mapping applied: ext=%s", extraction_id)
         else:
@@ -964,7 +1018,7 @@ async def _process_postprocess(pool, job: dict) -> None:
         logger.warning("ERP field mapping failed ext=%s: %s", extraction_id, exc)
 
     if await _stop_if_cancelled(pool, extraction_id, "postprocess", "Cancelled before completion"):
-        return
+        raise JobCancelled("Cancelled before completion")
     await db_mod.set_extraction_status(
         pool,
         extraction_id,
@@ -1065,153 +1119,151 @@ async def run_worker(stage: str, worker_name: str) -> None:
         logger.info("Startup recovery: reset %d stale '%s' job(s) to queued", recovered, stage)
     last_recovery = time.monotonic()
     RECOVERY_INTERVAL = 60.0  # seconds between periodic stale-job sweeps
+    backoff = 2.0
     try:
         while True:
-            # Periodic stale-job recovery (handles jobs that get stuck mid-flight)
-            now = time.monotonic()
-            if now - last_recovery >= RECOVERY_INTERVAL:
-                recovered = await db_mod.recover_stale_jobs(pool, stage, stale_minutes=10)
-                if recovered:
-                    logger.info("Periodic recovery: reset %d stale '%s' job(s) to queued", recovered, stage)
-                last_recovery = now
-
-            job = await db_mod.claim_job(pool, stage, worker_name)
-            if not job:
-                await asyncio.sleep(POLL_INTERVAL_SECONDS)
-                continue
-
-            logger.info("Claimed job id=%s stage=%s extraction=%s", job["id"], stage, job.get("extraction_id"))
             try:
-                job_start = time.perf_counter()
-                await process_job(pool, stage, job)
-                await db_mod.complete_job(pool, job["id"], {"stage": stage, "message": "done"})
-                elapsed = (time.perf_counter() - job_start) * 1000
-                logger.info("Job completed: id=%s stage=%s ext=%s (%.0fms)",
-                            job["id"], stage, job.get("extraction_id"), elapsed)
-            except Exception as exc:
-                logger.exception("Job failed id=%s stage=%s", job["id"], stage)
-                if stage in ("normalize", "ocr", "llm", "postprocess") and job.get("extraction_id"):
-                    try:
-                        _exc_row = await db_mod.get_extraction(pool, job["extraction_id"])
-                        _exc_total = (_exc_row or {}).get("total_pages") or 0
-                        _exc_elapsed = int((time.perf_counter() - job_start) * 1000)
-                        _exc_err = [{"page": None, "error": str(exc), "error_type": page_logger.classify_error_type(str(exc))}]
-                        _exc_base = {
-                            "extraction_id": job["extraction_id"],
-                            "filename": (_exc_row or {}).get("filename"),
-                            "vendor_id": (_exc_row or {}).get("vendor_id"),
-                            "attempt_number": job.get("attempts", 1),
-                            "duration_ms": _exc_elapsed,
-                            "errors": _exc_err,
-                        }
-                        if stage == "normalize":
-                            page_logger.append_log({
-                                **_exc_base,
-                                "total_pages": None,
-                                "billable_pages": 0,
-                                "digital_pages": None,
-                                "scanned_pages": None,
-                                "qwen_extracted_pages": 0,
-                                "qwen_failed_pages": 0,
-                                "qwen_skipped_pages": 0,
-                                "field_count": 0,
-                                "empty_result": True,
-                                "status": "failed_before_page_count",
-                            })
-                        elif stage == "ocr":
-                            page_logger.append_log({
-                                **_exc_base,
-                                "total_pages": _exc_total or None,
-                                "billable_pages": 0,
-                                "digital_pages": None,
-                                "scanned_pages": None,
-                                "qwen_extracted_pages": 0,
-                                "qwen_failed_pages": 0,
-                                "qwen_skipped_pages": _exc_total,
-                                "field_count": 0,
-                                "empty_result": True,
-                                "status": "failed_ocr_stage",
-                            })
-                        elif stage == "llm":
-                            _exc_pr = (_exc_row or {}).get("page_results") or []
-                            _exc_extracted = len([pr for pr in _exc_pr if "_error" not in pr]) if isinstance(_exc_pr, list) else 0
-                            _exc_failed_count = len([pr for pr in _exc_pr if "_error" in pr]) if isinstance(_exc_pr, list) else 0
-                            page_logger.append_log({
-                                **_exc_base,
-                                "total_pages": _exc_total or None,
-                                "billable_pages": _exc_total,
-                                "digital_pages": None,
-                                "scanned_pages": None,
-                                "qwen_extracted_pages": _exc_extracted,
-                                "qwen_failed_pages": _exc_failed_count,
-                                "qwen_skipped_pages": max(0, _exc_total - (_exc_extracted + _exc_failed_count)),
-                                "field_count": 0,
-                                "empty_result": True,
-                                "status": "error",
-                            })
-                        elif stage == "postprocess":
-                            _exc_pr = (_exc_row or {}).get("page_results") or []
-                            _exc_extracted = len([pr for pr in _exc_pr if "_error" not in pr]) if isinstance(_exc_pr, list) else 0
-                            _exc_failed_count = len([pr for pr in _exc_pr if "_error" in pr]) if isinstance(_exc_pr, list) else 0
-                            page_logger.append_log({
-                                **_exc_base,
-                                "total_pages": _exc_total or None,
-                                "billable_pages": _exc_total,
-                                "digital_pages": None,
-                                "scanned_pages": None,
-                                "qwen_extracted_pages": _exc_extracted,
-                                "qwen_failed_pages": _exc_failed_count,
-                                "qwen_skipped_pages": max(0, _exc_total - (_exc_extracted + _exc_failed_count)),
-                                "field_count": page_logger.count_result_fields((_exc_row or {}).get("result")),
-                                "empty_result": not bool((_exc_row or {}).get("result")),
-                                "status": "postprocess_failed",
-                            })
-                    except Exception:
-                        pass
-                if job.get("extraction_id"):
-                    await db_mod.set_extraction_status(
+                # Periodic stale-job recovery (handles jobs that get stuck mid-flight)
+                now = time.monotonic()
+                if now - last_recovery >= RECOVERY_INTERVAL:
+                    recovered = await db_mod.recover_stale_jobs(pool, stage, stale_minutes=10)
+                    if recovered:
+                        logger.info("Periodic recovery: reset %d stale '%s' job(s) to queued", recovered, stage)
+                    last_recovery = now
+
+                job = await db_mod.claim_job(pool, stage, worker_name)
+                # Success communicating with database, reset backoff
+                backoff = 2.0
+
+                if not job:
+                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                    continue
+
+                logger.info("Claimed job id=%s stage=%s extraction=%s", job["id"], stage, job.get("extraction_id"))
+                try:
+                    job_start = time.perf_counter()
+                    await process_job(pool, stage, job)
+                    await db_mod.complete_job(pool, job["id"], {"stage": stage, "message": "done"})
+                    elapsed = (time.perf_counter() - job_start) * 1000
+                    logger.info("Job completed: id=%s stage=%s ext=%s (%.0fms)",
+                                job["id"], stage, job.get("extraction_id"), elapsed)
+                except JobCancelled as exc:
+                    logger.info("Job cancelled id=%s stage=%s ext=%s: %s", job["id"], stage, job.get("extraction_id"), exc)
+                    await db_mod.cancel_job(
                         pool,
-                        job["extraction_id"],
-                        "failed",
-                        progress={"stage": stage, "message": str(exc)},
+                        job["id"],
+                        {"stage": stage, "message": str(exc)},
                         error=str(exc),
                     )
-                    try:
-                        _fr = await db_mod.get_extraction(pool, job["extraction_id"])
-                        _st = plog.current_stage.set("DONE")
+                except Exception as exc:
+                    logger.exception("Job failed id=%s stage=%s", job["id"], stage)
+                    if stage in ("normalize", "ocr", "llm", "postprocess") and job.get("extraction_id"):
                         try:
-                            plog.error(
-                                "── EXTRACTION FAILED ──",
-                                failed_stage=stage,
-                                pages=(_fr or {}).get("total_pages"),
+                            _exc_row = await db_mod.get_extraction(pool, job["extraction_id"])
+                            _exc_total = (_exc_row or {}).get("total_pages") or 0
+                            _exc_elapsed = int((time.perf_counter() - job_start) * 1000)
+                            _exc_err = [{"page": None, "error": str(exc), "error_type": page_logger.classify_error_type(str(exc))}]
+                            _exc_base = {
+                                "extraction_id": job["extraction_id"],
+                                "filename": (_exc_row or {}).get("filename"),
+                                "vendor_id": (_exc_row or {}).get("vendor_id"),
+                                "attempt_number": job.get("attempts", 1),
+                                "duration_ms": _exc_elapsed,
+                                "errors": _exc_err,
+                            }
+                            if stage == "normalize":
+                                page_logger.append_log({
+                                    **_exc_base,
+                                    "total_pages": None,
+                                    "billable_pages": 0,
+                                    "digital_pages": None,
+                                    "scanned_pages": None,
+                                    "qwen_extracted_pages": 0,
+                                    "qwen_failed_pages": 0,
+                                    "qwen_skipped_pages": 0,
+                                    "field_count": 0,
+                                    "empty_result": True,
+                                    "status": "failed_before_page_count",
+                                })
+                            elif stage == "ocr":
+                                page_logger.append_log({
+                                    **_exc_base,
+                                    "total_pages": _exc_total or None,
+                                    "billable_pages": 0,
+                                    "digital_pages": None,
+                                    "scanned_pages": None,
+                                    "qwen_extracted_pages": 0,
+                                    "qwen_failed_pages": 0,
+                                    "qwen_skipped_pages": _exc_total,
+                                    "field_count": 0,
+                                    "empty_result": True,
+                                    "status": "failed_ocr_stage",
+                                })
+                            elif stage == "llm":
+                                _exc_pr = (_exc_row or {}).get("page_results") or []
+                                _exc_extracted = len([pr for pr in _exc_pr if "_error" not in pr]) if isinstance(_exc_pr, list) else 0
+                                _exc_failed_count = len([pr for pr in _exc_pr if "_error" in pr]) if isinstance(_exc_pr, list) else 0
+                                page_logger.append_log({
+                                    **_exc_base,
+                                    "total_pages": _exc_total or None,
+                                    "billable_pages": _exc_total,
+                                    "digital_pages": None,
+                                    "scanned_pages": None,
+                                    "qwen_extracted_pages": _exc_extracted,
+                                    "qwen_failed_pages": _exc_failed_count,
+                                    "qwen_skipped_pages": max(0, _exc_total - (_exc_extracted + _exc_failed_count)),
+                                    "field_count": 0,
+                                    "empty_result": True,
+                                    "status": "error",
+                                })
+                            elif stage == "postprocess":
+                                _exc_pr = (_exc_row or {}).get("page_results") or []
+                                _exc_extracted = len([pr for pr in _exc_pr if "_error" not in pr]) if isinstance(_exc_pr, list) else 0
+                                _exc_failed_count = len([pr for pr in _exc_pr if "_error" in pr]) if isinstance(_exc_pr, list) else 0
+                                page_logger.append_log({
+                                    **_exc_base,
+                                    "total_pages": _exc_total or None,
+                                    "billable_pages": _exc_total,
+                                    "digital_pages": None,
+                                    "scanned_pages": None,
+                                    "qwen_extracted_pages": _exc_extracted,
+                                    "qwen_failed_pages": _exc_failed_count,
+                                    "qwen_skipped_pages": max(0, _exc_total - (_exc_extracted + _exc_failed_count)),
+                                    "field_count": page_logger.count_result_fields((_exc_row or {}).get("result")),
+                                    "empty_result": not bool((_exc_row or {}).get("result")),
+                                    "status": "postprocess_failed",
+                                })
+                        except Exception as log_exc:
+                            logger.warning(
+                                "worker: failed to write failure page log job=%s ext=%s: %s",
+                                job.get("id"),
+                                job.get("extraction_id"),
+                                log_exc,
                             )
-                        finally:
-                            plog.current_stage.reset(_st)
-                        plog.result_block(
+                    if job.get("extraction_id"):
+                        await db_mod.set_extraction_status(
+                            pool,
                             job["extraction_id"],
-                            status="failed",
-                            filename=(_fr or {}).get("filename"),
-                            vendor=(_fr or {}).get("vendor_name") or (_fr or {}).get("vendor_id"),
-                            pages=(_fr or {}).get("total_pages"),
-                            failed_stage=stage,
-                            errors=[f"{stage}  {type(exc).__name__}: {exc}"],
+                            "failed",
+                            progress={"stage": stage, "message": str(exc)},
+                            error=str(exc),
                         )
-                    except Exception:
-                        logger.exception("worker: failure summary failed")
-                    try:
-                        _fr_doc = await db_mod.get_document(pool, (_fr or {}).get("document_id")) if _fr else None
-                        _billing = ((_fr_doc or {}).get("metadata") or {}).get("billing_user_id") if _fr_doc else None
-                        if _billing:
-                            _pages = (
-                                (_fr or {}).get("total_pages")
-                                or ((_fr_doc or {}).get("metadata") or {}).get("reserved_pages")
-                                or 0
-                            )
-                            if _pages:
-                                await db_mod.release_quota_reservation(pool, _billing, _pages)
-                    except Exception as _q_exc:
-                        logger.warning("quota release failed (fail) ext=%s: %s", job.get("extraction_id"), _q_exc)
-                await db_mod.fail_job(pool, job["id"], str(exc), retryable=False)
+                    if stage in ("normalize", "ocr", "llm", "postprocess"):
+                        await _release_failed_job_quota(pool, job)
+                    await db_mod.fail_job(pool, job["id"], str(exc), retryable=False)
+            except Exception as db_exc:
+                logger.error("Worker DB error stage=%s: %s. Reconnecting pool in %.1fs...", stage, db_exc, backoff)
+                try:
+                    await pool.close()
+                except Exception:
+                    pass
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
+                try:
+                    pool = await db_mod.create_pool()
+                    await db_mod.init(pool)
+                except Exception as rc_exc:
+                    logger.error("Worker DB reconnect failed: %s", rc_exc)
     finally:
         await pool.close()
 

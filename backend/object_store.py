@@ -19,6 +19,22 @@ from .config import (
 )
 
 
+class StorageUnavailableError(OSError):
+    """Raised when the object store backend is unreachable or returns an unexpected error."""
+
+
+class ObjectNotFoundError(FileNotFoundError):
+    """Raised when the requested object does not exist in the store."""
+
+
+class StoragePermissionError(PermissionError):
+    """Raised when the store rejects the operation due to access permissions."""
+
+
+import logging as _log
+_store_log = _log.getLogger(__name__)
+
+
 class ObjectStore:
     def __init__(self) -> None:
         endpoint = MINIO_ENDPOINT
@@ -32,12 +48,18 @@ class ObjectStore:
             self.client = None
             self._endpoint = None
         else:
-            self.client = Minio(
-                endpoint,
-                access_key=access_key,
-                secret_key=secret_key,
-                secure=secure,
-            )
+            try:
+                self.client = Minio(
+                    endpoint,
+                    access_key=access_key,
+                    secret_key=secret_key,
+                    secure=secure,
+                )
+            except Exception as exc:
+                _store_log.warning(
+                    "MinIO client init failed (%s) — falling back to local storage", exc
+                )
+                self.client = None
 
     @staticmethod
     def _validate_object_key(object_key: str) -> None:
@@ -55,8 +77,18 @@ class ObjectStore:
                 (self._local_root / bucket).mkdir(parents=True, exist_ok=True)
             return
         for bucket in (DOCUMENTS_BUCKET, ARTIFACTS_BUCKET):
-            if not self.client.bucket_exists(bucket):
-                self.client.make_bucket(bucket)
+            try:
+                if not self.client.bucket_exists(bucket):
+                    self.client.make_bucket(bucket)
+            except Exception as exc:
+                code = str(getattr(exc, "code", "") or "")
+                if code in ("AccessDenied", "Forbidden"):
+                    raise StoragePermissionError(
+                        f"Object store denied access to bucket {bucket!r}: {exc}"
+                    ) from exc
+                raise StorageUnavailableError(
+                    f"Object store unreachable while checking bucket {bucket!r}: {exc}"
+                ) from exc
 
     def put_bytes(self, bucket: str, object_key: str, data: bytes, content_type: str) -> None:
         self._validate_object_key(object_key)
@@ -75,13 +107,23 @@ class ObjectStore:
                 ) from exc
             return
         payload = io.BytesIO(data)
-        self.client.put_object(
-            bucket,
-            object_key,
-            payload,
-            length=len(data),
-            content_type=content_type,
-        )
+        try:
+            self.client.put_object(
+                bucket,
+                object_key,
+                payload,
+                length=len(data),
+                content_type=content_type,
+            )
+        except Exception as exc:
+            code = str(getattr(exc, "code", "") or "")
+            if code in ("AccessDenied", "Forbidden"):
+                raise StoragePermissionError(
+                    f"Object store denied write: key={object_key!r} bucket={bucket!r}"
+                ) from exc
+            raise StorageUnavailableError(
+                f"Object store write failed: key={object_key!r} bucket={bucket!r}: {exc}"
+            ) from exc
 
     def get_bytes(self, bucket: str, object_key: str) -> bytes:
         self._validate_object_key(object_key)
@@ -100,7 +142,21 @@ class ObjectStore:
                 raise OSError(
                     f"Failed to read object: key={object_key!r} bucket={bucket!r} path={target}: {exc}"
                 ) from exc
-        response = self.client.get_object(bucket, object_key)
+        try:
+            response = self.client.get_object(bucket, object_key)
+        except Exception as exc:
+            code = str(getattr(exc, "code", "") or "")
+            if code in ("NoSuchKey", "NoSuchObject"):
+                raise ObjectNotFoundError(
+                    f"Object not found: key={object_key!r} bucket={bucket!r}"
+                ) from exc
+            if code in ("AccessDenied", "Forbidden"):
+                raise StoragePermissionError(
+                    f"Object store denied read: key={object_key!r} bucket={bucket!r}"
+                ) from exc
+            raise StorageUnavailableError(
+                f"Object store read failed: key={object_key!r} bucket={bucket!r}: {exc}"
+            ) from exc
         try:
             return response.read()
         finally:

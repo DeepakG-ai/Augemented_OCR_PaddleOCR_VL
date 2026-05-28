@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backend import db as db_mod
+from backend import scheduler as sched_mod
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +185,17 @@ class GetAllSchedulesEnabledTests(unittest.IsolatedAsyncioTestCase):
         pool, _ = _make_pool([])
         result = await db_mod.get_all_schedules_enabled(pool)
         self.assertEqual(result, [])
+
+
+class RuntimeSchedulerRemovedTests(unittest.TestCase):
+
+    def test_server_scheduler_module_has_no_runtime_scheduler(self):
+        self.assertFalse(hasattr(sched_mod, "_scheduler"))
+        self.assertFalse(hasattr(sched_mod, "reload_all_schedules"))
+        self.assertFalse(hasattr(sched_mod, "sync_job"))
+
+    def test_server_scheduler_only_computes_display_next_run(self):
+        self.assertTrue(callable(sched_mod.compute_next_run))
 
 
 # ---------------------------------------------------------------------------

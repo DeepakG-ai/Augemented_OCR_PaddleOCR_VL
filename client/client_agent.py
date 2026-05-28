@@ -28,8 +28,8 @@ show ACTIVE / INACTIVE on the Settings page.
 
 PDF lifecycle
 -------------
-  1. Watchdog detects a new PDF in input_folder.
-  2. Queues it locally until an enabled SaaS schedule's next_run time is due.
+  1. The agent sleeps until an enabled SaaS schedule is due.
+  2. At that scheduled time, it scans input_folder for PDFs.
   3. Waits for the file to finish writing (size stable for 1 s).
   4. POST /ingest/rest  ->  { job_id, extraction_id }
   5. GET  /jobs/{job_id}/stream  (SSE)  ->  progress ... -> terminal status
@@ -58,11 +58,9 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Tuple
 
 import requests
-from watchdog.events import FileCreatedEvent, FileMovedEvent, FileSystemEventHandler
-from watchdog.observers import Observer
 
 # ── Logging — same column format as backend/logging_config.py ────────────────
 
@@ -70,6 +68,13 @@ _FMT = "%(asctime)s.%(msecs)03d  %(levelname)-5s  %(message)s"
 _DATEFMT = "%Y-%m-%d %H:%M:%S"
 
 logger = logging.getLogger("client_agent")
+
+
+def _app_dir() -> Path:
+    """Return the real app folder, even when running as a PyInstaller exe."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
 
 
 def _configure_logging(log_dir: Path) -> None:
@@ -325,21 +330,16 @@ def _iter_sse(response: requests.Response):
                 pass
 
 
-# ── Schedule gate — holds uploads until a schedule time is due ────────────────
-
-_SCHED_POLL_SECS = 10
+# ── Schedule state — tracks schedule definitions and computes fire times ───────
 
 
 class _ScheduleState:
-    """Thread-safe queue for local PDFs controlled by SaaS schedule times."""
+    """Thread-safe schedule tracker. No file queuing — folder is scanned at fire time."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._pending: List[Path] = []
-        self._pending_keys: Set[str] = set()
-        self._seen: Set[str] = set()
         self._schedules: List[dict] = []
-        self._executed_slots: Set[Tuple[int, datetime]] = set()
+        self._executed_slots: set = set()  # {(sid, datetime)} — prevents re-firing
         self._batch_running = False
         self._has_enabled_schedules = False
 
@@ -347,30 +347,6 @@ class _ScheduleState:
     def has_enabled_schedules(self) -> bool:
         with self._lock:
             return self._has_enabled_schedules
-
-    def queue(self, path: Path) -> bool:
-        key = str(path).casefold()
-        with self._lock:
-            if key in self._pending_keys:
-                return False
-            self._pending.append(path)
-            self._pending_keys.add(key)
-            return True
-
-    def mark_seen(self, path: Path) -> bool:
-        """Mark a path as seen. Returns True if it was NOT already seen."""
-        key = str(path).casefold()
-        with self._lock:
-            if key in self._seen:
-                return False
-            self._seen.add(key)
-            return True
-
-    def remove_seen(self, path: Path) -> None:
-        """Remove a path from seen so it can be processed again in the future."""
-        key = str(path).casefold()
-        with self._lock:
-            self._seen.discard(key)
 
     def update_from_server(self, schedules: List[dict]) -> Tuple[int, int]:
         """Refresh enabled schedule definitions. Returns (enabled, tracked)."""
@@ -405,8 +381,7 @@ class _ScheduleState:
             self._has_enabled_schedules = bool(enabled)
             self._schedules = parsed_schedules
 
-            # Housekeep self._executed_slots to avoid growing indefinitely.
-            # Keep only slots within the last 2 days.
+            # Housekeep executed_slots — keep only slots within the last 2 days.
             two_days_ago = datetime.now(timezone.utc) - timedelta(days=2)
             self._executed_slots = {
                 item for item in self._executed_slots
@@ -415,55 +390,56 @@ class _ScheduleState:
 
             return len(enabled), len(parsed_schedules)
 
-    def claim_due_batch(self) -> Tuple[str, List[Path], List[int]]:
-        """Claim one due schedule batch.
-
-        State is one of: none, empty, busy, start. Due schedules are consumed
-        immediately, so a later schedule does not start while a prior batch runs.
-        """
+    def next_fire_time(self) -> datetime | None:
+        """Return the earliest next fire time across all enabled schedules, or None."""
         now = datetime.now(timezone.utc)
-        due_sids = []
-
+        earliest = None
         with self._lock:
             for sched in self._schedules:
                 sid = sched["id"]
-                hour = sched["utc_hour"]
-                minute = sched["utc_minute"]
-                last_ran = sched["last_ran_at"]
+                t = now.replace(hour=sched["utc_hour"], minute=sched["utc_minute"],
+                                second=0, microsecond=0)
+                if now >= t:
+                    # Today's slot has passed — check if it's due right now
+                    # (handled by claim_due). For next_fire_time, look at tomorrow.
+                    if (sid, t) in self._executed_slots:
+                        t += timedelta(days=1)
+                    else:
+                        last_ran = sched.get("last_ran_at")
+                        if last_ran and last_ran >= t:
+                            t += timedelta(days=1)
+                        # else: it's due NOW — return it as-is
+                if earliest is None or t < earliest:
+                    earliest = t
+        return earliest
 
-                # Calculate the most recent scheduled time for today
-                today_sched = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                if now >= today_sched:
-                    last_scheduled_time = today_sched
-                else:
-                    last_scheduled_time = today_sched - timedelta(days=1)
+    def claim_due(self) -> Tuple[str, List[int]]:
+        """Check if any schedule is due RIGHT NOW. Returns (state, due_sids).
 
-                # Check if this slot was already executed in this session
-                if (sid, last_scheduled_time) in self._executed_slots:
-                    continue
-
-                # Check if this slot was already run on the server (according to DB last_ran_at)
-                if last_ran is not None and last_ran >= last_scheduled_time:
-                    continue
-
-                # It is due!
-                due_sids.append(sid)
-                self._executed_slots.add((sid, last_scheduled_time))
-
-            if not due_sids:
-                return "none", [], []
-
+        States: 'none' (nothing due), 'busy' (batch running), 'start' (fire!).
+        """
+        now = datetime.now(timezone.utc)
+        due_sids = []
+        with self._lock:
             if self._batch_running:
-                return "busy", [], due_sids
-
-            items = list(self._pending)
-            self._pending.clear()
-            self._pending_keys.clear()
-            if not items:
-                return "empty", [], due_sids
-
+                return "busy", []
+            for sched in self._schedules:
+                sid = sched["id"]
+                t = now.replace(hour=sched["utc_hour"], minute=sched["utc_minute"],
+                                second=0, microsecond=0)
+                if now < t:
+                    continue  # not time yet today
+                if (sid, t) in self._executed_slots:
+                    continue  # already ran this slot in this session
+                last_ran = sched.get("last_ran_at")
+                if last_ran and last_ran >= t:
+                    continue  # server says already ran for this slot
+                due_sids.append(sid)
+                self._executed_slots.add((sid, t))
+            if not due_sids:
+                return "none", []
             self._batch_running = True
-            return "start", items, due_sids
+            return "start", due_sids
 
     def finish_batch(self) -> None:
         with self._lock:
@@ -647,43 +623,6 @@ def _process_pdf(
         _move(pdf_path, folders["failed"], "failed")
 
 
-# ── Watchdog handler ──────────────────────────────────────────────────────────
-
-class _PDFHandler(FileSystemEventHandler):
-    def __init__(
-        self,
-        base_url: str,
-        token_mgr: _TokenManager,
-        folders_ref: dict,
-        sched_state: _ScheduleState,
-    ) -> None:
-        super().__init__()
-        self._base_url = base_url
-        self._token_mgr = token_mgr
-        self._folders_ref = folders_ref
-        self._sched_state = sched_state
-
-    def _dispatch(self, path: str) -> None:
-        if not path.lower().endswith(".pdf"):
-            return
-        pdf = Path(path)
-        if not self._sched_state.mark_seen(pdf):
-            return
-        logger.info("detected%s", _kv(file=pdf.name))
-        if self._sched_state.queue(pdf):
-            logger.info("queued: waiting for schedule%s", _kv(file=pdf.name))
-        else:
-            logger.info("already queued%s", _kv(file=pdf.name))
-
-    def on_created(self, event: FileCreatedEvent) -> None:
-        if not event.is_directory:
-            self._dispatch(str(event.src_path))
-
-    def on_moved(self, event: FileMovedEvent) -> None:
-        if not event.is_directory:
-            self._dispatch(str(event.dest_path))
-
-
 # ── Background threads ────────────────────────────────────────────────────────
 
 def _token_refresh_loop(token_mgr: _TokenManager, stop: threading.Event) -> None:
@@ -703,126 +642,128 @@ def _config_poll_loop(
     base_url: str,
     token_mgr: _TokenManager,
     folders_ref: dict,
-    observer_ref: list,
-    sched_state: _ScheduleState,
+    schedule_changed: threading.Event,
     stop: threading.Event,
 ) -> None:
-    """Re-fetch folder paths every 60 s; restart watcher if input_folder changes."""
+    """Re-fetch folder paths and schedules every 60 s. Signal scheduler on changes."""
     while not stop.wait(60):
         resp = _call(token_mgr, "GET", base_url + "/api/config", timeout=15)
-        if not resp or resp.status_code != 200:
-            continue
+        if resp and resp.status_code == 200:
+            cfg = resp.json().get("config", {})
+            old_input = folders_ref.get("input", "")
+            new_input = cfg.get("input_folder", "")
+            folders_ref.update({
+                "input":   new_input,
+                "output":  cfg.get("output_folder", ""),
+                "success": cfg.get("success_folder", ""),
+                "failed":  cfg.get("failed_folder", ""),
+            })
+            if new_input != old_input:
+                logger.info("input_folder changed%s", _kv(old=old_input, new=new_input))
 
-        cfg = resp.json().get("config", {})
-        new_input = cfg.get("input_folder", "")
-        old_input = folders_ref.get("input", "")
-
-        folders_ref.update({
-            "input":   new_input,
-            "output":  cfg.get("output_folder", ""),
-            "success": cfg.get("success_folder", ""),
-            "failed":  cfg.get("failed_folder", ""),
-        })
-
-        if new_input == old_input and observer_ref[0] is not None:
-            continue
-
-        logger.info("input_folder changed — restarting watcher%s", _kv(path=new_input))
-        old_obs: Observer | None = observer_ref[0]
-        if old_obs:
-            old_obs.stop()
-            old_obs.join(timeout=5)
-        observer_ref[0] = None
-
-        if new_input and Path(new_input).is_dir():
-            handler = _PDFHandler(base_url, token_mgr, folders_ref, sched_state)
-            obs = Observer()
-            obs.schedule(handler, new_input, recursive=False)
-            obs.start()
-            observer_ref[0] = obs
-            logger.info("watcher restarted%s", _kv(path=new_input))
-            for pdf in _pdfs_in(Path(new_input)):
-                if sched_state.mark_seen(pdf):
-                    if sched_state.queue(pdf):
-                        logger.info("queued existing PDF after folder change%s", _kv(file=pdf.name))
-        else:
-            logger.warning("new input_folder does not exist%s", _kv(path=new_input))
+        # Also re-fetch schedules to detect changes and wake the scheduler thread
+        schedule_changed.set()
 
 
-def _scheduler_poll_loop(
+def _scheduler_loop(
     base_url: str,
     token_mgr: _TokenManager,
     folders_ref: dict,
     sched_state: _ScheduleState,
+    schedule_changed: threading.Event,
     stop: threading.Event,
 ) -> None:
-    """Poll /api/scheduler and start local queued PDFs when a schedule is due."""
+    """Sleep until next schedule time, then scan folder and upload PDFs.
+
+    Zero polling: the thread sleeps until the exact schedule fire time.
+    It wakes early only if schedules change (via schedule_changed event)
+    or the agent is shutting down (via stop event).
+    """
     while not stop.is_set():
-        state, pending, due_sids = sched_state.claim_due_batch()
-        due_count = len(due_sids)
-        if state == "busy":
-            logger.info("schedule due while previous batch is still running; skipping %d due schedule(s)", due_count)
-            pending = []
-        elif state == "empty":
-            logger.info("schedule due; no queued PDFs")
-            pending = []
-        elif state != "start":
-            pending = []
-
-        if due_sids:
-            # Report the run(s) to the server
-            for sid in due_sids:
-                _call(token_mgr, "POST", f"{base_url}/api/scheduler/{sid}/ran", timeout=10)
-
-        if pending:
-            logger.info("schedule due; uploading %d queued PDF(s)", len(pending))
-
-        if pending:
-            threading.Thread(
-                target=_process_pdf_batch,
-                args=(base_url, token_mgr, folders_ref, sched_state, pending),
-                daemon=True,
-            ).start()
-
+        # Refresh schedules from server
         resp = _call(token_mgr, "GET", base_url + "/api/scheduler", timeout=15)
         if resp and resp.status_code == 200:
             schedules = resp.json().get("schedules", [])
             enabled_count, tracked_count = sched_state.update_from_server(schedules)
-            if enabled_count and not tracked_count:
-                logger.warning("enabled schedules found, but no next_run could be tracked")
+            if enabled_count:
+                logger.debug("scheduler: %d enabled, %d tracked", enabled_count, tracked_count)
 
-        if stop.wait(_SCHED_POLL_SECS):
-            break
+        # Compute sleep duration
+        next_fire = sched_state.next_fire_time()
+        if next_fire is None:
+            # No enabled schedules — wait 60s then re-check
+            logger.info("no enabled schedules; waiting for schedule to be configured")
+            schedule_changed.wait(timeout=60)
+            schedule_changed.clear()
+            continue
 
+        now = datetime.now(timezone.utc)
+        wait_secs = max(0, (next_fire - now).total_seconds())
 
-def _process_pdf_batch(
-    base_url: str,
-    token_mgr: _TokenManager,
-    folders_ref: dict,
-    sched_state: _ScheduleState,
-    pending: List[Path],
-) -> None:
-    try:
-        folders = dict(folders_ref)
-        for pdf in pending:
-            if not pdf.exists():
-                logger.warning("queued PDF no longer exists%s", _kv(file=pdf.name))
-                sched_state.remove_seen(pdf)
-                continue
-            logger.info("uploading queued PDF%s", _kv(file=pdf.name))
-            try:
+        if wait_secs > 1:
+            logger.info(
+                "next schedule fires in %.0fs at %s",
+                wait_secs, next_fire.strftime("%H:%M:%S UTC"),
+            )
+            # Sleep until fire time OR schedule change OR stop
+            schedule_changed.wait(timeout=wait_secs)
+            schedule_changed.clear()
+            if stop.is_set():
+                break
+            # Re-check: if we woke early due to schedule change, re-compute
+            now = datetime.now(timezone.utc)
+            if next_fire > now + timedelta(seconds=1):
+                continue  # woke early — loop back to recalculate
+
+        # ── Schedule fired! ───────────────────────────────────────────────
+        state, due_sids = sched_state.claim_due()
+        if state == "busy":
+            logger.info("schedule due but previous batch still running; skipping")
+            continue
+        if state != "start":
+            continue
+
+        # Scan folder for PDFs
+        input_folder = folders_ref.get("input", "")
+        if not input_folder:
+            logger.warning("schedule fired but input_folder not configured")
+            sched_state.finish_batch()
+            continue
+
+        input_path = Path(input_folder)
+        if not input_path.is_dir():
+            logger.warning("schedule fired but input_folder does not exist%s", _kv(path=input_folder))
+            sched_state.finish_batch()
+            continue
+
+        pdfs = _pdfs_in(input_path)
+        if not pdfs:
+            logger.info("schedule fired; no PDFs in %s", input_folder)
+        else:
+            logger.info("schedule fired; uploading %d PDF(s) from %s", len(pdfs), input_folder)
+            folders = dict(folders_ref)
+            for pdf in pdfs:
+                if stop.is_set():
+                    break
+                if not pdf.exists():
+                    logger.warning("PDF disappeared before upload%s", _kv(file=pdf.name))
+                    continue
+                logger.info("uploading%s", _kv(file=pdf.name))
                 _process_pdf(base_url, token_mgr, folders, pdf)
-            finally:
-                sched_state.remove_seen(pdf)
-    finally:
+
+        # Mark ran on server
+        for sid in due_sids:
+            _call(token_mgr, "POST", f"{base_url}/api/scheduler/{sid}/ran", timeout=10)
+
         sched_state.finish_batch()
+        logger.info("schedule batch complete; %d schedule(s) marked as ran", len(due_sids))
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="AugmentedOCR Desktop Agent — watches a local folder and uploads PDFs.",
+        description="AugmentedOCR Desktop Agent — uploads PDFs at scheduled times.",
     )
     parser.add_argument("--config",   metavar="PATH",  help="Path to client_agent.json")
     parser.add_argument("--server",   metavar="URL",   help="Server base URL override")
@@ -831,7 +772,7 @@ def main() -> int:
     parser.add_argument("--log-dir",  metavar="DIR",   help="Log directory (default: ./logs)")
     args = parser.parse_args()
 
-    script_dir = Path(__file__).parent
+    script_dir = _app_dir()
     log_dir = Path(args.log_dir) if args.log_dir else script_dir / "logs"
     _configure_logging(log_dir)
 
@@ -930,34 +871,20 @@ def main() -> int:
         schedules = resp_sched.json().get("schedules", [])
         enabled_count, tracked_count = sched_state.update_from_server(schedules)
         if enabled_count:
+            next_fire = sched_state.next_fire_time()
+            next_str = next_fire.strftime("%H:%M:%S UTC") if next_fire else "unknown"
             logger.info(
-                "scheduler: %d enabled schedule(s), %d next run(s) tracked; files wait until schedule time",
-                enabled_count, tracked_count,
+                "scheduler: %d enabled schedule(s); next fire at %s",
+                enabled_count, next_str,
             )
         else:
-            logger.info("scheduler: no enabled schedules; folder uploads paused")
+            logger.info("scheduler: no enabled schedules; waiting for schedule to be configured")
     else:
-        logger.warning("scheduler state unavailable; folder uploads paused until scheduler can be read")
+        logger.warning("scheduler state unavailable; will retry in scheduler loop")
 
-    # ── Scan input folder for PDFs already present at startup ─────────────────
-    existing_pdfs = _pdfs_in(input_path)
-    if existing_pdfs:
-        logger.info("found %d existing PDF(s) in input folder", len(existing_pdfs))
-        for pdf in existing_pdfs:
-            if sched_state.mark_seen(pdf):
-                if sched_state.queue(pdf):
-                    logger.info("queued: waiting for schedule%s", _kv(file=pdf.name))
-                else:
-                    logger.info("already queued%s", _kv(file=pdf.name))
-
-    # ── Start watcher ─────────────────────────────────────────────────────────
-    handler = _PDFHandler(base_url, token_mgr, folders, sched_state)
-    observer = Observer()
-    observer.schedule(handler, str(input_path), recursive=False)
-    observer.start()
-
-    observer_ref: list = [observer]
+    # ── Start background threads ──────────────────────────────────────────────
     stop = threading.Event()
+    schedule_changed = threading.Event()
 
     threading.Thread(
         target=_token_refresh_loop, args=(token_mgr, stop),
@@ -969,30 +896,23 @@ def main() -> int:
     ).start()
     threading.Thread(
         target=_config_poll_loop,
-        args=(base_url, token_mgr, folders, observer_ref, sched_state, stop),
+        args=(base_url, token_mgr, folders, schedule_changed, stop),
         name="config-poll", daemon=True,
     ).start()
     threading.Thread(
-        target=_scheduler_poll_loop,
-        args=(base_url, token_mgr, folders, sched_state, stop),
-        name="scheduler-poll", daemon=True,
+        target=_scheduler_loop,
+        args=(base_url, token_mgr, folders, sched_state, schedule_changed, stop),
+        name="scheduler", daemon=True,
     ).start()
 
     try:
-        while True:
-            time.sleep(1)
-            obs = observer_ref[0]
-            if obs and not obs.is_alive():
-                logger.error("watchdog observer died unexpectedly")
-                return 1
+        while not stop.is_set():
+            stop.wait(1)
     except KeyboardInterrupt:
         logger.info("shutdown requested")
     finally:
         stop.set()
-        obs = observer_ref[0]
-        if obs:
-            obs.stop()
-            obs.join(timeout=5)
+        schedule_changed.set()  # wake scheduler thread so it exits
         logger.info("stopped")
 
     return 0

@@ -101,6 +101,8 @@ class InfrastructureSafetyTests(unittest.TestCase):
         self.assertIn("CREATE TABLE IF NOT EXISTS review_events", db_text)
         self.assertIn("FOR UPDATE SKIP LOCKED", db_text)
         self.assertIn("status IN ('queued', 'running')", db_text)
+        self.assertIn("pg_advisory_lock(hashtext('augocr_db_init'))", db_text)
+        self.assertIn("pg_advisory_unlock(hashtext('augocr_db_init'))", db_text)
 
 
 class StreamingObservabilityTests(unittest.TestCase):

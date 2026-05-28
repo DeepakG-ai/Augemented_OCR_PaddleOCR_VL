@@ -39,6 +39,24 @@ from . import mlflow_tracing as mlf
 
 logger = get_logger(__name__)
 
+_failed_usage_buffer: list[dict] = []
+
+
+async def _flush_failed_usage_buffer(pool) -> None:
+    if not _failed_usage_buffer or pool is None:
+        return
+    logger.info("Attempting to flush %d queued LLM usage payloads...", len(_failed_usage_buffer))
+    to_retry = list(_failed_usage_buffer)
+    _failed_usage_buffer.clear()
+    for payload in to_retry:
+        try:
+            await db_mod.record_llm_usage(pool, **payload)
+        except Exception as exc:
+            logger.error("Failed to flush LLM usage payload from buffer: %s", exc)
+            _failed_usage_buffer.append(payload)
+
+
+
 
 def _strip_newlines(obj: Any) -> Any:
     """Recursively replace embedded newlines in all string values with a space."""
@@ -427,28 +445,33 @@ async def call_llm(
         async def _record_usage_if_needed():
             if pool is not None:
                 context = pipeline_context or {}
+                payload = {
+                    "doc_id": context.get("doc_id") or context.get("document_id"),
+                    "extraction_id": context.get("extraction_id"),
+                    "vendor_id": context.get("vendor_id"),
+                    "page_num": page_num,
+                    "total_pages": total_pages,
+                    "call_type": "extraction",
+                    "model": model,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                    "duration_ms": duration_ms,
+                    "llm_url": llm_url,
+                    "request_id": context.get("request_id") or context.get("job_id"),
+                    "billing_user_id": billing_user_id or context.get("billing_user_id"),
+                    "api_key_id": context.get("api_key_id"),
+                }
                 try:
-                    await db_mod.record_llm_usage(
-                        pool,
-                        doc_id=context.get("doc_id") or context.get("document_id"),
-                        extraction_id=context.get("extraction_id"),
-                        vendor_id=context.get("vendor_id"),
-                        page_num=page_num,
-                        total_pages=total_pages,
-                        call_type="extraction",
-                        model=model,
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=completion_tokens,
-                        total_tokens=total_tokens,
-                        duration_ms=duration_ms,
-                        llm_url=llm_url,
-                        request_id=context.get("request_id") or context.get("job_id"),
-                        # Override billing to admin when admin is the uploader
-                        billing_user_id=billing_user_id or context.get("billing_user_id"),
-                        api_key_id=context.get("api_key_id"),
-                    )
+                    await db_mod.record_llm_usage(pool, **payload)
+                    await _flush_failed_usage_buffer(pool)
                 except Exception as exc:
-                    logger.warning("Failed to record LLM usage for extraction page %s: %s", page_num, exc)
+                    logger.error(
+                        "Failed to record LLM usage for extraction page %s, queueing to recovery buffer: %s",
+                        page_num,
+                        exc,
+                    )
+                    _failed_usage_buffer.append(payload)
 
     _choices = resp_json.get("choices") or []
     if not _choices or not isinstance(_choices[0], dict) or "message" not in _choices[0]:
