@@ -205,7 +205,14 @@ async function showHistoryDetailSafe(id) {
             'historyDetailMeta',
             `${data.total_pages || 0} pages · ${formatDurationMs(data.duration_ms)}${data.duration_ms ? ' · ' : ''}${new Date(data.created_at).toLocaleString()}`
         );
-        setText('historyDetailResult', JSON.stringify(data.corrected_result || data.result, null, 2) || 'null');
+        const histResult = data.corrected_result || data.result;
+        const histResultEl = document.getElementById('historyDetailResult');
+        const histErr = parseResultErrors(histResult);
+        if (histErr) {
+            renderResultErrorBlock(histResultEl, histErr);
+        } else {
+            setText('historyDetailResult', JSON.stringify(histResult, null, 2) || 'null');
+        }
 
         const errorEl = document.getElementById('historyDetailError');
         if (errorEl && data.error) {

@@ -617,6 +617,37 @@ function updatePipelineFromSSE(jobState) {
         return;
     }
 
+    // failed / partial must be caught here — before !stage — because terminal
+    // events from the backend (e.g. status=unverified) often omit progress.stage.
+    if (event === 'failed') {
+        if (_pipelineTimerInterval) { clearInterval(_pipelineTimerInterval); _pipelineTimerInterval = null; }
+        const _tel = document.getElementById('pipelineTimer');
+        if (_tel && _pipelineStartTime) {
+            _tel.textContent = `${((Date.now() - _pipelineStartTime) / 1000).toFixed(1)}s — FAILED`;
+        }
+        // Find which stage to mark failed: use stage from progress if present,
+        // otherwise scan DOM for the last stage still showing as active.
+        const _sm = { normalize: 'normalize', ocr: 'ocr', llm: 'llm', postprocess: 'postprocess' };
+        let _failStage = stage ? (_sm[stage] || stage) : null;
+        if (!_failStage) {
+            for (let i = stageOrder.length - 1; i >= 0; i--) {
+                const _se = document.getElementById(`pipeStage_${stageOrder[i]}`);
+                if (_se && _se.classList.contains('active')) { _failStage = stageOrder[i]; break; }
+            }
+        }
+        if (_failStage) setPipelineStage(_failStage, 'failed', message || 'Extraction failed');
+        return;
+    }
+
+    if (event === 'partial') {
+        if (_pipelineTimerInterval) { clearInterval(_pipelineTimerInterval); _pipelineTimerInterval = null; }
+        const _tel = document.getElementById('pipelineTimer');
+        if (_tel && _pipelineStartTime) {
+            _tel.textContent = `${((Date.now() - _pipelineStartTime) / 1000).toFixed(1)}s — STOPPED`;
+        }
+        return;
+    }
+
     if (!stage) return;
 
     // Mark upload as done always
@@ -637,49 +668,15 @@ function updatePipelineFromSSE(jobState) {
         const s = stageOrder[i];
         const el = document.getElementById(`pipeStage_${s}`);
         if (el && !el.classList.contains('done')) {
-            // Read the current detail text from DOM (may have been set by a prior SSE event)
             const detEl = document.getElementById(`pipeDetail_${s}`);
             const liveDetail = detEl ? detEl.textContent : null;
             const stageInfo = PIPELINE_STAGES.find(p => p.id === s);
             const fallback = stageInfo ? stageInfo.detail : 'Complete';
-            // Use the live detail if it differs from the default, otherwise append " — complete"
             const finalDetail = (liveDetail && liveDetail !== fallback)
                 ? liveDetail
                 : fallback + ' — complete';
             setPipelineStage(s, 'done', finalDetail);
         }
-    }
-
-    // Handle terminal events
-    if (event === 'done') {
-        stageOrder.forEach(s => {
-            setPipelineStage(s, 'done', null);
-        });
-        // Stop timer
-        if (_pipelineTimerInterval) { clearInterval(_pipelineTimerInterval); _pipelineTimerInterval = null; }
-        // Final elapsed
-        const el = document.getElementById('pipelineTimer');
-        if (el && _pipelineStartTime) {
-            const elapsed = ((Date.now() - _pipelineStartTime) / 1000).toFixed(1);
-            el.textContent = `${elapsed}s — COMPLETE`;
-        }
-        return;
-    }
-
-    if (event === 'failed') {
-        setPipelineStage(uiStage, 'failed', message);
-        if (_pipelineTimerInterval) { clearInterval(_pipelineTimerInterval); _pipelineTimerInterval = null; }
-        return;
-    }
-
-    if (event === 'partial') {
-        if (_pipelineTimerInterval) { clearInterval(_pipelineTimerInterval); _pipelineTimerInterval = null; }
-        const el = document.getElementById('pipelineTimer');
-        if (el && _pipelineStartTime) {
-            const elapsed = ((Date.now() - _pipelineStartTime) / 1000).toFixed(1);
-            el.textContent = `${elapsed}s — STOPPED`;
-        }
-        return;
     }
 
     // Set current stage as active
@@ -1048,7 +1045,12 @@ function retryLastExtract() {
 
 function showResult(data) {
     const rs = document.getElementById('resultSection'); if (rs) rs.style.display = 'block';
-    const rb = document.getElementById('resultBlock'); if (rb) rb.textContent = JSON.stringify(data, null, 2);
+    const rb = document.getElementById('resultBlock'); if (!rb) return;
+    // A failure sentinel ({_all_pages_failed, errors}) is shown as a clean
+    // message, not dumped as raw JSON.
+    const errInfo = parseResultErrors(data);
+    if (errInfo) { renderResultErrorBlock(rb, errInfo); return; }
+    rb.textContent = JSON.stringify(data, null, 2);
 }
 
 async function loadExtractionPages(extractionId) {

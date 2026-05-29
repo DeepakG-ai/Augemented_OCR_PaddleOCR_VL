@@ -150,6 +150,71 @@ function safeMimeType(value) {
     return /^[a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+$/.test(mime) ? mime : 'application/octet-stream';
 }
 
+// ── RESULT ERROR RENDERING ─────────────────────────────────────────────
+// An extraction result can come back as a failure sentinel instead of real
+// data. The backend returns {_all_pages_failed: true, errors: [...]} when
+// every page fails (see extractor.merge_results). The UI must show a clean,
+// human-readable message — never the raw {...} object.
+
+/**
+ * Inspect an extraction result. Returns null when it is real data, or
+ * { messages: string[] } when it is a failure sentinel that should be shown
+ * as a red error card instead of JSON.
+ */
+function parseResultErrors(data) {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+
+    const allFailed = data._all_pages_failed === true;
+    const list = Array.isArray(data.errors) ? data.errors : [];
+
+    // A normal result may legitimately carry other keys; only treat this as an
+    // error when the failure flag is set, or when there are errors AND no real
+    // extracted content alongside them.
+    const META_KEYS = new Set(['errors', '_all_pages_failed', '_format', 'boxes']);
+    const hasRealData = ('line_items' in data) || ('fields' in data) ||
+        Object.keys(data).some(k => !META_KEYS.has(k) && data[k] != null && data[k] !== '');
+    if (!allFailed && (list.length === 0 || hasRealData)) return null;
+
+    const messages = list.map(cleanErrorMessage).filter(Boolean);
+    if (messages.length === 0) {
+        messages.push('Extraction failed — every page returned an error.');
+    }
+    return { messages };
+}
+
+/** Turn a raw backend error string/object into a short, readable message. */
+function cleanErrorMessage(raw) {
+    let msg = '';
+    if (typeof raw === 'string') msg = raw;
+    else if (raw && typeof raw === 'object') msg = raw.error || raw.message || '';
+    else msg = String(raw ?? '');
+    msg = msg.trim();
+    if (!msg) return '';
+
+    // "LLM returned invalid JSON: <raw model output>" — the raw dump is noise;
+    // keep just the reason. Same for any wrapper that appends a payload it
+    // does not actually have (trailing dangling colon).
+    const wrap = msg.match(/^(LLM returned invalid JSON)\b/i);
+    if (wrap) return wrap[1];
+    msg = msg.replace(/[:\s]+$/, '');
+    if (msg.length > 300) msg = msg.slice(0, 297) + '...';
+    return msg;
+}
+
+/** Render a failure sentinel into `el` as a red error card (not raw JSON). */
+function renderResultErrorBlock(el, info) {
+    if (!el) return;
+    const label = info.messages.length > 1 ? 'Extraction errors' : 'Extraction error';
+    const items = info.messages
+        .map(m => `<div style="margin-top:3px">${escapeHtml(m)}</div>`)
+        .join('');
+    el.innerHTML = `
+        <div style="color:var(--red);background:var(--red-bg);border-left:3px solid var(--red);border-radius:2px;padding:8px 10px;font-family:var(--mono);font-size:11px;line-height:1.6;white-space:pre-wrap;word-break:break-word">
+            <div style="font-weight:600;letter-spacing:0.06em;text-transform:uppercase;margin-bottom:4px">&#9888; ${escapeHtml(label)}</div>
+            ${items}
+        </div>`;
+}
+
 // ── TOAST ──────────────────────────────────────────────────────────────
 function showToast(msg) {
     const t = document.createElement('div');

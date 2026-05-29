@@ -56,7 +56,7 @@ function _startConfigSSE(onEvent) {
         while (!controller.signal.aborted) {
             try {
                 const token = localStorage.getItem('auth_token');
-                const resp = await fetch('/api/config/stream', {
+                const resp = await fetch(`${API || ''}/api/config/stream`, {
                     signal: controller.signal,
                     headers: token ? { 'Authorization': `Bearer ${token}` } : {},
                 });

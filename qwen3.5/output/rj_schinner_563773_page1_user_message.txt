@@ -1,0 +1,58 @@
+Extract the header fields AND all visible line item rows from this purchase order page (page 1 of 3).
+
+If any field is empty or not visible, return null.
+
+<header_fields>
+  - bill_to
+  - ship_to
+  - order_date
+  - vendor_name
+  - order_number
+  - vendor_adress
+</header_fields>
+
+<line_item_columns>
+  - item
+  - pack
+  - order_qty
+  - unit_price
+</line_item_columns>
+
+Return JSON in exactly this shape:
+{
+  "fields": {
+    "bill_to": null,
+    "ship_to": null,
+    "order_date": null,
+    "vendor_name": null,
+    "order_number": null,
+    "vendor_adress": null,
+    "line_items": [
+      {
+        "item": null,
+        "pack": null,
+        "order_qty": null,
+        "unit_price": null
+      }
+    ]
+  },
+  "boxes": {
+    "bill_to": null,
+    "ship_to": null,
+    "order_date": null,
+    "vendor_name": null,
+    "order_number": null,
+    "vendor_adress": null,
+    "item": null,
+    "pack": null,
+    "order_qty": null,
+    "unit_price": null
+  }
+}
+
+<rules>
+- Empty or missing cells → null.
+- Extract every visible line item row.
+</rules>
+
+STRICTLY return ONLY valid JSON matching EXACTLY the structure above.
