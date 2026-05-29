@@ -571,11 +571,6 @@ async def _init_db(pool: asyncpg.Pool) -> None:
                 END IF;
             END $$;
         """)
-        # Retroactively reset clients who got the legacy 1000 default limit back to 0
-        await conn.execute("""
-            UPDATE users SET subscription_limit = 0
-            WHERE role = 'client' AND subscription_limit = 1000;
-        """)
         # Migration: pending_pages tracks in-flight uploads for atomic quota enforcement
         await conn.execute("""
             DO $$ BEGIN
@@ -623,6 +618,11 @@ async def _init_db(pool: asyncpg.Pool) -> None:
                     ALTER TABLE user_schedules ADD COLUMN is_executing BOOLEAN NOT NULL DEFAULT FALSE;
                 END IF;
             END $$;
+        """)
+        # Migration: prevent duplicate schedule times per user
+        await conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS user_schedules_user_cron_uniq
+            ON user_schedules (user_id, cron_expr);
         """)
         # Migration: API keys table for programmatic access
         await conn.execute("""
@@ -2203,6 +2203,29 @@ async def update_document_status(pool: asyncpg.Pool, document_id: int, status: s
         )
 
 
+async def set_document_reserved_pages(pool: asyncpg.Pool, document_id: int, pages: int) -> None:
+    """Record the currently outstanding quota reservation on the document.
+
+    The worker release paths read metadata.reserved_pages to know how many pages
+    to return to the user's quota when the pipeline ends. Resume reserves only
+    the missing pages, so this must be updated to that smaller count (it was set
+    to the full page count at initial submission).
+    """
+    if not document_id:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE documents
+               SET metadata = COALESCE(metadata, '{}'::jsonb)
+                              || jsonb_build_object('reserved_pages', $2::int),
+                   updated_at = NOW()
+             WHERE id = $1
+            """,
+            document_id, int(pages),
+        )
+
+
 # -- Extraction queries ----------------------------------------------------
 
 _EXTRACTION_COLS = """
@@ -3427,6 +3450,56 @@ async def release_quota_reservation(
         )
 
 
+async def release_quota_once(pool: asyncpg.Pool, document_id: int | None, user_id: str | None) -> int:
+    """Idempotently release a document's page reservation.
+
+    Reads metadata.reserved_pages and decrements the billing user's pending_pages
+    by that amount, then clears reserved_pages in the SAME transaction. A second
+    call (e.g. a job re-run after stale-job recovery picks up a job that released
+    but crashed before complete_job) finds reserved_pages already gone and is a
+    no-op — so a double-release can't steal pending quota from another in-flight
+    upload by the same user. Returns the pages actually released.
+    """
+    if document_id is None:
+        return 0
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT metadata FROM documents WHERE id = $1 FOR UPDATE",
+                document_id,
+            )
+            if not row:
+                return 0
+            meta = row["metadata"]
+            if isinstance(meta, str):
+                import json as _json
+                meta = _json.loads(meta) if meta else {}
+            meta = meta or {}
+            raw_pages = meta.get("reserved_pages")
+            try:
+                pages = int(raw_pages) if raw_pages is not None else 0
+            except (TypeError, ValueError):
+                pages = 0
+            if pages <= 0:
+                return 0
+            uid = _uuid_or_none(user_id) or _uuid_or_none(meta.get("billing_user_id"))
+            if uid is not None:
+                await conn.execute(
+                    "UPDATE users SET pending_pages = GREATEST(0, pending_pages - $1) WHERE id = $2",
+                    pages, uid,
+                )
+            await conn.execute(
+                """
+                UPDATE documents
+                   SET metadata = COALESCE(metadata, '{}'::jsonb) - 'reserved_pages',
+                       updated_at = NOW()
+                 WHERE id = $1
+                """,
+                document_id,
+            )
+    return pages
+
+
 async def update_user_subscription_limit(
     pool: asyncpg.Pool,
     user_id: str,
@@ -4148,7 +4221,7 @@ async def get_all_schedules(pool: asyncpg.Pool) -> list[dict]:
 async def mark_schedule_ran(pool: asyncpg.Pool, schedule_id: int) -> None:
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE user_schedules SET last_ran_at = NOW() WHERE id = $1",
+            "UPDATE user_schedules SET last_ran_at = NOW(), is_executing = FALSE, updated_at = NOW() WHERE id = $1",
             schedule_id,
         )
 
@@ -4166,6 +4239,19 @@ async def get_user_is_executing(pool: asyncpg.Pool, user_id: str) -> bool:
     if uid is None:
         return False
     async with pool.acquire() as conn:
+        # Auto-clear stale execution locks. If an agent crashes after marking a
+        # schedule running but before clearing it, the flag would otherwise block
+        # manual uploads forever. updated_at is maintained by set_schedule_executing.
+        await conn.execute(
+            """
+            UPDATE user_schedules
+               SET is_executing = FALSE
+             WHERE user_id = $1
+               AND is_executing = TRUE
+               AND updated_at < NOW() - INTERVAL '10 minutes'
+            """,
+            uid,
+        )
         row = await conn.fetchrow(
             "SELECT EXISTS(SELECT 1 FROM user_schedules WHERE user_id = $1 AND is_executing = TRUE) AS running",
             uid,
@@ -4610,6 +4696,90 @@ async def resolve_topup_request(
             status, resolution_note, admin_uid, request_id,
         )
     return _row_topup_request(row) if row else None
+
+
+async def approve_topup_atomically(
+    pool: asyncpg.Pool,
+    request_id: int,
+    resolved_by: str,
+    resolution_note: str | None = None,
+) -> dict:
+    """Approve a pending top-up request and apply its pages in one transaction.
+
+    SELECT … FOR UPDATE on the request row serialises concurrent admin approvals
+    so a request can produce at most one top-up. All-or-nothing: either the
+    status flip AND the topup insert both commit, or neither does.
+
+    Returns: {"request": {...}, "topup": {...}}
+    Raises ValueError("not_found" | "already_<status>" | "no_active_subscription").
+    """
+    admin_uid = _uuid_or_none(resolved_by)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            req = await conn.fetchrow(
+                "SELECT * FROM topup_requests WHERE id = $1 FOR UPDATE",
+                request_id,
+            )
+            if not req:
+                raise ValueError("not_found")
+            if req["status"] != "pending":
+                raise ValueError(f"already_{req['status']}")
+
+            user_id = req["user_id"]
+            pages = int(req["requested_pages"])
+
+            # Expire any stale subscriptions for this user (same rule as reserve_quota).
+            await conn.execute(
+                """
+                WITH expired AS (
+                    UPDATE subscriptions
+                       SET status = 'expired'
+                     WHERE user_id = $1 AND status = 'active' AND period_end < NOW()
+                     RETURNING user_id
+                )
+                UPDATE users
+                   SET subscription_limit = 0
+                 WHERE id IN (SELECT user_id FROM expired)
+                """,
+                user_id,
+            )
+
+            sub = await conn.fetchrow(
+                "SELECT id FROM subscriptions WHERE user_id = $1 AND status = 'active' LIMIT 1",
+                user_id,
+            )
+            if not sub:
+                raise ValueError("no_active_subscription")
+
+            topup_row = await conn.fetchrow(
+                """
+                INSERT INTO topups (user_id, subscription_id, pages, note, created_by)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id, user_id, subscription_id, pages, note, created_by, created_at
+                """,
+                user_id, int(sub["id"]), pages,
+                f"Approved top-up request #{request_id}"
+                + (f": {resolution_note}" if resolution_note else ""),
+                admin_uid,
+            )
+
+            resolved_row = await conn.fetchrow(
+                """
+                UPDATE topup_requests
+                   SET status = 'approved',
+                       resolution_note = $1,
+                       resolved_by = $2,
+                       resolved_at = NOW()
+                 WHERE id = $3
+                 RETURNING *
+                """,
+                resolution_note, admin_uid, request_id,
+            )
+
+    return {
+        "request": _row_topup_request(resolved_row),
+        "topup": _row_subscription(topup_row),
+    }
 
 
 async def get_pending_topup_request_count(pool: asyncpg.Pool) -> int:

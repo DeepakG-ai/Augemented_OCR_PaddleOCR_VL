@@ -310,8 +310,12 @@ class ZeroLimitUserBlockedTests(unittest.TestCase):
         with patch.object(main.db_mod, "get_extraction",
                           new=AsyncMock(return_value=partial)), \
              patch.object(main, "assert_extraction_access", new=AsyncMock()), \
-             patch.object(main.db_mod, "get_user_billable_pages",
-                          new=AsyncMock(return_value=_usage(0, 0))), \
+             patch.object(main.db_mod, "list_jobs_for_extraction",
+                          new=AsyncMock(return_value=[])), \
+             patch.object(main.db_mod, "get_pages",
+                          new=AsyncMock(return_value=[{"page_number": 1}])), \
+             patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(0, 0, incoming=1))), \
              patch.object(main.db_mod, "get_user_by_id",
                           new=AsyncMock(return_value={"email": "fresh@test.com"})):
             r = self.client.post("/jobs/extractions/1/resume")

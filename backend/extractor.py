@@ -171,8 +171,8 @@ Count the number of rows in the line items table FIRST, then extract that exact 
 - STRICTLY return ONLY valid JSON. No markdown fences, no explanation, no extra text.
 - Treat each field independently. A missing field gets null; all other visible fields must still be extracted. Do not return all fields as null because one field is absent.
 - Use null for missing fields, never omit them.
-- For line_items, return an array even if only one item exists.
-- Dates should be in the format they appear in the document.
+- For line_items, you MUST return the `fields.line_items` key. Strictly return an array even if only one item visible in document.
+- Return `fields.line_items: []` ONLY if no line-item rows are visible.
 </output_rules>"""
 
 
@@ -521,7 +521,10 @@ async def call_llm(
         except Exception:
             pass
 
-        # All recovery attempts failed
+        # All recovery attempts failed — still record usage, the LLM consumed
+        # tokens regardless of whether we could parse the output.
+        await _record_usage_if_needed()
+
         plog.error(
             f"page {page_num}/{total_pages} JSON parse failed (all fallbacks exhausted)",
             logger=__name__,

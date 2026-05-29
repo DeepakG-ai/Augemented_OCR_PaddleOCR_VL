@@ -178,7 +178,7 @@ class WorkerFailurePathTests(unittest.IsolatedAsyncioTestCase):
              patch.object(worker.db_mod, "set_extraction_status", new=AsyncMock()) as mock_status, \
              patch.object(worker.db_mod, "get_extraction", new=AsyncMock(return_value=extraction)), \
              patch.object(worker.db_mod, "get_document", new=AsyncMock(return_value=document)), \
-             patch.object(worker.db_mod, "release_quota_reservation", new=AsyncMock()) as mock_release, \
+             patch.object(worker.db_mod, "release_quota_once", new=AsyncMock(return_value=3)) as mock_release, \
              patch.object(worker.db_mod, "fail_job", new=AsyncMock()) as mock_fail_job, \
              patch.object(worker.page_logger, "append_log", new=MagicMock()), \
              patch.object(worker.asyncio, "sleep", new=AsyncMock(side_effect=stop_after_first_idle)):
@@ -186,7 +186,7 @@ class WorkerFailurePathTests(unittest.IsolatedAsyncioTestCase):
                 await worker.run_worker("ocr", "ocr-worker")
 
         self.assertEqual(mock_status.await_args.args[2], "failed")
-        mock_release.assert_awaited_once_with(pool_obj, "user-1", 3)
+        mock_release.assert_awaited_once_with(pool_obj, 99, None)
         mock_fail_job.assert_awaited_once_with(pool_obj, 77, "ocr model failed", retryable=False)
 
 

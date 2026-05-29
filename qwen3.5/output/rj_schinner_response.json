@@ -1,0 +1,36 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "{\n  \"fields\": {\n    \"bill_to\": \"RJ SCHINNER CO., INC\\nN89 W14700 PATRITA DRIVE\\nMENOMONEE FALLS WI 53051\",\n    \"ship_to\": \"RJ SCHINNER - GRAND PRAIRIE TX\\n3001 ALOUETTE DRIVE SUITE 300\\nGRAND PRAIRIE TX 75052\\n469-348-0042 Fax 469-277-8804\",\n    \"order_date\": \"11/14/25\",\n    \"vendor_name\": \"FRESH PRODUCTS, INC.\",\n    \"order_number\": \"P1416144\",\n    \"vendor_adress\": \"PO BOX 933189\\nCLEVELAND, OH 44193\\n419-531-8472\",\n    \"line_items\": [\n      {\n        \"item\": \"3PB-F-20-BX\",\n        \"pack\": \"12/bx\",\n        \"order_qty\": \"24\",\n        \"unit_price\": \"6.220\"\n      },\n      {\n        \"item\": \"105G-F-02\",\n        \"pack\": \"4/cs\",\n        \"order_qty\": \"15\",\n        \"unit_price\": \"41.890\"\n      },\n      {\n        \"item\": \"3WDS-F-06-BX\",\n        \"pack\": \"10/bx\",\n        \"order_qty\": \"24\",\n        \"unit_price\": \"15.690\"\n      },\n      {\n        \"item\": \"EBC-F-04-BX\",\n        \"pack\": \"12/bx\",\n        \"order_qty\": \"6\",\n        \"unit_price\": \"17.150\"\n      },\n      {\n        \"item\": \"4PB-F-20-BX\",\n        \"pack\": \"12/bx\",\n        \"order_qty\": \"60\",\n        \"unit_price\": \"7.340\"\n      },\n      {\n        \"item\": \"CITP-F-66\",\n        \"pack\": \"1/pl\",\n        \"order_qty\": \"3\",\n        \"unit_price\": \"33.610\"\n      },\n      {\n        \"item\": \"OFB-F-01-BX\",\n        \"pack\": \"8/bx\",\n        \"order_qty\": \"12\",\n        \"unit_price\": \"27.660\"\n      },\n      {\n        \"item\": \"OFB-F-06-BX\",\n        \"pack\": \"8/bx\",\n        \"order_qty\": \"18\",\n        \"unit_price\": \"27.660\"\n      },\n      {\n        \"item\": \"OFB-F-54-BX\",\n        \"pack\": \"8/bx\",\n        \"order_qty\": \"6\",\n        \"unit_price\": \"27.660\"\n      }\n    ]\n  },\n  \"boxes\": {\n    \"bill_to\": [669, 101, 853, 146],\n    \"ship_to\": [579, 168, 964, 237],\n    \"order_date\": [675, 51, 789, 66],\n    \"vendor_name\": [138, 177, 365, 190],\n    \"order_number\": [815, 52, 954, 66],\n    \"vendor_adress\": [136, 195, 355, 237],\n    \"item\": [146, 300, 268, 311],\n    \"pack\": [614, 300, 736, 311],\n    \"order_qty\": [39, 300, 150, 311],\n    \"unit_price\": [754, 300, 875, 311]\n  }\n}"
+      }
+    }
+  ],
+  "created": 1780051974,
+  "model": "Qwen3.5-9B-UD-Q4_K_XL.gguf",
+  "system_fingerprint": "b9294-0f3cb3fc8",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 983,
+    "prompt_tokens": 2355,
+    "total_tokens": 3338,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "id": "chatcmpl-AFDpAt0ZEFijRA3tYdrmJ7Hyi7GgHXAC",
+  "timings": {
+    "cache_n": 0,
+    "prompt_n": 2355,
+    "prompt_ms": 3674.167,
+    "prompt_per_token_ms": 1.560155838641189,
+    "prompt_per_second": 640.9616111624758,
+    "predicted_n": 983,
+    "predicted_ms": 32443.134,
+    "predicted_per_token_ms": 33.00420549338759,
+    "predicted_per_second": 30.29916900136713
+  }
+}

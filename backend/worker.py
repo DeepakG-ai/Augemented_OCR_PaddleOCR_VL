@@ -63,6 +63,7 @@ def _pipeline_base(
         "filename": document.get("filename") or extraction.get("filename"),
         "billing_user_id": (document.get("metadata") or {}).get("billing_user_id"),
         "api_key_id": (document.get("metadata") or {}).get("api_key_id"),
+        "reserved_pages": (document.get("metadata") or {}).get("reserved_pages"),
     }
 
 
@@ -159,16 +160,7 @@ async def _stop_if_cancelled(pool, extraction_id: int, stage: str, message: str)
         progress={"stage": stage, "message": message},
     )
     try:
-        doc = await db_mod.get_document(pool, extraction_row.get("document_id"))
-        billing_uid = ((doc or {}).get("metadata") or {}).get("billing_user_id") if doc else None
-        if billing_uid:
-            total_pages = (
-                extraction_row.get("total_pages")
-                or ((doc or {}).get("metadata") or {}).get("reserved_pages")
-                or 0
-            )
-            if total_pages:
-                await db_mod.release_quota_reservation(pool, billing_uid, total_pages)
+        await db_mod.release_quota_once(pool, extraction_row.get("document_id"), None)
     except Exception as exc:
         logger.warning("quota release failed (cancel) ext=%s: %s", extraction_id, exc)
     return True
@@ -184,12 +176,7 @@ async def _release_failed_job_quota(pool, job: dict) -> None:
         if not extraction_row:
             return
         document_id = extraction_row.get("document_id") or job.get("document_id")
-        document = await db_mod.get_document(pool, document_id) if document_id else None
-        metadata = (document or {}).get("metadata") or {}
-        billing_uid = metadata.get("billing_user_id")
-        pages = extraction_row.get("total_pages") or metadata.get("reserved_pages") or 0
-        if billing_uid and pages:
-            await db_mod.release_quota_reservation(pool, billing_uid, pages)
+        await db_mod.release_quota_once(pool, document_id, None)
     except Exception as exc:
         logger.warning("quota release failed (job failure) ext=%s: %s", extraction_id, exc)
 
@@ -838,20 +825,23 @@ async def _process_llm(pool, job: dict) -> None:
         }
     logger.info("LLM result persisted: status=%s elapsed=%dms", status, elapsed_ms)
 
-    if output.get("cancelled") and await db_mod.is_cancel_requested(pool, extraction_id):
-        billing_uid = base.get("billing_user_id")
-        if billing_uid:
-            try:
-                _pages = (
-                    extraction_row.get("total_pages")
-                    or ((document_row or {}).get("metadata") or {}).get("reserved_pages")
-                    or 0
-                )
-                if _pages:
-                    await db_mod.release_quota_reservation(pool, billing_uid, _pages)
-            except Exception as exc:
-                logger.warning("quota release failed (llm cancel) ext=%s: %s", extraction_id, exc)
-        raise JobCancelled("Cancelled during LLM extraction")
+    # output.cancelled is True for BOTH a user cancel and an internal batch
+    # failure (which lands the extraction in "partial"). Either way the pipeline
+    # ends here without reaching postprocess, so release the reservation now —
+    # otherwise pending_pages stays inflated and blocks the user's next upload.
+    if output.get("cancelled"):
+        user_cancelled = await db_mod.is_cancel_requested(pool, extraction_id)
+        try:
+            await db_mod.release_quota_once(pool, base.get("document_id"), base.get("billing_user_id"))
+        except Exception as exc:
+            logger.warning(
+                "quota release failed (llm %s) ext=%s: %s",
+                "cancel" if user_cancelled else "partial", extraction_id, exc,
+            )
+        if user_cancelled:
+            raise JobCancelled("Cancelled during LLM extraction")
+        # Internal batch failure: extraction stays "partial"; nothing more to do.
+        return
 
     if status == "processing":
         await _maybe_enqueue_postprocess(pool, extraction_id, job["document_id"], _job_trace_context(job))
@@ -1025,12 +1015,10 @@ async def _process_postprocess(pool, job: dict) -> None:
         "done",
         progress={"stage": "postprocess", "message": "Field mapping complete"},
     )
-    billing_uid = base.get("billing_user_id")
-    if billing_uid:
-        try:
-            await db_mod.release_quota_reservation(pool, billing_uid, extraction_row.get("total_pages") or 0)
-        except Exception as _rel_exc:
-            logger.warning("quota release failed ext=%s: %s", extraction_id, _rel_exc)
+    try:
+        await db_mod.release_quota_once(pool, base.get("document_id"), base.get("billing_user_id"))
+    except Exception as _rel_exc:
+        logger.warning("quota release failed ext=%s: %s", extraction_id, _rel_exc)
     try:
         tok = await db_mod.get_extraction_token_totals(pool, extraction_id)
         _final = await db_mod.get_extraction(pool, extraction_id) or extraction_row

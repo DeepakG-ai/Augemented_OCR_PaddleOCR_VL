@@ -1345,41 +1345,31 @@ async def admin_approve_topup_request(
 ):
     """Admin: approve a pending top-up request and automatically apply the top-up."""
     pool = request.app.state.pool
-    req = await db_mod.get_topup_request(pool, request_id)
-    if not req:
-        raise HTTPException(status_code=404, detail="Top-up request not found")
-    if req["status"] != "pending":
-        raise HTTPException(status_code=409, detail=f"Request is already {req['status']}")
-
-    # Apply the top-up to the user's active subscription
     try:
-        topup = await db_mod.add_topup(
+        result = await db_mod.approve_topup_atomically(
             pool,
-            user_id=req["user_id"],
-            pages=req["requested_pages"],
-            note=f"Approved top-up request #{request_id}" + (f": {body.resolution_note}" if body.resolution_note else ""),
-            created_by=user["id"],
+            request_id=request_id,
+            resolved_by=user["id"],
+            resolution_note=body.resolution_note,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    if not topup:
-        raise HTTPException(
-            status_code=409,
-            detail="User has no active subscription. Create a subscription period before approving.",
-        )
+        msg = str(exc)
+        if msg == "not_found":
+            raise HTTPException(status_code=404, detail="Top-up request not found")
+        if msg == "no_active_subscription":
+            raise HTTPException(
+                status_code=409,
+                detail="User has no active subscription. Create a subscription period before approving.",
+            )
+        if msg.startswith("already_"):
+            raise HTTPException(status_code=409, detail=f"Request is already {msg[len('already_'):]}")
+        raise HTTPException(status_code=400, detail=msg)
 
-    resolved = await db_mod.resolve_topup_request(
-        pool,
-        request_id=request_id,
-        resolved_by=user["id"],
-        status="approved",
-        resolution_note=body.resolution_note,
-    )
     logger.info(
-        "Admin %s approved topup request #%d for user %s (%d pages)",
-        user["id"], request_id, req["user_id"], req["requested_pages"],
+        "Admin %s approved topup request #%d (%d pages) [atomic]",
+        user["id"], request_id, result["request"]["requested_pages"],
     )
-    return {"request": resolved, "topup": topup}
+    return result
 
 
 @app.post("/admin/topup-requests/{request_id}/reject", status_code=200)
@@ -2345,7 +2335,8 @@ async def ingest_document(
 
     pool = request.app.state.pool
 
-    # Block UI uploads when the scheduler is actively executing for this user
+    # Active schedules are allowed to wait quietly. Block manual UI uploads only
+    # while the desktop agent has explicitly marked a due schedule as running.
     if source_type == "ui" and await db_mod.get_user_is_executing(pool, user["id"]):
         raise HTTPException(
             409,
@@ -2901,48 +2892,8 @@ async def queue_resume_extraction(
     if extraction["status"] not in ("partial", "cancelled", "failed", "cancelling"):
         raise HTTPException(400, detail=f"Cannot resume extraction with status '{extraction['status']}'")
 
-    # -- Quota check (same rule as /ingest/ui) --------------------------------
-    if user.get("role") != "admin":
-        try:
-            usage_info = await db_mod.get_user_billable_pages(pool, user["id"])
-            u_used = usage_info["billable_pages"]
-            u_limit = usage_info["subscription_limit"]
-            if u_used >= u_limit:
-                _user_record = await db_mod.get_user_by_id(pool, user["id"])
-                page_logger.log_limit_alert(
-                    user_id=user["id"],
-                    email=(_user_record or {}).get("email"),
-                    total_extracted_pages=u_used,
-                    subscription_limit=u_limit,
-                    alert_type="exceeded",
-                    filename=extraction.get("filename"),
-                )
-                overage = u_used - u_limit
-                raise HTTPException(
-                    status_code=402,
-                    detail={
-                        "code": "QUOTA_EXCEEDED",
-                        "message": (
-                            f"Page limit exceeded. "
-                            f"Subscription: {u_limit} pages, "
-                            f"Extracted: {u_used} pages, "
-                            f"Overage: {overage} pages. "
-                            "Contact your administrator to increase your limit."
-                        ),
-                        "subscription_limit": u_limit,
-                        "total_extracted_pages": u_used,
-                        "overage": overage,
-                    },
-                )
-        except HTTPException:
-            raise
-        except Exception as usage_exc:
-            logger.error("Subscription quota check failed — blocking upload: %s", usage_exc)
-            raise HTTPException(
-                status_code=503,
-                detail="Service temporarily unavailable. Please retry.",
-            )
-
+    # 1. Reject if prior jobs are still draining — BEFORE reserving any quota,
+    #    so a 409 never leaks a reservation.
     jobs = await db_mod.list_jobs_for_extraction(pool, extraction_id)
     inflight_jobs = [job for job in jobs if job["status"] in ("queued", "running", "cancelling")]
     if inflight_jobs:
@@ -2957,28 +2908,88 @@ async def queue_resume_extraction(
                            if "_error" not in pr and pr.get("_page") is not None}
     all_page_nums = {p["page_number"] for p in pages}
     missing_pages = sorted(all_page_nums - completed_page_nums)
-    start_from = missing_pages[0] if missing_pages else len(pages) + 1
+    incoming_pages = len(missing_pages)
+    if incoming_pages <= 0:
+        raise HTTPException(400, detail="All pages are already extracted. Nothing to resume.")
+    start_from = missing_pages[0]
+    document_id = extraction.get("document_id")
 
-    await db_mod.set_cancel_requested(pool, extraction_id, False)
-    job = await db_mod.enqueue_job(
-        pool,
-        extraction_id=extraction_id,
-        document_id=extraction.get("document_id"),
-        job_type="llm",
-        payload={
-            "extraction_id": extraction_id,
-            "start_from_page": start_from,
-            "existing_page_results": existing_page_results,
-        },
-    )
-    if job is None:
-        raise HTTPException(409, detail="A resume job is already queued or running for this extraction")
-    await db_mod.set_extraction_status(
-        pool,
-        extraction_id,
-        "queued",
-        progress={"stage": "resume", "message": f"Queued resume from page {start_from}"},
-    )
+    # 2. Reserve quota atomically for just the missing pages (same hard cap as
+    #    /ingest/ui and /v1/extract — the old soft get_user_billable_pages check
+    #    let concurrent resumes all pass the same snapshot).
+    quota_reserved = False
+    if user.get("role") != "admin":
+        try:
+            quota = await db_mod.reserve_quota(pool, user["id"], incoming_pages)
+        except Exception as usage_exc:
+            logger.error("Subscription quota check failed — blocking resume: %s", usage_exc)
+            raise HTTPException(status_code=503, detail="Service temporarily unavailable. Please retry.")
+        if not quota["allowed"]:
+            _user_record = await db_mod.get_user_by_id(pool, user["id"])
+            page_logger.log_limit_alert(
+                user_id=user["id"],
+                email=(_user_record or {}).get("email"),
+                total_extracted_pages=quota["used"],
+                subscription_limit=quota["limit"],
+                alert_type="exceeded",
+                filename=extraction.get("filename"),
+            )
+            overage = max(quota["used"] - quota["limit"], 0)
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "code": "QUOTA_EXCEEDED",
+                    "message": (
+                        f"Resuming this document ({incoming_pages} pages) would exceed your "
+                        f"subscription limit of {quota['limit']} pages. "
+                        f"You have {quota['remaining']} pages remaining. "
+                        "Contact your administrator to increase your limit."
+                    ),
+                    "subscription_limit": quota["limit"],
+                    "total_extracted_pages": quota["used"],
+                    "remaining": quota["remaining"],
+                    "overage": overage,
+                },
+            )
+        quota_reserved = True
+
+    # 3. Enqueue — release the reservation if anything fails before job handoff.
+    try:
+        # Record the outstanding reservation on the document so the worker's
+        # terminal release returns exactly the missing-page count (not the full
+        # document size, which would over-release into other reservations).
+        if quota_reserved and document_id:
+            await db_mod.set_document_reserved_pages(pool, document_id, incoming_pages)
+
+        await db_mod.set_cancel_requested(pool, extraction_id, False)
+        job = await db_mod.enqueue_job(
+            pool,
+            extraction_id=extraction_id,
+            document_id=document_id,
+            job_type="llm",
+            payload={
+                "extraction_id": extraction_id,
+                "start_from_page": start_from,
+                "existing_page_results": existing_page_results,
+                "reserved_pages": incoming_pages,
+            },
+        )
+        if job is None:
+            raise HTTPException(409, detail="A resume job is already queued or running for this extraction")
+        await db_mod.set_extraction_status(
+            pool,
+            extraction_id,
+            "queued",
+            progress={"stage": "resume", "message": f"Queued resume from page {start_from}"},
+        )
+    except Exception:
+        if quota_reserved:
+            try:
+                await db_mod.release_quota_reservation(pool, user["id"], incoming_pages)
+            except Exception:
+                pass
+        raise
+
     return ExtractionJobStartOut(job_id=job["id"], extraction_id=extraction_id, status=job["status"])
 
 
@@ -3155,6 +3166,10 @@ async def upload_preview(
     file_bytes = await file.read()
     filename = file.filename or "unknown"
     _require_pdf(filename, file_bytes)
+
+    # Clamp to a safe range — preview is cheaper than extraction and must never
+    # render an unbounded page count (max_pages=0 previously rendered the whole PDF).
+    max_pages = max(1, min(max_pages, 50))
 
     pages = await processor.pdf_to_images(file_bytes, max_pages=max_pages)
     total_pages = pages[0].get("doc_total_pages", len(pages)) if pages else 0
@@ -4131,6 +4146,11 @@ async def list_user_schedules(request: Request, user: dict = Depends(get_current
 async def create_schedule(
     request: Request, body: ScheduleCreate, user: dict = Depends(get_current_user)
 ):
+    current = await db_mod.get_user_schedules(request.app.state.pool, user["id"])
+    if len(current) >= _SCHED_MAX:
+        raise HTTPException(400, detail=f"Maximum {_SCHED_MAX} schedules allowed per user")
+    if any(s["cron_expr"] == body.cron_expr for s in current):
+        raise HTTPException(400, detail="A schedule with this time already exists")
     row = await db_mod.create_user_schedule(
         request.app.state.pool, user["id"], body.cron_expr, body.timezone, body.label
     )
@@ -4159,6 +4179,10 @@ async def update_schedule_route(
     existing = await db_mod.get_schedule(request.app.state.pool, schedule_id)
     if not existing or str(existing.get("user_id")) != user["id"]:
         raise HTTPException(status_code=404, detail="Schedule not found")
+    if body.cron_expr is not None:
+        all_schedules = await db_mod.get_user_schedules(request.app.state.pool, user["id"])
+        if any(s["cron_expr"] == body.cron_expr and s["id"] != schedule_id for s in all_schedules):
+            raise HTTPException(400, detail="A schedule with this time already exists")
     row = await db_mod.update_user_schedule(
         request.app.state.pool, schedule_id,
         **{k: v for k, v in body.model_dump().items() if v is not None},
@@ -4233,7 +4257,10 @@ def _row_to_sched(row: dict) -> dict:
 @app.get("/api/scheduler")
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def get_user_scheduler(request: Request, user: dict = Depends(get_current_user)):
-    rows = await db_mod.get_user_schedules(request.app.state.pool, user["id"])
+    pool = request.app.state.pool
+    # Also clears stale running flags from crashed agents before the UI renders.
+    await db_mod.get_user_is_executing(pool, user["id"])
+    rows = await db_mod.get_user_schedules(pool, user["id"])
     return {"schedules": [_row_to_sched(r) for r in rows], "max_schedules": _SCHED_MAX}
 
 
@@ -4250,17 +4277,23 @@ async def start_user_scheduler(request: Request, user: dict = Depends(get_curren
     cron_expr = f"{utc_minute} {utc_hour} * * *"
     pool = request.app.state.pool
 
+    time_label = f"{utc_hour:02d}:{utc_minute:02d}"
     if schedule_id:
         # Update existing — verify it belongs to this user
         existing = await db_mod.get_schedule(pool, int(schedule_id))
         if not existing or str(existing.get("user_id")) != str(user["id"]):
             raise HTTPException(404, detail="Schedule not found")
+        all_schedules = await db_mod.get_user_schedules(pool, user["id"])
+        if any(s["cron_expr"] == cron_expr and s["id"] != int(schedule_id) for s in all_schedules):
+            raise HTTPException(400, detail=f"A schedule at {time_label} already exists")
         row = await db_mod.update_user_schedule(pool, int(schedule_id), cron_expr=cron_expr, enabled=True)
     else:
-        # Create new — enforce max limit
+        # Create new — enforce max limit and duplicate time
         current = await db_mod.get_user_schedules(pool, user["id"])
         if len(current) >= _SCHED_MAX:
             raise HTTPException(400, detail=f"Maximum {_SCHED_MAX} schedules allowed per user")
+        if any(s["cron_expr"] == cron_expr for s in current):
+            raise HTTPException(400, detail=f"A schedule at {time_label} already exists")
         row = await db_mod.create_user_schedule(pool, user["id"], cron_expr, "UTC", "daily run")
 
     return _row_to_sched(row)
@@ -4294,6 +4327,22 @@ async def delete_user_schedule(
         raise HTTPException(404, detail="Schedule not found")
     await db_mod.delete_user_schedule(pool, schedule_id)
     return {"deleted": True, "schedule_id": schedule_id}
+
+
+@app.post("/api/scheduler/{schedule_id}/running")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def mark_schedule_running_endpoint(
+    request: Request, schedule_id: int, user: dict = Depends(get_current_user)
+):
+    """Mark a due schedule as actively executing on the desktop agent."""
+    pool = request.app.state.pool
+    existing = await db_mod.get_schedule(pool, schedule_id)
+    if not existing or str(existing.get("user_id")) != str(user["id"]):
+        raise HTTPException(404, detail="Schedule not found")
+    if not existing.get("enabled", False):
+        raise HTTPException(409, detail="Schedule is disabled")
+    await db_mod.set_schedule_executing(pool, schedule_id, True)
+    return {"status": "running"}
 
 
 @app.post("/api/scheduler/{schedule_id}/ran")
@@ -4409,51 +4458,57 @@ async def extract_via_api_key(
                     # For sync_mode, we skip submitting job and proceed directly to polling
 
     if extraction_id is None:
-        # -- Page count + hard cap -------------------------------------------------
-        if filename.lower().endswith(".pdf"):
-            try:
-                incoming_pages = processor.count_pdf_pages(file_bytes)
-            except ValueError:
-                raise HTTPException(400, detail="Could not read the uploaded PDF.")
-            if incoming_pages > MAX_DOCUMENT_PAGES:
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "code": "DOCUMENT_TOO_LARGE",
-                        "message": f"PDF has {incoming_pages} pages. Maximum allowed is {MAX_DOCUMENT_PAGES} pages.",
-                        "pages": incoming_pages,
-                        "max_pages": MAX_DOCUMENT_PAGES,
-                    },
-                )
-        else:
-            incoming_pages = 1
-
-        # -- Subscription quota check (atomic reservation) -------------------------
-        if user.get("role") != "admin":
-            try:
-                quota = await db_mod.reserve_quota(pool, user["id"], incoming_pages)
-            except Exception as usage_exc:
-                logger.error("Subscription quota check failed: %s", usage_exc)
-                raise HTTPException(503, detail="Service temporarily unavailable. Please retry.")
-            if not quota["allowed"]:
-                raise HTTPException(
-                    status_code=402,
-                    detail={
-                        "code": "QUOTA_EXCEEDED",
-                        "message": (
-                            f"Uploading this document ({incoming_pages} pages) would exceed your "
-                            f"subscription limit of {quota['limit']} pages. "
-                            f"You have {quota['remaining']} pages remaining."
-                        ),
-                        "subscription_limit": quota["limit"],
-                        "total_extracted_pages": quota["used"],
-                        "incoming_pages": incoming_pages,
-                        "remaining": quota["remaining"],
-                    },
-                )
-
+        # All pre-submit work is wrapped in one try so that any failure before
+        # the job is handed off releases the quota reservation AND deletes the
+        # idempotency claim — otherwise a retry with the same key is poisoned.
+        incoming_pages = 0
+        quota_reserved = False
         _job_submitted = False
         try:
+            # -- Page count + hard cap -------------------------------------------------
+            if filename.lower().endswith(".pdf"):
+                try:
+                    incoming_pages = processor.count_pdf_pages(file_bytes)
+                except ValueError:
+                    raise HTTPException(400, detail="Could not read the uploaded PDF.")
+                if incoming_pages > MAX_DOCUMENT_PAGES:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "code": "DOCUMENT_TOO_LARGE",
+                            "message": f"PDF has {incoming_pages} pages. Maximum allowed is {MAX_DOCUMENT_PAGES} pages.",
+                            "pages": incoming_pages,
+                            "max_pages": MAX_DOCUMENT_PAGES,
+                        },
+                    )
+            else:
+                incoming_pages = 1
+
+            # -- Subscription quota check (atomic reservation) -------------------------
+            if user.get("role") != "admin":
+                try:
+                    quota = await db_mod.reserve_quota(pool, user["id"], incoming_pages)
+                except Exception as usage_exc:
+                    logger.error("Subscription quota check failed: %s", usage_exc)
+                    raise HTTPException(503, detail="Service temporarily unavailable. Please retry.")
+                if not quota["allowed"]:
+                    raise HTTPException(
+                        status_code=402,
+                        detail={
+                            "code": "QUOTA_EXCEEDED",
+                            "message": (
+                                f"Uploading this document ({incoming_pages} pages) would exceed your "
+                                f"subscription limit of {quota['limit']} pages. "
+                                f"You have {quota['remaining']} pages remaining."
+                            ),
+                            "subscription_limit": quota["limit"],
+                            "total_extracted_pages": quota["used"],
+                            "incoming_pages": incoming_pages,
+                            "remaining": quota["remaining"],
+                        },
+                    )
+                quota_reserved = True
+
             logger.info("[v1/extract] File received: %s (%d bytes, auth=%s, user=%s)",
                         filename, len(file_bytes), user.get("auth_method"), user.get("email"))
 
@@ -4531,7 +4586,24 @@ async def extract_via_api_key(
             document_id = submitted["extraction"].get("document_id")
 
             if claim and claim.get("claim_id"):
-                await db_mod.bind_idempotency_claim(pool, claim["claim_id"], extraction_id, document_id)
+                # The extraction/job now exist and own the quota reservation, so we
+                # must NOT delete the claim on failure here (that would let a retry
+                # spawn a duplicate extraction). Retry the bind to ride out a
+                # transient DB hiccup; if it ultimately fails the claim stays
+                # unbound and self-heals when its 24h TTL lapses.
+                for _bind_attempt in range(3):
+                    try:
+                        await db_mod.bind_idempotency_claim(pool, claim["claim_id"], extraction_id, document_id)
+                        break
+                    except Exception as bind_exc:
+                        if _bind_attempt == 2:
+                            logger.error(
+                                "Idempotency claim bind failed after retries "
+                                "(claim=%s ext=%s); claim will self-heal at TTL: %s",
+                                claim["claim_id"], extraction_id, bind_exc,
+                            )
+                        else:
+                            await asyncio.sleep(0.1 * (_bind_attempt + 1))
 
             if async_mode:
                 return JSONResponse(
@@ -4543,11 +4615,16 @@ async def extract_via_api_key(
                     }
                 )
         except Exception:
-            if user.get("role") != "admin" and not _job_submitted:
+            if quota_reserved and not _job_submitted:
                 try:
                     await db_mod.release_quota_reservation(pool, user["id"], incoming_pages)
                 except Exception:
                     pass
+            if claim and claim.get("claim_id") and not _job_submitted:
+                try:
+                    await db_mod.delete_idempotency_claim(pool, user["id"], idempotency_key)
+                except Exception as del_exc:
+                    logger.warning("Failed to delete orphaned idempotency claim: %s", del_exc)
             raise
 
     # -- Poll for completion (synchronous wait, scales with page count) ---------

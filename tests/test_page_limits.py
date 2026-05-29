@@ -220,7 +220,7 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
         main.limiter.reset()
         # The /ingest/ui endpoint runs a scheduler guard
         # (db_mod.get_user_is_executing) before the quota check. These tests
-        # use a non-DB fake pool, so stub the guard to "not executing" — the
+        # use a non-DB fake pool, so stub the guard to "not running" — the
         # quota path under test stays exercised.
         _sched = patch.object(
             main.db_mod, "get_user_is_executing", new=AsyncMock(return_value=False)
@@ -709,8 +709,12 @@ class ResumeQuotaEnforcementTests(unittest.TestCase):
         with patch.object(main.db_mod, "get_extraction",
                           new=AsyncMock(return_value=self._partial_extraction())), \
              patch.object(main, "assert_extraction_access", new=AsyncMock()), \
-             patch.object(main.db_mod, "get_user_billable_pages",
-                          new=AsyncMock(return_value=_usage(1003, 1000))), \
+             patch.object(main.db_mod, "list_jobs_for_extraction",
+                          new=AsyncMock(return_value=[])), \
+             patch.object(main.db_mod, "get_pages",
+                          new=AsyncMock(return_value=[{"page_number": 1}])), \
+             patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(1003, 1000, incoming=1))), \
              patch.object(main.db_mod, "get_user_by_id",
                           new=AsyncMock(return_value={"email": "c@test.com"})):
             r = self.client.post("/jobs/extractions/1/resume")
@@ -725,12 +729,43 @@ class ResumeQuotaEnforcementTests(unittest.TestCase):
         with patch.object(main.db_mod, "get_extraction",
                           new=AsyncMock(return_value=self._partial_extraction())), \
              patch.object(main, "assert_extraction_access", new=AsyncMock()), \
-             patch.object(main.db_mod, "get_user_billable_pages",
-                          new=AsyncMock(return_value=_usage(500, 500))), \
+             patch.object(main.db_mod, "list_jobs_for_extraction",
+                          new=AsyncMock(return_value=[])), \
+             patch.object(main.db_mod, "get_pages",
+                          new=AsyncMock(return_value=[{"page_number": 1}])), \
+             patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(500, 500, incoming=1))), \
              patch.object(main.db_mod, "get_user_by_id",
                           new=AsyncMock(return_value={"email": "c@test.com"})):
             r = self.client.post("/jobs/extractions/1/resume")
         self.assertEqual(r.status_code, 402)
+
+    def test_resume_reserves_only_missing_pages(self):
+        """Resume must reserve exactly the missing-page count, not the full doc."""
+        self._use_client()
+        # 3 rendered pages; page 1 already done → 2 missing.
+        ext = {**self._partial_extraction(),
+               "page_results": [{"_page": 1, "field": "x"}]}
+        with patch.object(main.db_mod, "get_extraction",
+                          new=AsyncMock(return_value=ext)), \
+             patch.object(main, "assert_extraction_access", new=AsyncMock()), \
+             patch.object(main.db_mod, "list_jobs_for_extraction",
+                          new=AsyncMock(return_value=[])), \
+             patch.object(main.db_mod, "get_pages",
+                          new=AsyncMock(return_value=[{"page_number": 1}, {"page_number": 2}, {"page_number": 3}])), \
+             patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(0, 1000, incoming=2))) as mock_reserve, \
+             patch.object(main.db_mod, "set_document_reserved_pages", new=AsyncMock()) as mock_set_reserved, \
+             patch.object(main.db_mod, "set_cancel_requested", new=AsyncMock()), \
+             patch.object(main.db_mod, "enqueue_job",
+                          new=AsyncMock(return_value={"id": 99, "status": "queued"})), \
+             patch.object(main.db_mod, "set_extraction_status", new=AsyncMock()):
+            r = self.client.post("/jobs/extractions/1/resume")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(mock_reserve.call_args.args[2], 2,
+                         "reserve_quota must be called with the missing-page count (2)")
+        # Document reservation is updated to the missing count so terminal release matches.
+        self.assertEqual(mock_set_reserved.call_args.args[2], 2)
 
     def test_admin_can_resume_regardless_of_quota(self):
         """Admin bypasses quota on resume."""
@@ -738,8 +773,8 @@ class ResumeQuotaEnforcementTests(unittest.TestCase):
         with patch.object(main.db_mod, "get_extraction",
                           new=AsyncMock(return_value=self._partial_extraction())), \
              patch.object(main, "assert_extraction_access", new=AsyncMock()), \
-             patch.object(main.db_mod, "get_user_billable_pages",
-                          new=AsyncMock(return_value=_usage(99999, 100))) as mock_check, \
+             patch.object(main.db_mod, "reserve_quota",
+                          new=AsyncMock(return_value=_quota_result(99999, 100))) as mock_reserve, \
              patch.object(main.db_mod, "list_jobs_for_extraction",
                           new=AsyncMock(return_value=[])), \
              patch.object(main.db_mod, "get_pages",
@@ -749,7 +784,7 @@ class ResumeQuotaEnforcementTests(unittest.TestCase):
                           new=AsyncMock(return_value={"id": 99, "status": "queued"})), \
              patch.object(main.db_mod, "set_extraction_status", new=AsyncMock()):
             r = self.client.post("/jobs/extractions/1/resume")
-        mock_check.assert_not_called()
+        mock_reserve.assert_not_called()
         self.assertNotEqual(r.status_code, 402)
 
 

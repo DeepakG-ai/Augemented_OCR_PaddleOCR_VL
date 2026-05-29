@@ -198,22 +198,21 @@ class SchedulerStartLimitRouteTests(unittest.TestCase):
 
     def test_update_existing_skips_limit_check(self):
         """
-        schedule_id in body → update path; get_user_schedules must NOT be called
-        regardless of how many schedules exist.
+        schedule_id in body → update path; the 3-schedule cap must NOT block the request.
+        get_user_schedules is called for the duplicate-time check (not for the cap).
         """
         existing_row = _sched_row(1, _TEST_USER_ID, "0 10 * * *")
         updated_row  = _sched_row(1, _TEST_USER_ID, "0 12 * * *")
-        mock_list = AsyncMock()
 
         with patch.object(db_mod, "get_schedule", new=AsyncMock(return_value=existing_row)), \
              patch.object(db_mod, "update_user_schedule", new=AsyncMock(return_value=updated_row)), \
-             patch.object(db_mod, "get_user_schedules", new=mock_list):
+             patch.object(db_mod, "get_user_schedules", new=AsyncMock(return_value=[existing_row])):
             resp = self.client.post(
                 "/api/scheduler/start",
                 json={"hour": 12, "minute": 0, "schedule_id": 1},
             )
 
-        mock_list.assert_not_called()
+        # Update path is not blocked by the 3-schedule cap
         self.assertEqual(resp.status_code, 200)
 
     # -- Input validation (exercised at the route, not just the DB layer) -----
@@ -258,6 +257,252 @@ class SchedulerStartLimitRouteTests(unittest.TestCase):
         with patch.object(db_mod, "get_user_schedules", new=AsyncMock(return_value=[])), \
              patch.object(db_mod, "create_user_schedule", new=AsyncMock(return_value=new_row)):
             resp = self.client.post("/api/scheduler/start", json={"hour": 8, "minute": 59})
+        self.assertNotEqual(resp.status_code, 400)
+
+
+class SchedulerRunningRouteTests(unittest.TestCase):
+    """The client agent marks schedules running only while it scans/uploads."""
+
+    @classmethod
+    def setUpClass(cls):
+        from fastapi.testclient import TestClient
+        main.app.state.pool = object()
+        cls.client = TestClient(main.app, raise_server_exceptions=False)
+
+    def test_running_endpoint_sets_execution_flag(self):
+        existing = _sched_row(7, _TEST_USER_ID, enabled=True)
+        with patch.object(db_mod, "get_schedule", new=AsyncMock(return_value=existing)), \
+             patch.object(db_mod, "set_schedule_executing", new=AsyncMock()) as mock_set:
+            resp = self.client.post("/api/scheduler/7/running")
+
+        self.assertEqual(resp.status_code, 200)
+        mock_set.assert_awaited_once_with(unittest.mock.ANY, 7, True)
+
+    def test_running_endpoint_rejects_disabled_schedule(self):
+        existing = _sched_row(7, _TEST_USER_ID, enabled=False)
+        with patch.object(db_mod, "get_schedule", new=AsyncMock(return_value=existing)), \
+             patch.object(db_mod, "set_schedule_executing", new=AsyncMock()) as mock_set:
+            resp = self.client.post("/api/scheduler/7/running")
+
+        self.assertEqual(resp.status_code, 409)
+        mock_set.assert_not_called()
+
+
+class ScheduleCrudLimitRouteTests(unittest.TestCase):
+    """The older /api/schedules create path must also honor the max-3 cap."""
+
+    @classmethod
+    def setUpClass(cls):
+        from fastapi.testclient import TestClient
+        main.app.state.pool = object()
+        cls.client = TestClient(main.app, raise_server_exceptions=False)
+
+    def test_crud_create_fourth_schedule_returns_400(self):
+        full = [_sched_row(i, _TEST_USER_ID) for i in range(1, 4)]
+        with patch.object(db_mod, "get_user_schedules", new=AsyncMock(return_value=full)), \
+             patch.object(db_mod, "create_user_schedule", new=AsyncMock()) as mock_create:
+            resp = self.client.post(
+                "/api/schedules",
+                json={"cron_expr": "0 9 * * *", "timezone": "UTC", "label": "extra"},
+            )
+
+        self.assertEqual(resp.status_code, 400)
+        mock_create.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 4. Duplicate schedule time — same user cannot have two schedules at the same time
+# ---------------------------------------------------------------------------
+
+class DuplicateScheduleTimeRouteTests(unittest.TestCase):
+    """
+    No two schedules for the same user can share the same fire time.
+
+    Covers four paths:
+      A. POST /api/scheduler/start (create)   — main UI route
+      B. POST /api/scheduler/start (update)   — same route with schedule_id
+      C. POST /api/schedules       (create)   — older CRUD route
+      D. PUT  /api/schedules/{id}  (update)   — older CRUD update
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from fastapi.testclient import TestClient
+        main.app.state.pool = object()
+        cls.client = TestClient(main.app, raise_server_exceptions=False)
+
+    # ── A. POST /api/scheduler/start (create) ────────────────────────────────
+
+    def test_create_duplicate_time_returns_400(self):
+        """User already has 10:20 → creating another 10:20 returns 400."""
+        existing = [_sched_row(1, _TEST_USER_ID, cron="20 10 * * *")]
+        with patch.object(db_mod, "get_user_schedules", new=AsyncMock(return_value=existing)):
+            resp = self.client.post("/api/scheduler/start", json={"hour": 10, "minute": 20})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_create_duplicate_400_detail_mentions_time(self):
+        """400 body must contain the conflicting time (10:20) so the user knows what clashed."""
+        existing = [_sched_row(1, _TEST_USER_ID, cron="20 10 * * *")]
+        with patch.object(db_mod, "get_user_schedules", new=AsyncMock(return_value=existing)):
+            resp = self.client.post("/api/scheduler/start", json={"hour": 10, "minute": 20})
+        self.assertIn("10:20", resp.json().get("error", {}).get("message", ""))
+
+    def test_create_different_time_is_allowed(self):
+        """User has 10:20 → creating at 11:30 is a different time and must not return 400."""
+        existing = [_sched_row(1, _TEST_USER_ID, cron="20 10 * * *")]
+        new_row   = _sched_row(2, _TEST_USER_ID, cron="30 11 * * *")
+        with patch.object(db_mod, "get_user_schedules", new=AsyncMock(return_value=existing)), \
+             patch.object(db_mod, "create_user_schedule", new=AsyncMock(return_value=new_row)):
+            resp = self.client.post("/api/scheduler/start", json={"hour": 11, "minute": 30})
+        self.assertNotEqual(resp.status_code, 400)
+
+    def test_create_duplicate_check_runs_before_insert(self):
+        """create_user_schedule must NOT be called when the time is already taken."""
+        existing = [_sched_row(1, _TEST_USER_ID, cron="20 10 * * *")]
+        mock_create = AsyncMock()
+        with patch.object(db_mod, "get_user_schedules", new=AsyncMock(return_value=existing)), \
+             patch.object(db_mod, "create_user_schedule", new=mock_create):
+            self.client.post("/api/scheduler/start", json={"hour": 10, "minute": 20})
+        mock_create.assert_not_called()
+
+    def test_create_zero_existing_allows_any_time(self):
+        """No existing schedules → any time is unique and must not return 400."""
+        new_row = _sched_row(1, _TEST_USER_ID, cron="20 10 * * *")
+        with patch.object(db_mod, "get_user_schedules", new=AsyncMock(return_value=[])), \
+             patch.object(db_mod, "create_user_schedule", new=AsyncMock(return_value=new_row)):
+            resp = self.client.post("/api/scheduler/start", json={"hour": 10, "minute": 20})
+        self.assertNotEqual(resp.status_code, 400)
+
+    # ── B. POST /api/scheduler/start (update with schedule_id) ───────────────
+
+    def test_update_to_duplicate_time_returns_400(self):
+        """Schedule 1=10:20, Schedule 2=11:30. Updating Schedule 2 to 10:20 returns 400."""
+        sched1 = _sched_row(1, _TEST_USER_ID, cron="20 10 * * *")
+        sched2 = _sched_row(2, _TEST_USER_ID, cron="30 11 * * *")
+        with patch.object(db_mod, "get_schedule", new=AsyncMock(return_value=sched2)), \
+             patch.object(db_mod, "get_user_schedules", new=AsyncMock(return_value=[sched1, sched2])):
+            resp = self.client.post(
+                "/api/scheduler/start", json={"hour": 10, "minute": 20, "schedule_id": 2}
+            )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_update_to_duplicate_time_check_runs_before_save(self):
+        """update_user_schedule must NOT be called when the target time is already taken."""
+        sched1 = _sched_row(1, _TEST_USER_ID, cron="20 10 * * *")
+        sched2 = _sched_row(2, _TEST_USER_ID, cron="30 11 * * *")
+        mock_update = AsyncMock()
+        with patch.object(db_mod, "get_schedule", new=AsyncMock(return_value=sched2)), \
+             patch.object(db_mod, "get_user_schedules", new=AsyncMock(return_value=[sched1, sched2])), \
+             patch.object(db_mod, "update_user_schedule", new=mock_update):
+            self.client.post(
+                "/api/scheduler/start", json={"hour": 10, "minute": 20, "schedule_id": 2}
+            )
+        mock_update.assert_not_called()
+
+    def test_update_same_schedule_to_its_own_time_is_allowed(self):
+        """Updating Schedule 1 to 10:20 when it is already 10:20 must not conflict with itself."""
+        sched1  = _sched_row(1, _TEST_USER_ID, cron="20 10 * * *")
+        updated = _sched_row(1, _TEST_USER_ID, cron="20 10 * * *")
+        with patch.object(db_mod, "get_schedule", new=AsyncMock(return_value=sched1)), \
+             patch.object(db_mod, "get_user_schedules", new=AsyncMock(return_value=[sched1])), \
+             patch.object(db_mod, "update_user_schedule", new=AsyncMock(return_value=updated)):
+            resp = self.client.post(
+                "/api/scheduler/start", json={"hour": 10, "minute": 20, "schedule_id": 1}
+            )
+        self.assertNotEqual(resp.status_code, 400)
+
+    def test_update_to_unique_time_is_allowed(self):
+        """Schedule 1=10:20, Schedule 2=11:30. Updating Schedule 2 to 14:00 must not return 400."""
+        sched1  = _sched_row(1, _TEST_USER_ID, cron="20 10 * * *")
+        sched2  = _sched_row(2, _TEST_USER_ID, cron="30 11 * * *")
+        updated = _sched_row(2, _TEST_USER_ID, cron="0 14 * * *")
+        with patch.object(db_mod, "get_schedule", new=AsyncMock(return_value=sched2)), \
+             patch.object(db_mod, "get_user_schedules", new=AsyncMock(return_value=[sched1, sched2])), \
+             patch.object(db_mod, "update_user_schedule", new=AsyncMock(return_value=updated)):
+            resp = self.client.post(
+                "/api/scheduler/start", json={"hour": 14, "minute": 0, "schedule_id": 2}
+            )
+        self.assertNotEqual(resp.status_code, 400)
+
+    # ── C. POST /api/schedules (older CRUD create) ────────────────────────────
+
+    def test_crud_create_duplicate_cron_returns_400(self):
+        """POST /api/schedules with a cron_expr already used by the same user → 400."""
+        existing = [_sched_row(1, _TEST_USER_ID, cron="20 10 * * *")]
+        mock_create = AsyncMock()
+        with patch.object(db_mod, "get_user_schedules", new=AsyncMock(return_value=existing)), \
+             patch.object(db_mod, "create_user_schedule", new=mock_create):
+            resp = self.client.post(
+                "/api/schedules",
+                json={"cron_expr": "20 10 * * *", "timezone": "UTC", "label": "dup"},
+            )
+        self.assertEqual(resp.status_code, 400)
+        mock_create.assert_not_called()
+
+    def test_crud_create_unique_cron_returns_201(self):
+        """POST /api/schedules with a new cron_expr returns 201."""
+        existing = [_sched_row(1, _TEST_USER_ID, cron="20 10 * * *")]
+        new_row   = _sched_row(2, _TEST_USER_ID, cron="30 11 * * *")
+        with patch.object(db_mod, "get_user_schedules", new=AsyncMock(return_value=existing)), \
+             patch.object(db_mod, "create_user_schedule", new=AsyncMock(return_value=new_row)):
+            resp = self.client.post(
+                "/api/schedules",
+                json={"cron_expr": "30 11 * * *", "timezone": "UTC", "label": "new"},
+            )
+        self.assertEqual(resp.status_code, 201)
+
+    # ── D. PUT /api/schedules/{id} (older CRUD update) ────────────────────────
+
+    def test_crud_update_cron_to_duplicate_returns_400(self):
+        """PUT /api/schedules/2 changing cron to one already used by schedule 1 → 400."""
+        sched1 = _sched_row(1, _TEST_USER_ID, cron="20 10 * * *")
+        sched2 = _sched_row(2, _TEST_USER_ID, cron="30 11 * * *")
+        mock_update = AsyncMock()
+        with patch.object(db_mod, "get_schedule", new=AsyncMock(return_value=sched2)), \
+             patch.object(db_mod, "get_user_schedules", new=AsyncMock(return_value=[sched1, sched2])), \
+             patch.object(db_mod, "update_user_schedule", new=mock_update):
+            resp = self.client.put(
+                "/api/schedules/2",
+                json={"cron_expr": "20 10 * * *"},
+            )
+        self.assertEqual(resp.status_code, 400)
+        mock_update.assert_not_called()
+
+    def test_crud_update_non_cron_field_skips_duplicate_check(self):
+        """PUT /api/schedules/1 changing only the label must not trigger the time-conflict check."""
+        sched1 = _sched_row(1, _TEST_USER_ID, cron="20 10 * * *")
+        updated = dict(sched1, label="renamed")
+        mock_get_all = AsyncMock()
+        with patch.object(db_mod, "get_schedule", new=AsyncMock(return_value=sched1)), \
+             patch.object(db_mod, "get_user_schedules", new=mock_get_all), \
+             patch.object(db_mod, "update_user_schedule", new=AsyncMock(return_value=updated)):
+            self.client.put("/api/schedules/1", json={"label": "renamed"})
+        mock_get_all.assert_not_called()
+
+    def test_crud_update_cron_to_own_value_is_allowed(self):
+        """PUT /api/schedules/1 setting the same cron_expr it already has must not block."""
+        sched1 = _sched_row(1, _TEST_USER_ID, cron="20 10 * * *")
+        with patch.object(db_mod, "get_schedule", new=AsyncMock(return_value=sched1)), \
+             patch.object(db_mod, "get_user_schedules", new=AsyncMock(return_value=[sched1])), \
+             patch.object(db_mod, "update_user_schedule", new=AsyncMock(return_value=sched1)):
+            resp = self.client.put(
+                "/api/schedules/1",
+                json={"cron_expr": "20 10 * * *"},
+            )
+        self.assertNotEqual(resp.status_code, 400)
+
+    def test_crud_update_cron_to_unique_time_is_allowed(self):
+        """PUT /api/schedules/2 changing to a time nobody else uses must not return 400."""
+        sched1  = _sched_row(1, _TEST_USER_ID, cron="20 10 * * *")
+        sched2  = _sched_row(2, _TEST_USER_ID, cron="30 11 * * *")
+        updated = _sched_row(2, _TEST_USER_ID, cron="0 14 * * *")
+        with patch.object(db_mod, "get_schedule", new=AsyncMock(return_value=sched2)), \
+             patch.object(db_mod, "get_user_schedules", new=AsyncMock(return_value=[sched1, sched2])), \
+             patch.object(db_mod, "update_user_schedule", new=AsyncMock(return_value=updated)):
+            resp = self.client.put(
+                "/api/schedules/2",
+                json={"cron_expr": "0 14 * * *"},
+            )
         self.assertNotEqual(resp.status_code, 400)
 
 

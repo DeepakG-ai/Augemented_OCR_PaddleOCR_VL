@@ -404,6 +404,78 @@ class ScheduleStateTests(unittest.TestCase):
             ])
             self.assertEqual(state.claim_due(), ("none", []))
 
+    def test_missed_schedule_is_skipped_until_tomorrow(self):
+        now = datetime(2026, 5, 27, 16, 40, tzinfo=UTC)
+        state = ca._ScheduleState()
+        with patch.object(ca, "datetime", _fixed_datetime(now)):
+            state.update_from_server([
+                {"id": 1, "enabled": True, "utc_hour": 16, "utc_minute": 30}
+            ])
+            # next_fire_time wakes the loop once so claim_due() can log the skip.
+            self.assertEqual(state.next_fire_time(), datetime(2026, 5, 27, 16, 30, tzinfo=UTC))
+            skip_state, skipped = state.claim_due()
+            self.assertEqual(skip_state, "skipped")
+            self.assertEqual(skipped[0]["schedule_id"], 1)
+            self.assertEqual(skipped[0]["scheduled_at"], datetime(2026, 5, 27, 16, 30, tzinfo=UTC))
+            self.assertEqual(skipped[0]["skipped_at"], now)
+            self.assertEqual(state.next_fire_time(), datetime(2026, 5, 28, 16, 30, tzinfo=UTC))
+            self.assertEqual(state.claim_due(), ("none", []))
+
+    def test_due_schedule_inside_grace_still_runs(self):
+        now = datetime(2026, 5, 27, 16, 30, 45, tzinfo=UTC)
+        state = ca._ScheduleState()
+        with patch.object(ca, "datetime", _fixed_datetime(now)):
+            state.update_from_server([
+                {"id": 1, "enabled": True, "utc_hour": 16, "utc_minute": 30}
+            ])
+            self.assertEqual(state.claim_due(), ("start", [1]))
+
+    def test_scheduler_loop_marks_running_and_ran(self):
+        now = datetime(2026, 5, 27, 16, 30, 5, tzinfo=UTC)
+        state = ca._ScheduleState()
+        stop = ca.threading.Event()
+        schedule_changed = ca.threading.Event()
+        calls: list[tuple[str, str]] = []
+
+        with TemporaryDirectory() as tmp:
+            input_dir = Path(tmp) / "input"
+            input_dir.mkdir()
+            pdf = input_dir / "invoice.pdf"
+            pdf.write_bytes(b"%PDF-1.4")
+            folders = {
+                "input": str(input_dir),
+                "output": str(Path(tmp) / "output"),
+                "success": str(Path(tmp) / "success"),
+                "failed": str(Path(tmp) / "failed"),
+            }
+
+            def fake_call(_token_mgr, method, url, **_kwargs):
+                calls.append((method, url))
+                if url.endswith("/api/scheduler"):
+                    return _mock_response(200, {
+                        "schedules": [
+                            {"id": 1, "enabled": True, "utc_hour": 16, "utc_minute": 30}
+                        ]
+                    })
+                return _mock_response(200, {"status": "ok"})
+
+            def fake_process(*_args, **_kwargs):
+                stop.set()
+
+            with patch.object(ca, "datetime", _fixed_datetime(now)), \
+                 patch.object(ca, "_call", side_effect=fake_call), \
+                 patch.object(ca, "_process_pdf", side_effect=fake_process) as mock_process:
+                ca._scheduler_loop("http://server", MagicMock(), folders, state, schedule_changed, stop)
+
+        urls = [url for _method, url in calls]
+        self.assertIn("http://server/api/scheduler/1/running", urls)
+        self.assertIn("http://server/api/scheduler/1/ran", urls)
+        self.assertLess(
+            urls.index("http://server/api/scheduler/1/running"),
+            urls.index("http://server/api/scheduler/1/ran"),
+        )
+        mock_process.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # client_online timestamp logic

@@ -8,6 +8,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import argparse
 import base64
 import json
 import sys
@@ -33,6 +34,21 @@ OUT_DIR = Path(__file__).parent / "output"
 OUT_DIR.mkdir(exist_ok=True)
 
 VENDORS = [
+    {
+        "name": "RJ Schinner",
+        "pdf":  Path(r"C:\Users\aigroup5\Downloads\PDF Samples\RJ SchINNER\RJ SCHINNER 563773.pdf"),
+        "header_fields": [
+            "bill_to", "ship_to", "order_date",
+            "vendor_name", "order_number", "vendor_adress",
+        ],
+        "line_item_fields": [
+            "item", "pack", "order_qty", "unit_price",
+        ],
+        "instructions": None,
+        "rules": [],
+        "strict_line_items": True,
+        "total_pages": 3,
+    },
     {
         "name": "Canada Metal",
         "pdf":  Path(r"C:\Users\aigroup5\Downloads\Canada Metal - INVCM-1005.pdf"),
@@ -147,11 +163,30 @@ async def run_vendor(v: dict):
     user_msg = build_user_message(
         header_fields=v["header_fields"],
         line_item_fields=v["line_item_fields"],
-        page_num=1, total_pages=1,
+        page_num=1, total_pages=v.get("total_pages", 1),
         include_boxes=True,
     )
     (OUT_DIR / f"{slug}_system_prompt.txt").write_text(sys_prompt, encoding="utf-8")
     (OUT_DIR / f"{slug}_user_message.txt").write_text(user_msg, encoding="utf-8")
+
+    if v.get("strict_line_items"):
+        strict_block = """
+<strict_line_items_required>
+- You MUST return the `fields.line_items` key.
+- `fields.line_items` MUST be an array of row objects using exactly the requested line-item columns.
+- If any line item row is visible on this page, do NOT omit `line_items` and do NOT return an empty array.
+- Boxes are only for labels/column headers; they do not replace row extraction.
+</strict_line_items_required>"""
+        sys_prompt = sys_prompt + strict_block
+        user_msg = user_msg + """
+
+STRICT LINE ITEM REQUIREMENT:
+Return `fields.line_items` as an array. Extract every visible table row on this page.
+Do not omit the `line_items` key."""
+
+        (OUT_DIR / f"{slug}_system_prompt.txt").write_text(sys_prompt, encoding="utf-8")
+        (OUT_DIR / f"{slug}_user_message.txt").write_text(user_msg, encoding="utf-8")
+
     print(f"    system_prompt: {len(sys_prompt)} chars")
     print(f"    user_message:  {len(user_msg)} chars")
 
@@ -169,8 +204,15 @@ async def run_vendor(v: dict):
 
 
 async def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("vendors", nargs="*", help="Optional vendor names to run, e.g. RJ Schinner")
+    args = parser.parse_args()
+    wanted = {name.casefold() for name in args.vendors}
+
     print(f"LLM: {LLM_URL}  model={LLM_MODEL}\n")
     for v in VENDORS:
+        if wanted and v["name"].casefold() not in wanted:
+            continue
         try:
             await run_vendor(v)
         except Exception as exc:

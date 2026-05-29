@@ -238,6 +238,12 @@ class MarkScheduleRanTests(unittest.IsolatedAsyncioTestCase):
         call_args = conn.execute.call_args[0]
         self.assertEqual(call_args[1], 99)
 
+    async def test_clears_running_flag(self):
+        pool, conn = _make_pool()
+        await db_mod.mark_schedule_ran(pool, 99)
+        sql = conn.execute.call_args[0][0]
+        self.assertIn("is_executing = FALSE", sql)
+
 
 # ---------------------------------------------------------------------------
 # Isolation: user A cannot see user B schedules

@@ -827,14 +827,15 @@ class AdminApproveTopupRequestTests(unittest.TestCase):
             json=body or {},
         )
 
+    def _ok_result(self, pages: int = 1000, note: str | None = None) -> dict:
+        return {
+            "request": _req_row(status="approved", resolution_note=note),
+            "topup": {**_topup_row(), "pages": pages},
+        }
+
     def test_approve_returns_200_and_applies_topup(self) -> None:
-        approved_req = _req_row(status="approved", resolution_note=None)
-        with patch.object(main.db_mod, "get_topup_request",
-                          new=AsyncMock(return_value=_req_row())), \
-             patch.object(main.db_mod, "add_topup",
-                          new=AsyncMock(return_value=_topup_row())), \
-             patch.object(main.db_mod, "resolve_topup_request",
-                          new=AsyncMock(return_value=approved_req)):
+        with patch.object(main.db_mod, "approve_topup_atomically",
+                          new=AsyncMock(return_value=self._ok_result())):
             r = self._approve()
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
@@ -844,68 +845,53 @@ class AdminApproveTopupRequestTests(unittest.TestCase):
         self.assertEqual(body["topup"]["pages"], 1000)
 
     def test_approve_with_resolution_note(self) -> None:
-        approved_req = _req_row(status="approved", resolution_note="Monthly plan extended")
-        with patch.object(main.db_mod, "get_topup_request",
-                          new=AsyncMock(return_value=_req_row())), \
-             patch.object(main.db_mod, "add_topup",
-                          new=AsyncMock(return_value=_topup_row())), \
-             patch.object(main.db_mod, "resolve_topup_request",
-                          new=AsyncMock(return_value=approved_req)):
+        with patch.object(main.db_mod, "approve_topup_atomically",
+                          new=AsyncMock(return_value=self._ok_result(note="Monthly plan extended"))):
             r = self._approve(body={"resolution_note": "Monthly plan extended"})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["request"]["resolution_note"], "Monthly plan extended")
 
-    def test_approve_calls_add_topup_with_correct_pages(self) -> None:
-        req = _req_row(pages=2000)
-        with patch.object(main.db_mod, "get_topup_request",
-                          new=AsyncMock(return_value=req)), \
-             patch.object(main.db_mod, "add_topup",
-                          new=AsyncMock(return_value={**_topup_row(), "pages": 2000})) as mock_add, \
-             patch.object(main.db_mod, "resolve_topup_request",
-                          new=AsyncMock(return_value=_req_row(status="approved"))):
+    def test_approve_delegates_to_atomic_helper(self) -> None:
+        with patch.object(main.db_mod, "approve_topup_atomically",
+                          new=AsyncMock(return_value=self._ok_result(pages=2000))) as mock_approve:
             self._approve()
-        mock_add.assert_awaited_once()
-        _, kwargs = mock_add.call_args
-        self.assertEqual(kwargs.get("pages"), 2000)
+        mock_approve.assert_awaited_once()
+        _, kwargs = mock_approve.call_args
+        self.assertEqual(kwargs.get("request_id"), _REQ_ID)
+        self.assertEqual(kwargs.get("resolved_by"), _ADMIN_UUID)
 
     def test_unknown_request_returns_404(self) -> None:
-        with patch.object(main.db_mod, "get_topup_request",
-                          new=AsyncMock(return_value=None)):
+        with patch.object(main.db_mod, "approve_topup_atomically",
+                          new=AsyncMock(side_effect=ValueError("not_found"))):
             r = self._approve(req_id=9999)
         self.assertEqual(r.status_code, 404)
 
     def test_already_approved_returns_409(self) -> None:
-        already = _req_row(status="approved")
-        with patch.object(main.db_mod, "get_topup_request",
-                          new=AsyncMock(return_value=already)):
+        with patch.object(main.db_mod, "approve_topup_atomically",
+                          new=AsyncMock(side_effect=ValueError("already_approved"))):
             r = self._approve()
         self.assertEqual(r.status_code, 409)
         msg = r.json()["error"]["message"].lower()
         self.assertIn("approved", msg)
 
     def test_already_rejected_returns_409(self) -> None:
-        already = _req_row(status="rejected")
-        with patch.object(main.db_mod, "get_topup_request",
-                          new=AsyncMock(return_value=already)):
+        with patch.object(main.db_mod, "approve_topup_atomically",
+                          new=AsyncMock(side_effect=ValueError("already_rejected"))):
             r = self._approve()
         self.assertEqual(r.status_code, 409)
 
     def test_no_active_subscription_returns_409(self) -> None:
-        """add_topup returns None when user has no active subscription."""
-        with patch.object(main.db_mod, "get_topup_request",
-                          new=AsyncMock(return_value=_req_row())), \
-             patch.object(main.db_mod, "add_topup",
-                          new=AsyncMock(return_value=None)):
+        """Atomic helper raises no_active_subscription when the user has none."""
+        with patch.object(main.db_mod, "approve_topup_atomically",
+                          new=AsyncMock(side_effect=ValueError("no_active_subscription"))):
             r = self._approve()
         self.assertEqual(r.status_code, 409)
         msg = r.json()["error"]["message"].lower()
         self.assertIn("subscription", msg)
 
-    def test_add_topup_value_error_returns_400(self) -> None:
-        with patch.object(main.db_mod, "get_topup_request",
-                          new=AsyncMock(return_value=_req_row())), \
-             patch.object(main.db_mod, "add_topup",
-                          side_effect=ValueError("pages must be positive")):
+    def test_generic_value_error_returns_400(self) -> None:
+        with patch.object(main.db_mod, "approve_topup_atomically",
+                          new=AsyncMock(side_effect=ValueError("pages must be positive"))):
             r = self._approve()
         self.assertEqual(r.status_code, 400)
 
@@ -914,17 +900,6 @@ class AdminApproveTopupRequestTests(unittest.TestCase):
             main.app.dependency_overrides.pop(require_admin, None)
             r = self._approve()
         self.assertEqual(r.status_code, 403)
-
-    def test_resolve_called_only_after_successful_topup(self) -> None:
-        """resolve_topup_request must NOT be called when add_topup fails."""
-        with patch.object(main.db_mod, "get_topup_request",
-                          new=AsyncMock(return_value=_req_row())), \
-             patch.object(main.db_mod, "add_topup",
-                          new=AsyncMock(return_value=None)), \
-             patch.object(main.db_mod, "resolve_topup_request",
-                          new=AsyncMock()) as mock_resolve:
-            self._approve()
-        mock_resolve.assert_not_awaited()
 
 
 class AdminRejectTopupRequestTests(unittest.TestCase):
@@ -1017,21 +992,20 @@ class TopupRequestIdempotencyTests(unittest.TestCase):
         cls.client = TestClient(main.app)
 
     def test_second_approve_after_first_sees_409(self) -> None:
-        # First call: request is pending → succeeds
-        pending_req  = _req_row(status="pending")
+        # The atomic helper's FOR UPDATE row lock serialises approvals: the first
+        # succeeds, the second sees status != 'pending' and raises already_approved.
         approved_req = _req_row(status="approved")
+        ok_result = {"request": approved_req, "topup": _topup_row()}
 
         call_count = {"n": 0}
 
-        async def _get_req(pool, req_id):
+        async def _approve(pool, request_id, resolved_by, resolution_note=None):
             call_count["n"] += 1
-            return pending_req if call_count["n"] == 1 else approved_req
+            if call_count["n"] == 1:
+                return ok_result
+            raise ValueError("already_approved")
 
-        with patch.object(main.db_mod, "get_topup_request", side_effect=_get_req), \
-             patch.object(main.db_mod, "add_topup",
-                          new=AsyncMock(return_value=_topup_row())), \
-             patch.object(main.db_mod, "resolve_topup_request",
-                          new=AsyncMock(return_value=approved_req)):
+        with patch.object(main.db_mod, "approve_topup_atomically", side_effect=_approve):
             r1 = self.client.post(f"/admin/topup-requests/{_REQ_ID}/approve", json={})
             r2 = self.client.post(f"/admin/topup-requests/{_REQ_ID}/approve", json={})
 
@@ -1068,27 +1042,58 @@ class TopupRequestUserIsolationTests(unittest.TestCase):
                          "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 
 
-class TopupRequestApproveAppliesCorrectUserTests(unittest.TestCase):
-    """Approve must apply the topup to the request owner, not the admin."""
+class TopupRequestApproveAppliesCorrectUserTests(unittest.IsolatedAsyncioTestCase):
+    """approve_topup_atomically must apply the topup to the request owner, atomically."""
 
-    @classmethod
-    def setUpClass(cls) -> None:
-        main.app.state.pool = object()
-        cls.client = TestClient(main.app)
-
-    def test_topup_applied_to_request_owner(self) -> None:
-        req = _req_row(user_id=_CLIENT_UUID, pages=1000)
-        with patch.object(main.db_mod, "get_topup_request",
-                          new=AsyncMock(return_value=req)), \
-             patch.object(main.db_mod, "add_topup",
-                          new=AsyncMock(return_value=_topup_row())) as mock_add, \
-             patch.object(main.db_mod, "resolve_topup_request",
-                          new=AsyncMock(return_value=_req_row(status="approved"))):
-            self.client.post(f"/admin/topup-requests/{_REQ_ID}/approve", json={})
-        _, kwargs = mock_add.call_args
-        self.assertEqual(kwargs.get("user_id"), _CLIENT_UUID,
+    async def test_topup_applied_to_request_owner(self) -> None:
+        import uuid as _uuid_mod
+        owner = _uuid_mod.UUID(_CLIENT_UUID)
+        now = datetime.now(timezone.utc)
+        pool, conn = _make_pool()
+        conn.fetchrow.side_effect = [
+            # 1. locked request row (pending)
+            {"id": _REQ_ID, "user_id": owner, "requested_pages": 1000, "status": "pending"},
+            # 2. active subscription lookup
+            {"id": 7},
+            # 3. inserted topup row
+            {"id": 99, "user_id": owner, "subscription_id": 7, "pages": 1000,
+             "note": "x", "created_by": _uuid_mod.UUID(_ADMIN_UUID), "created_at": now},
+            # 4. updated (approved) request row
+            {"id": _REQ_ID, "user_id": owner, "requested_pages": 1000,
+             "requested_period": "6 months", "note": None, "status": "approved",
+             "resolution_note": None, "resolved_by": _uuid_mod.UUID(_ADMIN_UUID),
+             "resolved_at": now, "created_at": now},
+        ]
+        result = await db_mod.approve_topup_atomically(
+            pool, request_id=_REQ_ID, resolved_by=_ADMIN_UUID,
+        )
+        # The INSERT into topups (3rd fetchrow) must use the request owner's id.
+        insert_call = conn.fetchrow.await_args_list[2]
+        self.assertIn("INSERT INTO topups", insert_call.args[0])
+        self.assertEqual(insert_call.args[1], owner,
                          "Topup must be applied to the request owner, not the admin")
-        self.assertEqual(kwargs.get("pages"), 1000)
+        self.assertEqual(insert_call.args[3], 1000)
+        self.assertEqual(result["request"]["status"], "approved")
+        self.assertEqual(result["topup"]["pages"], 1000)
+
+    async def test_non_pending_request_raises_already(self) -> None:
+        pool, conn = _make_pool()
+        conn.fetchrow.side_effect = [
+            {"id": _REQ_ID, "user_id": _CLIENT_UUID, "requested_pages": 1000, "status": "approved"},
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            await db_mod.approve_topup_atomically(pool, request_id=_REQ_ID, resolved_by=_ADMIN_UUID)
+        self.assertEqual(str(ctx.exception), "already_approved")
+
+    async def test_no_active_subscription_raises(self) -> None:
+        pool, conn = _make_pool()
+        conn.fetchrow.side_effect = [
+            {"id": _REQ_ID, "user_id": _CLIENT_UUID, "requested_pages": 1000, "status": "pending"},
+            None,  # no active subscription
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            await db_mod.approve_topup_atomically(pool, request_id=_REQ_ID, resolved_by=_ADMIN_UUID)
+        self.assertEqual(str(ctx.exception), "no_active_subscription")
 
 
 if __name__ == "__main__":

@@ -206,22 +206,26 @@ async def save_from_corrections(
     page_dims = {p["page_number"]: (p.get("width", 0), p.get("height", 0)) for p in pages}
     page_sources = {p["page_number"]: p.get("source", "paddleocr") for p in pages}
 
-    # Handle list-format field_locations (po_per_page)
+    # Handle list-format field_locations (po_per_page). Use a list of
+    # (field_key, loc) tuples instead of dict.update so the same field on
+    # different pages (e.g. po_number on page 1 and page 2) is not overwritten.
+    items_to_process: list[tuple[str, Any]] = []
     if isinstance(field_locations, list):
-        # Flatten: merge all per-doc field_locations into one
-        merged = {}
         for fl in field_locations:
             if isinstance(fl, dict):
-                merged.update(fl)
-        field_locations = merged
+                items_to_process.extend(fl.items())
+    elif isinstance(field_locations, dict):
+        items_to_process = list(field_locations.items())
+    else:
+        return 0
 
-    if not isinstance(field_locations, dict):
+    if not items_to_process:
         return 0
 
     configured_header_fields = await _load_configured_header_fields(pool, extraction, vendor_id)
-    logger.info("Spatial memory save: layout=%s, %d locations submitted", lk, len(field_locations))
+    logger.info("Spatial memory save: layout=%s, %d locations submitted", lk, len(items_to_process))
     saved = 0
-    for field_key, loc in field_locations.items():
+    for field_key, loc in items_to_process:
         # Save reusable memory for configured top-level fields only.
         if not _is_reusable_header_field(field_key, configured_header_fields):
             continue

@@ -336,6 +336,11 @@ def _iter_sse(response: requests.Response):
 class _ScheduleState:
     """Thread-safe schedule tracker. No file queuing — folder is scanned at fire time."""
 
+    # The agent should run only at the configured wall-clock time. A small grace
+    # window absorbs normal thread wake-up jitter; later starts are skipped until
+    # tomorrow instead of running a stale schedule.
+    _DUE_GRACE = timedelta(seconds=60)
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._schedules: List[dict] = []
@@ -400,15 +405,14 @@ class _ScheduleState:
                 t = now.replace(hour=sched["utc_hour"], minute=sched["utc_minute"],
                                 second=0, microsecond=0)
                 if now >= t:
-                    # Today's slot has passed — check if it's due right now
-                    # (handled by claim_due). For next_fire_time, look at tomorrow.
                     if (sid, t) in self._executed_slots:
                         t += timedelta(days=1)
                     else:
                         last_ran = sched.get("last_ran_at")
                         if last_ran and last_ran >= t:
                             t += timedelta(days=1)
-                        # else: it's due NOW — return it as-is
+                        # Else: it is due or missed today. claim_due() decides
+                        # whether to run within grace or skip/log the stale slot.
                 if earliest is None or t < earliest:
                     earliest = t
         return earliest
@@ -416,10 +420,14 @@ class _ScheduleState:
     def claim_due(self) -> Tuple[str, List[int]]:
         """Check if any schedule is due RIGHT NOW. Returns (state, due_sids).
 
-        States: 'none' (nothing due), 'busy' (batch running), 'start' (fire!).
+        States: 'none' (nothing due), 'busy' (batch running), 'start' (fire!),
+        'skipped' (today's configured time was missed; wait until tomorrow).
+        For the skipped state, the second value contains small dicts with
+        schedule_id, scheduled_at, and skipped_at so logs can name the missed time.
         """
         now = datetime.now(timezone.utc)
         due_sids = []
+        skipped_slots = []
         with self._lock:
             if self._batch_running:
                 return "busy", []
@@ -434,9 +442,19 @@ class _ScheduleState:
                 last_ran = sched.get("last_ran_at")
                 if last_ran and last_ran >= t:
                     continue  # server says already ran for this slot
+                if now > t + self._DUE_GRACE:
+                    self._executed_slots.add((sid, t))
+                    skipped_slots.append({
+                        "schedule_id": sid,
+                        "scheduled_at": t,
+                        "skipped_at": now,
+                    })
+                    continue
                 due_sids.append(sid)
                 self._executed_slots.add((sid, t))
             if not due_sids:
+                if skipped_slots:
+                    return "skipped", skipped_slots
                 return "none", []
             self._batch_running = True
             return "start", due_sids
@@ -720,43 +738,75 @@ def _scheduler_loop(
         if state == "busy":
             logger.info("schedule due but previous batch still running; skipping")
             continue
+        if state == "skipped":
+            for skipped in due_sids:
+                scheduled_at = skipped.get("scheduled_at")
+                skipped_at = skipped.get("skipped_at")
+                late_by = (
+                    int((skipped_at - scheduled_at).total_seconds())
+                    if scheduled_at and skipped_at else None
+                )
+                logger.info(
+                    "schedule time skipped; missed configured time and will wait until tomorrow%s",
+                    _kv(
+                        schedule_id=skipped.get("schedule_id"),
+                        scheduled=scheduled_at.strftime("%H:%M:%S UTC") if scheduled_at else "unknown",
+                        checked=skipped_at.strftime("%H:%M:%S UTC") if skipped_at else "unknown",
+                        late_by_s=late_by if late_by is not None else "unknown",
+                    ),
+                )
+            continue
         if state != "start":
             continue
 
-        # Scan folder for PDFs
-        input_folder = folders_ref.get("input", "")
-        if not input_folder:
-            logger.warning("schedule fired but input_folder not configured")
-            sched_state.finish_batch()
-            continue
-
-        input_path = Path(input_folder)
-        if not input_path.is_dir():
-            logger.warning("schedule fired but input_folder does not exist%s", _kv(path=input_folder))
-            sched_state.finish_batch()
-            continue
-
-        pdfs = _pdfs_in(input_path)
-        if not pdfs:
-            logger.info("schedule fired; no PDFs in %s", input_folder)
-        else:
-            logger.info("schedule fired; uploading %d PDF(s) from %s", len(pdfs), input_folder)
-            folders = dict(folders_ref)
-            for pdf in pdfs:
-                if stop.is_set():
-                    break
-                if not pdf.exists():
-                    logger.warning("PDF disappeared before upload%s", _kv(file=pdf.name))
-                    continue
-                logger.info("uploading%s", _kv(file=pdf.name))
-                _process_pdf(base_url, token_mgr, folders, pdf)
-
-        # Mark ran on server
+        running_sids: list[int] = []
         for sid in due_sids:
-            _call(token_mgr, "POST", f"{base_url}/api/scheduler/{sid}/ran", timeout=10)
+            resp = _call(token_mgr, "POST", f"{base_url}/api/scheduler/{sid}/running", timeout=10)
+            if resp and 200 <= resp.status_code < 300:
+                running_sids.append(sid)
+            else:
+                status = getattr(resp, "status_code", "no-response")
+                logger.warning("schedule start rejected%s", _kv(schedule_id=sid, status=status))
 
-        sched_state.finish_batch()
-        logger.info("schedule batch complete; %d schedule(s) marked as ran", len(due_sids))
+        if not running_sids:
+            sched_state.finish_batch()
+            continue
+
+        processed = 0
+        logger.info("schedule run started%s", _kv(schedule_ids=",".join(map(str, running_sids))))
+        try:
+            # Scan folder for PDFs
+            input_folder = folders_ref.get("input", "")
+            if not input_folder:
+                logger.warning("schedule fired but input_folder not configured")
+            else:
+                input_path = Path(input_folder)
+                if not input_path.is_dir():
+                    logger.warning("schedule fired but input_folder does not exist%s", _kv(path=input_folder))
+                else:
+                    pdfs = _pdfs_in(input_path)
+                    if not pdfs:
+                        logger.info("schedule fired; no PDFs in %s", input_folder)
+                    else:
+                        logger.info("schedule fired; uploading %d PDF(s) from %s", len(pdfs), input_folder)
+                        folders = dict(folders_ref)
+                        for pdf in pdfs:
+                            if stop.is_set():
+                                break
+                            if not pdf.exists():
+                                logger.warning("PDF disappeared before upload%s", _kv(file=pdf.name))
+                                continue
+                            logger.info("uploading%s", _kv(file=pdf.name))
+                            _process_pdf(base_url, token_mgr, folders, pdf)
+                            processed += 1
+        finally:
+            for sid in running_sids:
+                _call(token_mgr, "POST", f"{base_url}/api/scheduler/{sid}/ran", timeout=10)
+            sched_state.finish_batch()
+            logger.info(
+                "schedule run complete%s",
+                _kv(schedule_ids=",".join(map(str, running_sids)), pdfs=processed),
+            )
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

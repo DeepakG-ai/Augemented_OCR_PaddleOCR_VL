@@ -71,7 +71,7 @@ class LlmUsageRecordingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["total_tokens"], 2104)
         self.assertEqual(kwargs["llm_url"], "http://localhost:8001/v1/chat/completions")
 
-    async def test_call_llm_does_not_record_usage_on_json_failure(self) -> None:
+    async def test_call_llm_records_usage_on_json_failure(self) -> None:
         resp = MagicMock()
         resp.status_code = 200
         resp.raise_for_status = MagicMock()
@@ -109,8 +109,15 @@ class LlmUsageRecordingTests(unittest.IsolatedAsyncioTestCase):
                     pool=pool,
                 )
             
+            # The LLM consumed tokens even though the output was unparseable, so
+            # usage must still be recorded (M7) — billing/MLflow must not miss it.
             self.assertIn("LLM returned invalid JSON", str(ctx.exception))
-            mock_record.assert_not_awaited()
+            mock_record.assert_awaited_once()
+            _, kwargs = mock_record.call_args
+            self.assertEqual(kwargs.get("prompt_tokens"), 1643)
+            self.assertEqual(kwargs.get("completion_tokens"), 461)
+            self.assertEqual(kwargs.get("total_tokens"), 2104)
+            self.assertEqual(kwargs.get("page_num"), 2)
 
 
 class LlmResponseGuardTests(unittest.IsolatedAsyncioTestCase):

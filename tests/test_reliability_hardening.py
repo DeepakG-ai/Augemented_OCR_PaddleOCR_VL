@@ -81,20 +81,24 @@ class ReliabilityHardeningTests(unittest.TestCase):
 
     @patch("backend.auth.decode_token")
     @patch("backend.auth.db_mod.get_user_by_id")
-    def test_get_current_user_sse_accepts_query_token(self, mock_get_user, mock_decode) -> None:
+    def test_get_current_user_sse_is_header_only(self, mock_get_user, mock_decode) -> None:
         mock_decode.return_value = {"sub": "u-1", "role": "client", "email": "client@test"}
         mock_get_user.return_value = {"id": "u-1", "role": "client", "email": "client@test", "is_active": True}
 
-        # 1. Neither header nor query param -> Unauthorized
+        # Query-parameter token auth was removed (tokens would leak into access
+        # logs). SSE auth is now Bearer-header only.
         mock_request = MagicMock()
         mock_request.app.state.pool = MagicMock()
         import asyncio
+
+        # 1. No header credentials -> Unauthorized
         with self.assertRaises(HTTPException) as ctx:
-            asyncio.run(auth_mod.get_current_user_sse(mock_request, credentials=None, token=None))
+            asyncio.run(auth_mod.get_current_user_sse(mock_request, credentials=None))
         self.assertEqual(ctx.exception.status_code, 401)
 
-        # 2. Only query parameter 'token' -> Allowed specifically for SSE
-        res = asyncio.run(auth_mod.get_current_user_sse(mock_request, credentials=None, token="valid-jwt-token"))
+        # 2. Bearer credentials in header -> Allowed
+        creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials="valid-jwt-token")
+        res = asyncio.run(auth_mod.get_current_user_sse(mock_request, credentials=creds))
         self.assertEqual(res["id"], "u-1")
 
     # ── 3. CANCEL TERMINAL STATE GUARD ──────────────────────────────────────────
@@ -166,6 +170,73 @@ class ReliabilityHardeningTests(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         mock_claim.assert_called_once()
         mock_bind.assert_called_once_with(unittest.mock.ANY, 999, 2000, 3000)
+
+    @patch("backend.main.assert_vendor_access")
+    @patch("backend.main.asyncio.sleep", new=AsyncMock())
+    @patch("backend.main.db_mod.claim_idempotency")
+    @patch("backend.main.db_mod.delete_idempotency_claim")
+    @patch("backend.main.db_mod.bind_idempotency_claim")
+    @patch("backend.main._submit_ingestion_job")
+    @patch("backend.main.processor.count_pdf_pages")
+    def test_extract_bind_retries_transient_failure_then_succeeds(
+        self, mock_count, mock_submit, mock_bind, mock_delete, mock_claim, mock_vendor_access
+    ) -> None:
+        mock_count.return_value = 1
+        mock_claim.return_value = {"status": "claimed", "claim_id": 999}
+        mock_submit.return_value = {
+            "job": {"id": 1000},
+            "extraction": {"id": 2000, "document_id": 3000, "status": "queued"},
+        }
+        # Bind fails twice (transient DB hiccup) then succeeds on the third try.
+        mock_bind.side_effect = [RuntimeError("hiccup"), RuntimeError("hiccup"), None]
+
+        payload = {"file": ("test.pdf", b"%PDF-1.4...", "application/pdf")}
+        response = self.client.post(
+            "/v1/extract",
+            headers={"Idempotency-Key": "bind-retry-key"},
+            files=payload,
+            data={"vendor_id": "vendor-abc"},
+            params={"async": "true"},
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(mock_bind.call_count, 3)
+        # The job already exists and owns the reservation — the claim must NOT be
+        # deleted (deleting it would let a retry spawn a duplicate extraction).
+        mock_delete.assert_not_called()
+
+    @patch("backend.main.assert_vendor_access")
+    @patch("backend.main.asyncio.sleep", new=AsyncMock())
+    @patch("backend.main.db_mod.claim_idempotency")
+    @patch("backend.main.db_mod.delete_idempotency_claim")
+    @patch("backend.main.db_mod.bind_idempotency_claim")
+    @patch("backend.main._submit_ingestion_job")
+    @patch("backend.main.processor.count_pdf_pages")
+    def test_extract_bind_permanent_failure_keeps_claim_and_still_returns_202(
+        self, mock_count, mock_submit, mock_bind, mock_delete, mock_claim, mock_vendor_access
+    ) -> None:
+        mock_count.return_value = 1
+        mock_claim.return_value = {"status": "claimed", "claim_id": 999}
+        mock_submit.return_value = {
+            "job": {"id": 1000},
+            "extraction": {"id": 2000, "document_id": 3000, "status": "queued"},
+        }
+        # Bind never succeeds. The extraction was still created, so the request
+        # must succeed; the unbound claim self-heals at TTL. No duplicate, no 500.
+        mock_bind.side_effect = RuntimeError("db down")
+
+        payload = {"file": ("test.pdf", b"%PDF-1.4...", "application/pdf")}
+        response = self.client.post(
+            "/v1/extract",
+            headers={"Idempotency-Key": "bind-fail-key"},
+            files=payload,
+            data={"vendor_id": "vendor-abc"},
+            params={"async": "true"},
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(mock_bind.call_count, 3)
+        mock_delete.assert_not_called()
 
     @patch("backend.main.db_mod.claim_idempotency")
     @patch("backend.main.db_mod.get_extraction")
