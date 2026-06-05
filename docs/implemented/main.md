@@ -44,7 +44,7 @@ The FastAPI application orchestrates requests through a series of global middlew
          ▼ Ingest Paths       ▼ Admin Paths        ▼ Telemetry Paths
   [/ingest/{source_type}]  [/admin/users]       [/health]
   [/v1/extract]            [/admin/topups]      [/live]
-  [/upload-preview]        [/admin/api-keys]    [/api/client/heartbeat]
+  [/upload-preview]        [/admin/api-keys]
          │
          ▼
 [Execution Hand-off]
@@ -57,7 +57,7 @@ The FastAPI application orchestrates requests through a series of global middlew
    - Instantiates the object store client (MinIO or local filesystem fallback).
    - Configures MLflow tracing endpoints.
    - Bootstraps the system admin account using credentials from `.env` (provided the password is not a `CHANGE_ME` placeholder).
-   - Registers quiet filters in the logger to prevent high-frequency telemetry routes (e.g. heartbeats, scheduler scans) from flooding logs.
+   - Registers a quiet filter in the logger to prevent the high-frequency `/health` route from flooding logs.
 2. **Shutdown**:
    - Closes the active Postgres connection pool asynchronously.
 
@@ -137,7 +137,6 @@ For programmatic API clients carrying an `Idempotency-Key` header:
 | | `test_idempotency_conflict_returns_409` | Verifies clashing files with the same key return HTTP 409. |
 | [`test_page_limits.py`](../../tests/test_page_limits.py) | `test_upload_exceeding_pages_returns_400` | Verifies page count guards reject files exceeding the page cap. |
 | | `test_quota_check_db_failure_blocks_upload_with_503` | Verifies DB connection exceptions map cleanly to HTTP 503. |
-| [`test_config_api.py`](../../tests/test_config_api.py) | `test_client_agent_cannot_access_admin_configs` | Verifies role-based access restrictions on config routes. |
 
 ---
 
@@ -150,5 +149,3 @@ For programmatic API clients carrying an `Idempotency-Key` header:
 | `/ingest/{source_type}` | POST | Bearer | `jobs` / `extractions` |
 | `/jobs/{job_id}/stream` | GET | Bearer / Query Token | `jobs` |
 | `/extractions/{id}/corrections` | PUT | Bearer | `extractions` / `review_events` |
-| `/api/config` | GET / PUT | Bearer | `users` |
-| `/api/client/heartbeat` | POST | Bearer | `users.last_heartbeat_at` |

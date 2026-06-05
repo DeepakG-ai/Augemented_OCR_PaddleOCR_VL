@@ -502,7 +502,7 @@ flowchart TD
 - **Keying**: By remote IP address. All users behind the same IP share the same counter. In production behind a reverse proxy, ensure `X-Forwarded-For` is set correctly.
 - **Window**: Rolling 1-minute window. The counter resets after 60 seconds of no requests.
 - **Scope**: Applied to every route in the application. No route is exempt.
-- **Health check suppression**: The `/health`, `/api/client/heartbeat`, `/api/config`, and `/api/scheduler` routes still count against the rate limit but their access log lines are suppressed at the INFO level to reduce log noise. Errors (4xx/5xx) still log.
+- **Health check suppression**: The `/health` route still counts against the rate limit but its access log lines are suppressed at the INFO level to reduce log noise. Errors (4xx/5xx) still log.
 
 ---
 

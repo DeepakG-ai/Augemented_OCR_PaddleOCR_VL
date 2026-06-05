@@ -28,7 +28,7 @@ The pipeline is **4 stages only**: normalize → ocr → llm → postprocess. Th
 | [Spatial Memory](spatial-memory.md) | Saves WHERE a field is on the page (normalized bbox + page number + layout key `vendor_id:template_id`). On reuse reads current document's text inside the saved region — never replays the old corrected value. Header fields only in phase 1. | **✓ doc** |
 | [Gold Corrections](gold-corrections.md) | Per-vendor correction examples injected into the system prompt. Value-redacted so the model learns the field structure, not a stale hardcoded value. Managed via `/vendors/{id}/gold-corrections`. | **✓ doc** |
 | [Review / Corrections](review.md) | Three-panel UI (fields / PDF viewer / JSON). User draws bounding boxes on the PDF to correct wrong field extractions. Saving a correction writes to `review_events` and saves to spatial memory. | **✓ doc** |
-| [ERP Field Mapping](erp-mapping.md) | Per-vendor field name remapping for downstream ERP systems. Raw `result` is left untouched; mapped copy stored in `mapped_result`. Schemas define canonical field sets. Routes: `/vendors/{id}/mapping`, `/schemas`. Applied in postprocess. | **✓ doc** |
+| [ERP Field Mapping](erp-mapping.md) | Per-vendor field name remapping for downstream ERP systems. Raw `result` is left untouched; mapped copy stored in `mapped_result`. Schemas define canonical field sets. Route: `/vendors/{id}/mapping`. Applied in postprocess. | **✓ doc** |
 
 ---
 
@@ -40,15 +40,6 @@ The pipeline is **4 stages only**: normalize → ocr → llm → postprocess. Th
 | [Multi-tenancy](auth.md#multi-tenancy) | All data chains through `vendors.user_id`. Extractions and jobs have no `user_id` column — ownership is always resolved by walking back to the vendor. Client A can never see Client B's data. | **✓ doc** |
 | [API Keys](auth.md#api-key-admin-management) | Admin-managed per-user API keys for programmatic access. Key hash stored (SHA-256), prefix stored for display, full key shown once at creation. Routes: `/admin/api-keys`. | **✓ doc** |
 | [Rate Limiting](auth.md#rate-limiting) | slowapi middleware on all routes. Configurable via `RATE_LIMIT_PER_MINUTE` env var (default 30/min). Returns HTTP 429 on breach. | **✓ doc** |
-
----
-
-## Scheduling and Client Agent
-
-| Feature | One-liner | Status |
-|---|---|---|
-| [Scheduler](scheduler.md) | Per-user scheduled PDF uploads. Active = waiting for fire time. Running = agent is uploading. Max 3 schedules per user. No two schedules at the same time. UI upload blocked while running. Each user isolated independently. | **✓ doc** |
-| [Client Agent](client-agent.md) | Desktop exe (.exe). Logs in with email + password (in-memory only). Reads folder paths from server config. Wakes at the exact scheduled time, marks running, scans input folder, uploads each PDF via `/ingest/rest`, streams SSE progress, moves PDF to success or failed folder. | **✓ doc** |
 
 ---
 
@@ -65,10 +56,10 @@ The pipeline is **4 stages only**: normalize → ocr → llm → postprocess. Th
 
 | Feature | One-liner | Status |
 |---|---|---|
-| [SSE Progress](sse-progress.md) | `GET /jobs/{job_id}/stream` keeps a persistent connection open. Frontend never polls — it receives live events (progress, done, failed). Client agent also reads this stream to know when to move the file. Config changes broadcast on a separate SSE channel (`/api/config/stream`). | **✓ doc** |
+| [SSE Progress](sse-progress.md) | `GET /jobs/{job_id}/stream` keeps a persistent connection open. Frontend never polls — it receives live events (progress, done, failed). | **✓ doc** |
 | [MLflow Tracing](mlflow-tracing.md) | 1 PDF = 1 hierarchical `field_extraction` trace. Each pipeline stage is a child span. `MLFLOW_ENABLED=false` in all tests — never emit real traces during tests. Trace accessible from UI at `/extractions/{id}/trace`. | needs doc |
 | [Page Logger](logging.md) | Per-extraction human-readable run log written to `PIPELINE_LOG_DIR`. Records pages, billable pages, digital/scanned split, Qwen success/fail/skip counts, field count, duration, errors. Admin reads via `/admin/logs/pipeline`. | needs doc |
-| [Structured Logging](logging.md) | `plog.event(...)` and `plog.timed(...)` emit structured JSON log lines. Same column format in backend and client agent. Context vars track `extraction_id`, `filename`, `stage`, `worker` per log line. | needs doc |
+| [Structured Logging](logging.md) | `plog.event(...)` and `plog.timed(...)` emit structured JSON log lines. Context vars track `extraction_id`, `filename`, `stage`, `worker` per log line. | needs doc |
 
 ---
 
@@ -82,8 +73,7 @@ The pipeline is **4 stages only**: normalize → ocr → llm → postprocess. Th
 | [Object Storage](object-storage.md) | MinIO abstraction in `object_store.py`. Falls back to `.local_object_store/` on disk when MinIO is unavailable. No code change needed to switch. Buckets: `documents` (originals), `artifacts` (page images). | **✓ doc** |
 | [Redis Cache](redis-cache.md) | Async Redis cache for extraction results. System prompts are NOT cached — rebuilt live from DB on every run. `REDIS_URL` env var. | needs doc |
 | [Idempotency](auth.md#how-idempotency-works) | Upload requests carry an optional `Idempotency-Key` header (API path only). Server checks `idempotency_claims` table before creating a new extraction. Duplicate key + same file → return existing result. Duplicate key + different file → HTTP 409. | **✓ doc** |
-| [Contract Endpoint](contract.md) | `GET /extractions/{id}/contract` returns the extraction result normalized into a canonical purchase-order shape via `contracts.py`. JSON only — not Excel/CSV. Used by API clients and the client agent output. | needs doc |
-| [Heartbeat](client-agent.md) | Client agent posts `POST /api/client/heartbeat` every 30s. Server uses this to show ACTIVE / INACTIVE on the Settings page. | needs doc |
+| [Contract Endpoint](contract.md) | `GET /extractions/{id}/contract` returns the extraction result normalized into a canonical purchase-order shape via `contracts.py`. JSON only — not Excel/CSV. Used by API clients. | needs doc |
 
 ---
 
@@ -103,4 +93,4 @@ Every file in `docs/implemented/` follows this section order:
 ## Quick Reference     — table: situation → answer
 ```
 
-`scheduler.md` is the reference implementation of this template.
+`subscription.md` is a good reference implementation of this template.

@@ -88,7 +88,7 @@ The streaming generator (`_generate`) runs on a 1-second interval:
 ## All Scenarios in Plain English
 
 ### Scenario 1 — Smooth multi-stage extraction
-- The Client Agent uploads a PDF, gets `job_id = 50`, and opens the SSE stream with `?token=eyJ...`.
+- A client uploads a PDF, gets `job_id = 50`, and opens the SSE stream with `?token=eyJ...`.
 - Stage 1: Normalize starts. The server yields: `{"event": "progress", "extraction": {"status": "normalizing", "progress": "Rendering PDF pages"}}`.
 - Stage 2: OCR runs. The server yields: `{"event": "progress", "extraction": {"status": "processing_ocr", "progress": "Extracting text geometry"}}`.
 - Stage 3: LLM runs. The server yields: `{"event": "progress", "extraction": {"status": "processing_llm", "progress": "Running LLM extractor"}}`.
@@ -117,8 +117,6 @@ The streaming generator (`_generate`) runs on a 1-second interval:
 
 | Test Module | Test Name | What it proves |
 |---|---|---|
-| [`test_client_agent.py`](../../tests/test_client_agent.py) | `test_parses_data_lines` | Verifies the client agent SSE line parser correctly extracts JSON data. |
-| | `test_tolerates_invalid_json` | Verifies the client agent tolerates malformed JSON SSE lines without crashing. |
 | [`test_auth.py`](../../tests/test_auth.py) | `test_get_current_user_sse_accepts_query_token` | Verifies authorization middleware accepts query-string token fallbacks. |
 | [`test_review_api.py`](../../tests/test_review_api.py) | `test_get_extraction_ocr_returns_200_with_payload` | Verifies geometry endpoint access controls (shares extraction ownership logic). |
 
@@ -130,4 +128,3 @@ The streaming generator (`_generate`) runs on a 1-second interval:
 |---|---|---|---|
 | Job SSE Stream | `GET /jobs/{job_id}/stream` | Bearer OR `?token=` query | Pushes progress/done/failed events |
 | Connection Keep-Alive | n/a | n/a | Sends keep-alive messages |
-| Config SSE Channel | `GET /api/config/stream` | Bearer OR `?token=` query | Pushes config change notices |

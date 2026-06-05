@@ -258,24 +258,6 @@ erDiagram
         TIMESTAMPTZ created_at
         TIMESTAMPTZ updated_at
     }
-    user_config {
-        UUID user_id PK, FK
-        TEXT key PK
-        TEXT value
-        TIMESTAMPTZ updated_at
-    }
-    user_schedules {
-        INT id PK
-        UUID user_id FK
-        TEXT label
-        TEXT cron_expr
-        TEXT timezone
-        BOOLEAN enabled
-        TIMESTAMPTZ last_ran_at
-        BOOLEAN is_executing
-        TIMESTAMPTZ created_at
-        TIMESTAMPTZ updated_at
-    }
     api_keys {
         INT id PK
         UUID user_id FK
@@ -331,8 +313,6 @@ erDiagram
     }
 
     users ||--o{ vendors : "owns"
-    users ||--o{ user_config : "defines"
-    users ||--o{ user_schedules : "triggers"
     users ||--o{ api_keys : "authenticates"
     users ||--o{ subscriptions : "possesses"
     users ||--o{ topups : "purchases"
@@ -371,7 +351,7 @@ erDiagram
 
 ## Table Schemas & Constraints
 
-The database is built on 22 tables. Below is the purpose, definition, and architectural detail for each table.
+The database is built on 20 tables. Below is the purpose, definition, and architectural detail for each table.
 
 ### 1. `users` — Tenant Accounts
 Stores tenant account records. User limits and pending quotas are managed in this table.
@@ -681,40 +661,7 @@ CREATE TABLE IF NOT EXISTS qwen_layout_boxes (
 CREATE INDEX IF NOT EXISTS qwen_layout_boxes_lookup_idx ON qwen_layout_boxes (vendor_id, template_id);
 ```
 
-### 16. `user_config` — Workspace Settings
-Custom desktop directories/paths used by the Client Agent.
-```sql
-CREATE TABLE IF NOT EXISTS user_config (
-    user_id    UUID REFERENCES users(id) ON DELETE CASCADE,
-    key        TEXT NOT NULL,
-    value      TEXT,
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (user_id, key)
-);
-CREATE INDEX IF NOT EXISTS user_config_user_id_idx ON user_config (user_id);
-```
-
-### 17. `user_schedules` — Scheduler Routines
-Timed agent loops.
-```sql
-CREATE TABLE IF NOT EXISTS user_schedules (
-    id           SERIAL PRIMARY KEY,
-    user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    label        TEXT NOT NULL DEFAULT '',
-    cron_expr    TEXT NOT NULL,
-    timezone     TEXT NOT NULL DEFAULT 'UTC',
-    enabled      BOOLEAN NOT NULL DEFAULT TRUE,
-    last_ran_at  TIMESTAMPTZ,
-    is_executing BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at   TIMESTAMPTZ DEFAULT NOW(),
-    updated_at   TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(user_id, cron_expr)
-);
-CREATE INDEX IF NOT EXISTS user_schedules_user_id_idx ON user_schedules (user_id);
-```
-- **`is_executing`**: Locking state. Set to `TRUE` while the desktop client agent processes files locally.
-
-### 18. `api_keys` — Authentication Secrets
+### 16. `api_keys` — Authentication Secrets
 API access keys.
 ```sql
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -735,7 +682,7 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
 - **`key_hash`**: SHA-256 of the plain-text key. Touch operations lookup by hash.
 - **`encrypted_key`**: Admin-recoverable ciphertext configuration.
 
-### 19. `idempotency_claims` — Deduplication Claims
+### 17. `idempotency_claims` — Deduplication Claims
 Ensures request deduplication.
 ```sql
 CREATE TABLE IF NOT EXISTS idempotency_claims (
@@ -751,7 +698,7 @@ CREATE TABLE IF NOT EXISTS idempotency_claims (
 CREATE INDEX IF NOT EXISTS idx_idempotency_claims_key ON idempotency_claims(user_id, idempotency_key);
 ```
 
-### 20. `subscriptions` — Page Allocation Packages
+### 18. `subscriptions` — Page Allocation Packages
 Baseline tenant page limit periods.
 ```sql
 CREATE TABLE IF NOT EXISTS subscriptions (
@@ -771,7 +718,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS subscriptions_one_active_per_user ON subscript
 ```
 - **`subscriptions_one_active_per_user`**: Partial unique index that guarantees exactly one active subscription per user.
 
-### 21. `topups` — Package Boosts
+### 19. `topups` — Package Boosts
 Top-ups that augment active subscription baseline limits.
 ```sql
 CREATE TABLE IF NOT EXISTS topups (
@@ -787,7 +734,7 @@ CREATE INDEX IF NOT EXISTS topups_subscription_idx ON topups (subscription_id);
 CREATE INDEX IF NOT EXISTS topups_user_idx ON topups (user_id, created_at DESC);
 ```
 
-### 22. `topup_requests` — Boost Requests
+### 20. `topup_requests` — Boost Requests
 Pending requests submitted by tenants when page allocation runs out.
 ```sql
 CREATE TABLE IF NOT EXISTS topup_requests (
@@ -903,7 +850,6 @@ These functions scope queries to a single tenant (`user_id`). The system impleme
 | [`test_topup_requests.py`](../../tests/test_topup_requests.py) | Atomic transactions inside `approve_topup_atomically`. |
 | [`test_api_keys.py`](../../tests/test_api_keys.py) | API key touch, verification, expiration, and token usage increments. |
 | [`test_immutable_usage_after_delete.py`](../../tests/test_immutable_usage_after_delete.py) | Usage telemetry permanence (preserves `llm_usage` rows after extraction deletion). |
-| [`test_scheduler_isolation.py`](../../tests/test_scheduler_isolation.py) | Concurrent scheduler locks and `is_executing` isolation states. |
 
 ---
 
@@ -914,4 +860,3 @@ These functions scope queries to a single tenant (`user_id`). The system impleme
 | `operator does not exist: uuid = text` | UUID column compared against text parameter without type cast. | Append `::UUID` to the SQL query parameter (e.g. `WHERE id = $1::UUID`). |
 | JSONB column returned as raw string | `asyncpg` does not always automatically parse JSONB fields back to Python dicts. | Wrap database row return calls with the `_record` or `_parse_jsonb` normalizer. |
 | Quota limit changes don't sync | Updating `subscription_limit` on `users` without an active subscription row. | Create a subscription period in `subscriptions` rather than modifying `users` directly. |
-| Locked scheduler status after crash | Stale `is_executing` flag remains `TRUE` indefinitely. | The `get_user_is_executing` check automatically clears locks if `updated_at` exceeds 10 minutes. |

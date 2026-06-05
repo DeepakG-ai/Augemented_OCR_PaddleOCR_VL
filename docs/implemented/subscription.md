@@ -21,7 +21,7 @@ The subscription and quota system restricts how many document pages a client use
 
 ## How it works
 
-The quota system operates atomically to handle concurrent uploads from client agents or web sessions.
+The quota system operates atomically to handle concurrent uploads from API clients or web sessions.
 
 ```
           [Document Upload Received]
