@@ -171,7 +171,7 @@ Count the number of rows in the line items table FIRST, then extract that exact 
 - STRICTLY return ONLY valid JSON. No markdown fences, no explanation, no extra text.
 - Treat each field independently. A missing field gets null; all other visible fields must still be extracted. Do not return all fields as null because one field is absent.
 - Use null for missing fields, never omit them.
-- For line_items, you MUST return the `fields.line_items` key. Strictly return an array even if only one item visible in document.
+- For line_items, you MUST always return the `fields.line_items` key. Strictly return an array even if only one item visible in document.
 - Return `fields.line_items: []` ONLY if no line-item rows are visible.
 </output_rules>"""
 

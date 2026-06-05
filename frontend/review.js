@@ -165,6 +165,7 @@ let _rvExtractionId = null;
 let _rvVendorId = null;
 let _rvExistingCorrectionFields = {};
 let _rvExistingSpatialFields = {};
+let _rvReviewUnavailableReason = null;
 
 // Selection mode state
 let _rvSelectionField = null;  // composite key of field being corrected (e.g. "vendor" or "line_item_0_qty")
@@ -278,6 +279,7 @@ async function renderReviewPage(app, extractionId) {
     _rvReasonModalCallback = null;
     _rvExistingCorrectionFields = {};
     _rvExistingSpatialFields = {};
+    _rvReviewUnavailableReason = null;
 
     // Load OCR data for click-to-select
     _rvOcrData = [];
@@ -287,7 +289,12 @@ async function renderReviewPage(app, extractionId) {
     } catch (e) {
         if (e.message && (e.message.includes('401') || e.message.includes('403'))) throw e;
         console.warn('OCR data not available for click-to-select:', e.message);
-        showToast('OCR overlay unavailable — click-to-select disabled for this document');
+        if (e.error && e.error.code === 'REVIEW_UNAVAILABLE_OCR_FAILED') {
+            _rvReviewUnavailableReason = e.error.message || 'OCR failed for this PDF. Drag/drop review and spatial memory are unavailable.';
+            showToast('OCR failed for this PDF - drag/drop review and spatial memory are unavailable');
+        } else {
+            showToast('OCR overlay unavailable - click-to-select disabled for this document');
+        }
     }
 
     if (_rvVendorId) {
@@ -361,7 +368,7 @@ async function renderReviewPage(app, extractionId) {
             <span class="stat-matched">${matchedCount} MATCHED</span>
             <span class="stat-missed">${headerKeys.length - matchedCount} UNMATCHED</span>
             <span>${_rvTotalPages} PAGE${_rvTotalPages !== 1 ? 'S' : ''}</span>
-            <span id="rvOcrStatus" style="color:var(--blue)">${_rvOcrData.length ? '✓ OCR LOADED' : '○ NO OCR'}</span>
+            <span id="rvOcrStatus" style="color:${_rvReviewUnavailableReason ? 'var(--red,#e06c75)' : 'var(--blue)'}">${_rvReviewUnavailableReason ? 'OCR FAILED' : (_rvOcrData.length ? 'OCR LOADED' : 'NO OCR')}</span>
         </div>
         <div style="flex:1"></div>
         <button class="review-btn secondary" onclick="rvUndo()" title="Undo last correction (Ctrl+Z)">↶ Undo</button>
@@ -779,6 +786,10 @@ function rvFocusField(fieldName) {
 // ══════════════════════════════════════════════════════════════════════
 
 function rvStartSelection(fieldKey) {
+    if (_rvReviewUnavailableReason || !_rvOcrData.length) {
+        showToast(_rvReviewUnavailableReason || 'OCR overlay unavailable - click-to-select disabled for this document');
+        return;
+    }
     // Toggle selection mode
     if (_rvSelectionField === fieldKey) {
         rvCancelSelection();
@@ -1427,7 +1438,7 @@ async function rvConfirm() {
         try {
             _rvPersistCurrentRecord();
             const payload = _rvCurrentPayload();
-            const finalFieldLocs = _rvIsPoPerPage ? _rvAllFieldLocs : _rvFieldLocs;
+            const finalFieldLocs = _rvReviewUnavailableReason ? (_rvIsPoPerPage ? [] : {}) : (_rvIsPoPerPage ? _rvAllFieldLocs : _rvFieldLocs);
             const typedOnlyFields = _rvTypedOnlyChangedFields(payload, finalFieldLocs);
             if (!_rvConfirmTypedOnlyChanges(typedOnlyFields)) {
                 return;

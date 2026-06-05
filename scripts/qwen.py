@@ -3,7 +3,7 @@ import httpx
 import json
 
 IMAGE_PATH = r"C:\Users\aigroup5\Pictures\Screenshots\Screenshot 2026-03-26 160717.png"
-LLAMA_URL  = "http://localhost:8001/v1/chat/completions"
+LLAMA_URL  = "http://localhost:8056/v1/chat/completions"
 
 with open(IMAGE_PATH, "rb") as f:
     b64 = base64.b64encode(f.read()).decode("utf-8")
@@ -56,7 +56,7 @@ except json.JSONDecodeError:
 """llama-server ^
   --model Qwen3-VL-8B-Instruct-UD-Q4KXL.gguf ^
   --mmproj mmproj-F16.gguf ^
-  --host 0.0.0.0 --port 8001 ^
+  --host 0.0.0.0 --port 8056 ^
   --n-gpu-layers 999 ^
   --ctx-size 8192 ^
   --threads 8 ^

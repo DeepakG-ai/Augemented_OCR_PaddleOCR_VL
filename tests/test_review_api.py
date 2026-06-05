@@ -29,11 +29,23 @@ class ReviewApiTests(unittest.TestCase):
         self.assertEqual(response.json(), {"extraction_id": 123, "ocr_pages": payload})
 
     def test_get_extraction_ocr_returns_404_when_missing(self) -> None:
-        with patch.object(main.db_mod, "get_ocr_data", new=AsyncMock(return_value=None)):
+        with patch.object(main.db_mod, "get_ocr_data", new=AsyncMock(return_value=None)), \
+             patch.object(main.db_mod, "get_latest_job_for_extraction_type", new=AsyncMock(return_value=None)):
             response = self.client.get("/extractions/123/ocr")
 
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.json()["error"]["message"], "No OCR data found for this extraction")
+
+    def test_get_extraction_ocr_returns_409_when_ocr_failed(self) -> None:
+        latest_ocr_job = {"status": "failed", "error": "ocr model failed"}
+
+        with patch.object(main.db_mod, "get_ocr_data", new=AsyncMock(return_value=None)), \
+             patch.object(main.db_mod, "get_latest_job_for_extraction_type", new=AsyncMock(return_value=latest_ocr_job)):
+            response = self.client.get("/extractions/123/ocr")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"]["code"], "REVIEW_UNAVAILABLE_OCR_FAILED")
+        self.assertEqual(response.json()["error"]["ocr_error"], "ocr model failed")
 
     def test_save_corrections_requires_corrected_result(self) -> None:
         response = self.client.put("/extractions/123/corrections", json={"field_locations": {}})
@@ -66,7 +78,7 @@ class ReviewApiTests(unittest.TestCase):
             "result": {"vendor_name": "OLD"},
             "page_results": [],
             "field_locations": {},
-            "ocr_data": None,
+            "ocr_data": [{"page_number": 1, "words": []}],
             "corrected_result": None,
             "correction_meta": None,
             "export_object_key": None,
@@ -95,6 +107,33 @@ class ReviewApiTests(unittest.TestCase):
         self.assertEqual(response.json()["status"], "saved")
         self.assertEqual(response.json()["extraction_id"], 123)
         self.assertEqual(mock_save.await_count, 1)
+
+    def test_save_corrections_blocks_field_locations_when_ocr_failed(self) -> None:
+        extraction = {
+            "id": 123,
+            "document_id": 1,
+            "vendor_id": "V1",
+            "vendor_name": "Vendor 1",
+            "filename": "test.pdf",
+            "result": {"vendor_name": "OLD"},
+            "field_locations": {},
+            "ocr_data": None,
+        }
+        latest_ocr_job = {"status": "failed", "error": "ocr model failed"}
+        with patch.object(main.db_mod, "get_extraction", new=AsyncMock(return_value=extraction)), \
+             patch.object(main.db_mod, "get_latest_job_for_extraction_type", new=AsyncMock(return_value=latest_ocr_job)), \
+             patch.object(main.db_mod, "save_corrections", new=AsyncMock(return_value=True)) as mock_save:
+            response = self.client.put(
+                "/extractions/123/corrections",
+                json={
+                    "corrected_result": {"vendor_name": "ACME"},
+                    "field_locations": {"vendor_name": {"page": 1, "box": [1, 2, 3, 4]}},
+                },
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"]["code"], "REVIEW_UNAVAILABLE_OCR_FAILED")
+        mock_save.assert_not_awaited()
 
     def test_admin_usage_returns_manager_summaries(self) -> None:
         document_rows = [

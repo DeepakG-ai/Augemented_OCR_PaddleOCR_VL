@@ -218,15 +218,6 @@ class SubscriptionQuotaEnforcementTests(unittest.TestCase):
 
     def setUp(self) -> None:
         main.limiter.reset()
-        # The /ingest/ui endpoint runs a scheduler guard
-        # (db_mod.get_user_is_executing) before the quota check. These tests
-        # use a non-DB fake pool, so stub the guard to "not running" — the
-        # quota path under test stays exercised.
-        _sched = patch.object(
-            main.db_mod, "get_user_is_executing", new=AsyncMock(return_value=False)
-        )
-        _sched.start()
-        self.addCleanup(_sched.stop)
         # Fake PDF bytes can't be parsed — stub the page counter so quota
         # tests reach their assertion without hitting 400.
         _pages = patch.object(main.processor, "count_pdf_pages", return_value=1)
@@ -628,13 +619,6 @@ class MultiClientIsolationTests(unittest.TestCase):
 
     def setUp(self):
         main.limiter.reset()
-        # See note in SubscriptionQuotaEnforcementTests.setUp — stub the
-        # scheduler guard so the quota path is what gets exercised.
-        _sched = patch.object(
-            main.db_mod, "get_user_is_executing", new=AsyncMock(return_value=False)
-        )
-        _sched.start()
-        self.addCleanup(_sched.stop)
         _pages = patch.object(main.processor, "count_pdf_pages", return_value=1)
         _pages.start()
         self.addCleanup(_pages.stop)

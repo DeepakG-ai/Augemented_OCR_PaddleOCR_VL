@@ -21,7 +21,7 @@ logging.basicConfig(
 log = logging.getLogger("rd_qwen")
 
 # ── Config ────────────────────────────────────────────────────────────
-LLAMA_URL = "http://localhost:8001/v1/chat/completions"
+LLAMA_URL = "http://localhost:8056/v1/chat/completions"
 
 IMAGE_PATHS = [
     r"C:\Users\aigroup5\Pictures\Screenshots\Screenshot 2026-03-30 124620.png",

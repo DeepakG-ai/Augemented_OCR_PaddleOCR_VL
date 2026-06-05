@@ -47,6 +47,7 @@ services:
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
       MINIO_SECURE: "false"
       MLFLOW_TRACKING_URI: http://mlflow:5000
+      LLM_URL: http://host.docker.internal:8056/v1/chat/completions
       SECRET_KEY: ${SECRET_KEY}
       ADMIN_EMAIL: ${ADMIN_EMAIL}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
@@ -58,7 +59,7 @@ services:
       mlflow:
         condition: service_started
     ports:
-      - "8000:8000"
+      - "8055:8000"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -123,7 +124,7 @@ services:
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
       MINIO_SECURE: "false"
       MLFLOW_TRACKING_URI: http://mlflow:5000
-      LLM_URL: http://host.docker.internal:8001/v1/chat/completions
+      LLM_URL: http://host.docker.internal:8056/v1/chat/completions
       LLM_PAGE_BATCH_SIZE: ${LLM_PAGE_BATCH_SIZE:-1}
     depends_on:
       postgres:
@@ -150,7 +151,7 @@ services:
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
       MINIO_SECURE: "false"
       MLFLOW_TRACKING_URI: http://mlflow:5000
-      LLM_URL: http://host.docker.internal:8001/v1/chat/completions
+      LLM_URL: http://host.docker.internal:8056/v1/chat/completions
     depends_on:
       postgres:
         condition: service_healthy
@@ -166,6 +167,9 @@ services:
   # ── MLflow (Observability UI) ─────────────────────────────────────
   mlflow:
     image: ghcr.io/mlflow/mlflow:v3.12.0
+    # Non-critical, but it must self-heal: if it crashes it has to come back,
+    # otherwise workers start logging "Failed to resolve 'mlflow'" forever.
+    restart: unless-stopped
     command: >
       mlflow server
         --host 0.0.0.0
@@ -180,6 +184,12 @@ services:
       - mlflowdata:/mlflow
     ports:
       - "5000:5000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
 volumes:
   pgdata:

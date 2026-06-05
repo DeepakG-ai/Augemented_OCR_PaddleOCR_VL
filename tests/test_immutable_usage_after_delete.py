@@ -510,11 +510,6 @@ class QuotaPersistsAfterDeleteTests(unittest.TestCase):
 
     def setUp(self) -> None:
         main.limiter.reset()
-        _sched = patch.object(
-            main.db_mod, "get_user_is_executing", new=AsyncMock(return_value=False)
-        )
-        _sched.start()
-        self.addCleanup(_sched.stop)
         _pages = patch.object(main.processor, "count_pdf_pages", return_value=1)
         _pages.start()
         self.addCleanup(_pages.stop)

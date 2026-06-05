@@ -30,7 +30,7 @@ try:
 except ImportError:
     pass
 
-BASE          = os.getenv("TEST_BASE_URL", "http://localhost:8000")
+BASE          = os.getenv("TEST_BASE_URL", "http://localhost:8055")
 ADMIN_EMAIL   = os.getenv("ADMIN_EMAIL")
 ADMIN_PASS    = os.getenv("ADMIN_PASSWORD")
 CLIENT1_EMAIL = "test_client_1@apitest.com"

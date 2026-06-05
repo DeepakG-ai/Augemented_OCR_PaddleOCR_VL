@@ -37,7 +37,13 @@ from . import mlflow_tracing as mlf
 configure_logging()
 logger = logging.getLogger(__name__)
 
-setup_mlflow()
+OCR_REVIEW_UNAVAILABLE_ERROR = "ocr_failed_review_unavailable"
+OCR_REVIEW_UNAVAILABLE_MESSAGE = (
+    "JSON extracted, but OCR failed. Review tools and spatial memory are unavailable."
+)
+LLM_FAILED_ERROR = "llm_failed"
+LLM_FAILED_MESSAGE = "LLM extraction failed on one or more pages. Retry or resume the extraction."
+TERMINAL_EXTRACTION_STATUSES = {"done", "failed", "partial", "cancelled", "unverified"}
 
 
 class JobCancelled(Exception):
@@ -197,6 +203,136 @@ async def _maybe_enqueue_postprocess(
 
 
 # dynamic qwen_ocr module helper removed
+
+
+async def _detect_and_apply_vendor(
+    pool,
+    document: dict,
+    extraction_id: int,
+    rendered_pages: list[dict],
+    geo_by_page: dict,
+) -> bool:
+    """Detect the vendor from page-1 text and persist it on the extraction.
+
+    This used to run synchronously in the ingest request; it now runs inside
+    normalize so uploads stay fast and don't depend on the OCR service.
+
+    Returns True when a vendor was matched AND has a usable template (the caller
+    should queue ocr/llm). Returns False otherwise — in that case this function
+    has already marked the extraction failed (with a specific error code:
+    ocr_unavailable, unknown_vendor, no_template, or no_fields), marked the
+    document failed, and released the quota reservation, so the caller MUST NOT
+    queue downstream jobs.
+    """
+    from . import vendor_detector as vd_mod
+
+    async def _fail(reason: str, message: str) -> bool:
+        await db_mod.set_extraction_status(
+            pool,
+            extraction_id,
+            "failed",
+            progress={"stage": "normalize", "message": message},
+            error=reason,
+        )
+        await db_mod.update_document_status(pool, document["id"], "failed")
+        try:
+            await db_mod.release_quota_once(pool, document["id"], None)
+        except Exception as exc:
+            logger.warning("quota release failed (%s) ext=%s: %s", reason, extraction_id, exc)
+        return False
+
+    metadata = document.get("metadata") or {}
+    # Detection is scoped to one client to avoid cross-tenant alias collisions.
+    # The ingest paths write detect_user_id; fall back to billing_user_id for
+    # any older job that predates it.
+    detect_user_id = metadata.get("detect_user_id") or metadata.get("billing_user_id")
+
+    # Reuse page-1 digital geometry; only OCR page 1 when it's scanned (no words).
+    page1_geo = geo_by_page.get(1) or {}
+    page_words = page1_geo.get("words") or []
+    if not page_words:
+        page1 = next((p for p in rendered_pages if p.get("page_number") == 1), None)
+        if page1 is not None:
+            try:
+                ocr_pages = await ocr_runner.run_ocr_on_pages([{
+                    "page_number": 1,
+                    "image_b64": page1["image_b64"],
+                    "mime_type": page1.get("mime_type", "image/jpeg"),
+                }])
+                page_words = (ocr_pages[0].get("words", []) if ocr_pages else [])
+            except Exception as exc:
+                # OCR was required to read a scanned page 1 but was unavailable.
+                # That is an infrastructure problem, NOT an unknown vendor — say so
+                # explicitly so the user retries instead of (wrongly) being told to
+                # create a vendor that may already exist.
+                logger.warning("vendor-detect page-1 OCR failed ext=%s: %s", extraction_id, exc)
+                return await _fail(
+                    "ocr_unavailable",
+                    "OCR was unavailable while reading page 1 for vendor detection. Please retry.",
+                )
+
+    match = await vd_mod.detect_vendor(pool, page_words, user_id=detect_user_id)
+
+    if match is None:
+        logger.warning(
+            "Unknown vendor for ext=%s (%d page-1 words) — marking failed",
+            extraction_id, len(page_words),
+        )
+        return await _fail(
+            "unknown_vendor",
+            "Unknown vendor — no alias matched the document.",
+        )
+
+    # A detected vendor still needs a template with at least one field, or the
+    # extraction cannot produce anything. Preselected vendors hit this gate in
+    # main._submit_ingestion_job; auto-detected vendors must hit the same gate
+    # here so we never queue ocr/llm for a vendor that cannot extract.
+    tmpl = await db_mod.get_template(pool, match.vendor_id)
+    if not tmpl:
+        logger.warning(
+            "Detected vendor %s for ext=%s has no template — marking failed",
+            match.vendor_id, extraction_id,
+        )
+        return await _fail(
+            "no_template",
+            f"Detected vendor '{match.vendor_name}' but it has no template. "
+            "Create a template with at least one field, then retry.",
+        )
+    if not (list(tmpl.get("header_fields") or []) + list(tmpl.get("line_item_fields") or [])):
+        logger.warning(
+            "Detected vendor %s for ext=%s has a template with no fields — marking failed",
+            match.vendor_id, extraction_id,
+        )
+        return await _fail(
+            "no_fields",
+            f"Detected vendor '{match.vendor_name}' but its template has no fields. "
+            "Add at least one header or line item field, then retry.",
+        )
+
+    await db_mod.update_extraction_vendor(
+        pool,
+        extraction_id,
+        vendor_id=match.vendor_id,
+        template_id=tmpl.get("id"),
+        format_type=tmpl.get("format_type") or "single_po_multipage",
+        header_fields=list(tmpl.get("header_fields") or []),
+        line_item_fields=list(tmpl.get("line_item_fields") or []),
+    )
+    logger.info(
+        "Vendor detected ext=%s vendor=%s (%s, score=%.2f)",
+        extraction_id, match.vendor_id, match.vendor_name, match.score,
+    )
+    await db_mod.update_extraction_progress(
+        pool,
+        extraction_id,
+        {
+            "stage": "normalize",
+            "message": f"Detected vendor: {match.vendor_name}",
+            "vendor_detected": True,
+        },
+        status="processing",
+    )
+    return True
 
 
 async def _process_normalize(pool, job: dict) -> None:
@@ -384,6 +520,19 @@ async def _process_normalize(pool, job: dict) -> None:
                 len(page_rows) - len(scanned_page_numbers), len(scanned_page_numbers))
     if await _stop_if_cancelled(pool, extraction_id, "normalize", "Cancelled during page rendering"):
         raise JobCancelled("Cancelled during page rendering")
+
+    # ── Vendor detection (auto-detect path) ──
+    # When the document was submitted without a vendor (vendor_id is NULL on the
+    # extraction), detect it now from page-1 text. An unknown vendor ends the
+    # pipeline here — the extraction is marked failed and no ocr/llm is queued.
+    extraction_row = await db_mod.get_extraction(pool, extraction_id)
+    if extraction_row is not None and not extraction_row.get("vendor_id"):
+        applied = await _detect_and_apply_vendor(
+            pool, document, extraction_id, rendered_pages, geo_by_page,
+        )
+        if not applied:
+            return
+
     # Run OCR (scanned pages only) and LLM in parallel
     await db_mod.ensure_job(
         pool, extraction_id, document["id"], "ocr",
@@ -749,27 +898,36 @@ async def _process_llm(pool, job: dict) -> None:
 
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     _pr = output.get("page_results") or []
+    _failed_pages = [
+        {"page": pr["_page"], "error": pr["_error"], "error_type": page_logger.classify_error_type(pr["_error"])}
+        for pr in _pr if "_error" in pr
+    ]
+    user_cancelled = False
     if output.get("cancelled"):
-        # batch_had_failure also sets cancelled=True; all-page failures land here
-        status = "partial" if _pr else "cancelled"
+        user_cancelled = await db_mod.is_cancel_requested(pool, extraction_id)
+        if user_cancelled:
+            status = "partial" if _pr else "cancelled"
+        else:
+            status = "failed"
+    elif _failed_pages:
+        status = "failed"
     else:
         # Don't set "done" here — postprocess worker sets the final status
         # after computing field-to-bounding-box mappings. Keeping "processing"
         # ensures the SSE stream stays open until field_locations are ready.
         status = "processing"
 
-    _pr = output.get("page_results") or []
-    _failed_pages = [
-        {"page": pr["_page"], "error": pr["_error"], "error_type": page_logger.classify_error_type(pr["_error"])}
-        for pr in _pr if "_error" in pr
-    ]
     _extracted = len([pr for pr in _pr if "_error" not in pr])
-    _result = output.get("result")
+    _result = _strip_internal_keys(output.get("result"))
+    output["result"] = _result
     _field_count = page_logger.count_result_fields(_result)
     if output.get("cancelled"):
-        _log_status = "partial" if _pr else "cancelled"
+        if user_cancelled:
+            _log_status = "partial" if _pr else "cancelled"
+        else:
+            _log_status = "failed"
     elif _failed_pages:
-        _log_status = "partial"
+        _log_status = "failed"
     else:
         _log_status = "done"
     page_logger.append_log({
@@ -811,11 +969,18 @@ async def _process_llm(pool, job: dict) -> None:
             output["page_results"],
             status,
             elapsed_ms,
+            error=LLM_FAILED_ERROR if status == "failed" else None,
             progress={
                 "stage": "llm",
-                "message": "LLM extraction complete, awaiting field mapping" if status == "processing" else status,
+                "message": (
+                    "LLM extraction complete, awaiting field mapping"
+                    if status == "processing"
+                    else LLM_FAILED_MESSAGE if status == "failed"
+                    else status
+                ),
                 "last_completed_page": output.get("last_completed_page", 0),
                 "total_pages": len(pages),
+                "failed_pages": [p["page"] for p in _failed_pages],
             },
         )
         persist_trace["output"] = {
@@ -825,26 +990,48 @@ async def _process_llm(pool, job: dict) -> None:
         }
     logger.info("LLM result persisted: status=%s elapsed=%dms", status, elapsed_ms)
 
-    # output.cancelled is True for BOTH a user cancel and an internal batch
-    # failure (which lands the extraction in "partial"). Either way the pipeline
-    # ends here without reaching postprocess, so release the reservation now —
-    # otherwise pending_pages stays inflated and blocks the user's next upload.
-    if output.get("cancelled"):
-        user_cancelled = await db_mod.is_cancel_requested(pool, extraction_id)
+    # User cancellation and LLM page failures both end the pipeline before
+    # postprocess. Release the reservation now so pending_pages does not block
+    # the user's next upload.
+    if output.get("cancelled") or status == "failed":
         try:
             await db_mod.release_quota_once(pool, base.get("document_id"), base.get("billing_user_id"))
         except Exception as exc:
             logger.warning(
                 "quota release failed (llm %s) ext=%s: %s",
-                "cancel" if user_cancelled else "partial", extraction_id, exc,
+                "cancel" if user_cancelled else "failed", extraction_id, exc,
             )
         if user_cancelled:
             raise JobCancelled("Cancelled during LLM extraction")
-        # Internal batch failure: extraction stays "partial"; nothing more to do.
+        # Internal LLM failure: extraction stays failed; resume can retry missing pages.
         return
 
     if status == "processing":
         await _maybe_enqueue_postprocess(pool, extraction_id, job["document_id"], _job_trace_context(job))
+
+
+async def _apply_erp_field_mapping(
+    pool,
+    extraction_id: int,
+    vendor_id: str | None,
+    result,
+) -> None:
+    """Apply the configured ERP mapping, or clear stale mapped output."""
+    try:
+        from . import field_mapper as _fm
+
+        mapping = await db_mod.get_field_mapping(pool, vendor_id) if vendor_id else None
+        if mapping and (mapping.get("header_map") or mapping.get("line_map")):
+            schema = None
+            if mapping.get("schema_id"):
+                schema = await db_mod.get_schema_by_id(pool, mapping["schema_id"])
+            mapped = _fm.apply_mapping(result, mapping, schema=schema)
+            await db_mod.update_extraction_mapped_result(pool, extraction_id, mapped)
+            logger.info("ERP field mapping applied: ext=%s", extraction_id)
+        else:
+            await db_mod.update_extraction_mapped_result(pool, extraction_id, None)
+    except Exception as exc:
+        logger.warning("ERP field mapping failed ext=%s: %s", extraction_id, exc)
 
 
 async def _process_postprocess(pool, job: dict) -> None:
@@ -862,6 +1049,8 @@ async def _process_postprocess(pool, job: dict) -> None:
 
     ocr_data = extraction_row.get("ocr_data")
     page_results = extraction_row.get("page_results")
+    vendor_id = extraction_row.get("vendor_id")
+    template_id = extraction_row.get("template_id")
 
     # ── Debug dump: save OCR + Qwen outputs for offline analysis ──
     if DEBUG_DUMP_BBOX:
@@ -881,8 +1070,47 @@ async def _process_postprocess(pool, job: dict) -> None:
             logger.warning("Failed to save debug dump for extraction %s: %s", extraction_id, _e)
 
     # ── Build field_locations ──
-    vendor_id = extraction_row.get("vendor_id")
-    template_id = extraction_row.get("template_id")
+    latest_ocr_job = await db_mod.get_latest_job_for_extraction_type(pool, extraction_id, "ocr")
+    ocr_failed = bool(latest_ocr_job and latest_ocr_job.get("status") == "failed")
+    if not ocr_data and ocr_failed:
+        ocr_error = latest_ocr_job.get("error") or "OCR failed"
+        logger.warning(
+            "Postprocess finalizing JSON-only success with OCR warning: ext=%s ocr_error=%s",
+            extraction_id,
+            ocr_error,
+        )
+        await db_mod.save_field_locations(pool, extraction_id, {})
+        await _apply_erp_field_mapping(pool, extraction_id, vendor_id, result)
+        with trace_named_step(
+            "final_result",
+            kind="CHAIN",
+            input_data={"extraction_id": extraction_id, "ocr_available": False},
+            attributes=base,
+        ) as final_trace:
+            final_trace["output"] = {
+                "result": _result_summary(result),
+                "field_location_count": 0,
+                "status": "done",
+                "review_available": False,
+                "ocr_error": ocr_error,
+            }
+        await db_mod.set_extraction_status(
+            pool,
+            extraction_id,
+            "done",
+            progress={
+                "stage": "postprocess",
+                "message": OCR_REVIEW_UNAVAILABLE_MESSAGE,
+                "warning_code": OCR_REVIEW_UNAVAILABLE_ERROR,
+                "review_available": False,
+                "ocr_error": ocr_error,
+            },
+        )
+        try:
+            await db_mod.release_quota_once(pool, base.get("document_id"), base.get("billing_user_id"))
+        except Exception as _rel_exc:
+            logger.warning("quota release failed ext=%s: %s", extraction_id, _rel_exc)
+        return
 
     qwen_boxes: dict = {}
     if vendor_id and template_id:
@@ -959,7 +1187,7 @@ async def _process_postprocess(pool, job: dict) -> None:
         if sm_applied:
             # Persist the updated result with spatial memory overrides
             await db_mod.update_extraction_result(
-                pool, extraction_id, result, page_results, "processing", None,
+                pool, extraction_id, _strip_internal_keys(result), page_results, "processing", None,
             )
             logger.info(
                 "Spatial memory: %d field(s) applied for extraction %d",
@@ -987,25 +1215,9 @@ async def _process_postprocess(pool, job: dict) -> None:
             "field_location_count": _field_location_count(field_locations),
             "status": "done",
         }
-    # ── Apply ERP field mapping (if configured for this vendor) ──
     # Renames merged extraction fields to the program's canonical fields.
     # Raw `result` is left untouched; the mapped copy is what API clients get.
-    try:
-        from . import field_mapper as _fm
-
-        mapping = await db_mod.get_field_mapping(pool, vendor_id) if vendor_id else None
-        if mapping and (mapping.get("header_map") or mapping.get("line_map")):
-            schema = None
-            if mapping.get("schema_id"):
-                schema = await db_mod.get_schema_by_id(pool, mapping["schema_id"])
-            mapped = _fm.apply_mapping(result, mapping, schema=schema)
-            await db_mod.update_extraction_mapped_result(pool, extraction_id, mapped)
-            logger.info("ERP field mapping applied: ext=%s", extraction_id)
-        else:
-            # No mapping configured — clear any stale mapped_result.
-            await db_mod.update_extraction_mapped_result(pool, extraction_id, None)
-    except Exception as exc:
-        logger.warning("ERP field mapping failed ext=%s: %s", extraction_id, exc)
+    await _apply_erp_field_mapping(pool, extraction_id, vendor_id, result)
 
     if await _stop_if_cancelled(pool, extraction_id, "postprocess", "Cancelled before completion"):
         raise JobCancelled("Cancelled before completion")
@@ -1097,6 +1309,8 @@ async def process_job(pool, stage: str, job: dict) -> None:
 
 
 async def run_worker(stage: str, worker_name: str) -> None:
+    if stage == "llm":
+        setup_mlflow()
     pool = await db_mod.create_pool()
     await db_mod.init(pool)
     plog.current_worker.set(worker_name)
@@ -1228,6 +1442,28 @@ async def run_worker(stage: str, worker_name: str) -> None:
                                 job.get("extraction_id"),
                                 log_exc,
                             )
+                    if stage == "ocr" and job.get("extraction_id"):
+                        current = await db_mod.get_extraction(pool, job["extraction_id"])
+                        if (current or {}).get("status") not in TERMINAL_EXTRACTION_STATUSES:
+                            await db_mod.update_extraction_progress(
+                                pool,
+                                job["extraction_id"],
+                                {
+                                    "stage": "ocr",
+                                    "message": OCR_REVIEW_UNAVAILABLE_MESSAGE,
+                                    "review_available": False,
+                                    "ocr_error": str(exc),
+                                },
+                                status="processing",
+                            )
+                        await db_mod.fail_job(pool, job["id"], str(exc), retryable=False)
+                        await _maybe_enqueue_postprocess(
+                            pool,
+                            job["extraction_id"],
+                            job.get("document_id"),
+                            _job_trace_context(job),
+                        )
+                        continue
                     if job.get("extraction_id"):
                         await db_mod.set_extraction_status(
                             pool,

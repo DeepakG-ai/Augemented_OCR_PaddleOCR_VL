@@ -262,6 +262,69 @@ class ReliabilityHardeningTests(unittest.TestCase):
         self.assertEqual(res_json["result"], {"total": 100.0})
 
     @patch("backend.main.db_mod.claim_idempotency")
+    @patch("backend.main.db_mod.get_extraction")
+    @patch("backend.main.db_mod.get_extraction_mapped_result")
+    def test_extract_idempotency_cached_all_pages_failed_returns_503(
+        self, mock_mapped, mock_get_ext, mock_claim
+    ) -> None:
+        mock_claim.return_value = {"status": "duplicate", "extraction_id": 2000, "extraction_status": "done"}
+        mock_get_ext.return_value = {
+            "id": 2000,
+            "vendor_id": "v-1",
+            "total_pages": 1,
+            "status": "done",
+            "error": None,
+            "result": {"_all_pages_failed": True, "errors": ["All connection attempts failed"]},
+            "page_results": [{"_page": 1, "_error": "All connection attempts failed"}],
+        }
+        mock_mapped.return_value = None
+
+        response = self.client.post(
+            "/v1/extract",
+            headers={"Idempotency-Key": "duplicate-failed-key"},
+            files={"file": ("test.pdf", b"%PDF-1.4...", "application/pdf")},
+        )
+
+        self.assertEqual(response.status_code, 503)
+        body = response.json()["error"]
+        self.assertEqual(body["code"], "LLM_UNAVAILABLE")
+        self.assertIn("llama-server", body["message"])
+        self.assertEqual(body["extraction_id"], 2000)
+
+    @patch("backend.main.processor.count_pdf_pages")
+    @patch("backend.main._submit_ingestion_job")
+    @patch("backend.main.db_mod.get_extraction")
+    def test_extract_sync_llm_connection_failure_returns_503(
+        self, mock_get_ext, mock_submit, mock_count
+    ) -> None:
+        mock_count.return_value = 1
+        mock_submit.return_value = {
+            "job": {"id": 1000},
+            "extraction": {"id": 2000, "document_id": 3000, "status": "queued"},
+        }
+        mock_get_ext.return_value = {
+            "id": 2000,
+            "vendor_id": "v-1",
+            "total_pages": 1,
+            "duration_ms": 18,
+            "status": "failed",
+            "error": "llm_failed",
+            "result": {"_all_pages_failed": True, "errors": ["All connection attempts failed"]},
+            "page_results": [{"_page": 1, "_error": "All connection attempts failed"}],
+            "updated_at": None,
+        }
+
+        response = self.client.post(
+            "/v1/extract",
+            files={"file": ("test.pdf", b"%PDF-1.4...", "application/pdf")},
+        )
+
+        self.assertEqual(response.status_code, 503)
+        body = response.json()["error"]
+        self.assertEqual(body["code"], "LLM_UNAVAILABLE")
+        self.assertEqual(body["errors"], ["All connection attempts failed"])
+
+    @patch("backend.main.db_mod.claim_idempotency")
     def test_extract_idempotency_conflict_returns_409(self, mock_claim) -> None:
         mock_claim.return_value = {"status": "conflict"}
 
@@ -325,7 +388,10 @@ class ReliabilityHardeningTests(unittest.TestCase):
         self.assertEqual(response.json()["status"], "initializing")
         mock_delete.assert_not_called()
 
-    def test_extract_releases_quota_when_vendor_render_fails(self) -> None:
+    def test_extract_releases_quota_when_submit_fails(self) -> None:
+        # Vendor detection moved into the worker, so the request no longer
+        # renders page 1. The remaining pre-handoff failure point is
+        # _submit_ingestion_job — if it raises, the reservation must be released.
         client_user = {
             "id": "11111111-1111-1111-1111-111111111111",
             "role": "client",
@@ -345,14 +411,14 @@ class ReliabilityHardeningTests(unittest.TestCase):
                      "remaining": 88,
                      "pending": 0,
                  })), \
-                 patch("backend.main.render_page_1_for_detection", new=AsyncMock(return_value=[])), \
+                 patch("backend.main._submit_ingestion_job", new=AsyncMock(side_effect=RuntimeError("submit down"))), \
                  patch("backend.main.db_mod.release_quota_reservation", new=AsyncMock()) as mock_release:
                 response = self.client.post(
                     "/v1/extract",
                     files={"file": ("test.pdf", b"%PDF-1.4...", "application/pdf")},
                 )
 
-            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.status_code, 500)
             mock_release.assert_called_once_with(unittest.mock.ANY, client_user["id"], 2)
         finally:
             if previous_override is None:
@@ -360,7 +426,9 @@ class ReliabilityHardeningTests(unittest.TestCase):
             else:
                 main.app.dependency_overrides[auth_mod.get_current_user_or_api_key] = previous_override
 
-    def test_ingest_releases_quota_when_vendor_render_raises(self) -> None:
+    def test_ingest_releases_quota_when_submit_raises(self) -> None:
+        # Same invariant for the UI upload path: a submission failure after the
+        # quota reservation must release it (detection no longer runs here).
         client_user = {
             "id": "11111111-1111-1111-1111-111111111111",
             "role": "client",
@@ -369,8 +437,7 @@ class ReliabilityHardeningTests(unittest.TestCase):
         previous_override = main.app.dependency_overrides.get(auth_mod.get_current_user)
         main.app.dependency_overrides[auth_mod.get_current_user] = lambda: client_user
         try:
-            with patch("backend.main.db_mod.get_user_is_executing", new=AsyncMock(return_value=False)), \
-                 patch("backend.main.processor.count_pdf_pages", return_value=2), \
+            with patch("backend.main.processor.count_pdf_pages", return_value=2), \
                  patch("backend.main.db_mod.reserve_quota", new=AsyncMock(return_value={
                      "allowed": True,
                      "reason": "ok",
@@ -379,21 +446,59 @@ class ReliabilityHardeningTests(unittest.TestCase):
                      "remaining": 88,
                      "pending": 0,
                  })), \
-                 patch("backend.main.render_page_1_for_detection", new=AsyncMock(side_effect=RuntimeError("renderer down"))), \
+                 patch("backend.main._submit_ingestion_job", new=AsyncMock(side_effect=RuntimeError("submit down"))), \
                  patch("backend.main.db_mod.release_quota_reservation", new=AsyncMock()) as mock_release:
                 response = self.client.post(
                     "/ingest/ui",
                     files={"file": ("test.pdf", b"%PDF-1.4...", "application/pdf")},
                 )
 
-            self.assertEqual(response.status_code, 400)
-            self.assertEqual(response.json()["error"]["code"], "PDF_RENDER_FAILED")
+            self.assertEqual(response.status_code, 500)
             mock_release.assert_called_once_with(unittest.mock.ANY, client_user["id"], 2)
         finally:
             if previous_override is None:
                 main.app.dependency_overrides.pop(auth_mod.get_current_user, None)
             else:
                 main.app.dependency_overrides[auth_mod.get_current_user] = previous_override
+
+    def test_v1_extract_maps_unknown_vendor_to_400(self) -> None:
+        # Detection now happens in the worker; the sync /v1/extract poll loop must
+        # translate a failed extraction with error=unknown_vendor back into the
+        # original 400 contract (not a generic 500).
+        client_user = {
+            "id": "11111111-1111-1111-1111-111111111111",
+            "role": "client",
+            "email": "client@test",
+            "auth_method": "api_key",
+            "api_key_id": 7,
+        }
+        previous_override = main.app.dependency_overrides.get(auth_mod.get_current_user_or_api_key)
+        main.app.dependency_overrides[auth_mod.get_current_user_or_api_key] = lambda: client_user
+        try:
+            with patch("backend.main.processor.count_pdf_pages", return_value=1), \
+                 patch("backend.main.db_mod.reserve_quota", new=AsyncMock(return_value={
+                     "allowed": True, "reason": "ok", "used": 1,
+                     "limit": 100, "remaining": 99, "pending": 0,
+                 })), \
+                 patch("backend.main._submit_ingestion_job", new=AsyncMock(return_value={
+                     "extraction": {"id": 99, "document_id": 1},
+                     "job": {"id": 1, "status": "queued"},
+                 })), \
+                 patch("backend.main.db_mod.get_extraction", new=AsyncMock(return_value={
+                     "id": 99, "status": "failed", "error": "unknown_vendor",
+                 })):
+                response = self.client.post(
+                    "/v1/extract",
+                    files={"file": ("test.pdf", b"%PDF-1.4...", "application/pdf")},
+                )
+
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("No vendor template found", response.text)
+        finally:
+            if previous_override is None:
+                main.app.dependency_overrides.pop(auth_mod.get_current_user_or_api_key, None)
+            else:
+                main.app.dependency_overrides[auth_mod.get_current_user_or_api_key] = previous_override
 
     def test_error_envelope_backfills_code_and_message_for_structured_details(self) -> None:
         body = main._error_body(

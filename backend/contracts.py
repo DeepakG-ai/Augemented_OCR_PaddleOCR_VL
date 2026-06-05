@@ -86,3 +86,23 @@ def build_purchase_order_contract(extraction: dict) -> dict[str, Any]:
             "reason_code": review_meta.get("reason_code"),
         },
     }
+
+
+def attach_vendor(result, vendor_name):
+    """Return `result` with a leading "vendor" key set to the detected vendor name.
+
+    Non-mutating: returns new objects, never edits the input.
+    No-op when `vendor_name` is falsy or when "vendor" is already present.
+      - dict -> {"vendor": vendor_name, **result}  (vendor first)
+      - list -> each dict document gets the same injection (po_per_page)
+      - anything else -> returned unchanged
+    """
+    if not vendor_name:
+        return result
+    if isinstance(result, dict):
+        if "vendor" in result:
+            return result
+        return {"vendor": vendor_name, **result}
+    if isinstance(result, list):
+        return [attach_vendor(d, vendor_name) if isinstance(d, dict) else d for d in result]
+    return result

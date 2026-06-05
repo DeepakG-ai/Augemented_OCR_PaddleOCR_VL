@@ -11,17 +11,14 @@ import os
 import threading
 from datetime import datetime, timezone
 
+from .config import PAGE_USAGE_LOG_PATH, PAGE_ALERTS_LOG_PATH
+
 logger = logging.getLogger(__name__)
 
-_LOG_PATH = os.environ.get(
-    "PAGE_USAGE_LOG_PATH",
-    os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs", "page_usage", "log.txt"),
-)
-
-_ALERTS_LOG_PATH = os.environ.get(
-    "PAGE_ALERTS_LOG_PATH",
-    os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs", "page_usage", "alerts.log"),
-)
+# Env-driven paths are resolved in config.py (single source of truth). These
+# module-level names are kept so tests can patch them to a temp path.
+_LOG_PATH = PAGE_USAGE_LOG_PATH
+_ALERTS_LOG_PATH = PAGE_ALERTS_LOG_PATH
 
 # Persistent open handles — created on first use, reused on subsequent calls.
 # Tests reset these to None in setUp to force re-open against a temp path.
@@ -136,6 +133,7 @@ def log_limit_alert(
     alert_type: str = "warning",
     extraction_id: int | None = None,
     filename: str | None = None,
+    grace_pages_used: int = 0,
 ) -> None:
     """Append one line to the alerts log when a user hits or nears their limit.
 
@@ -143,7 +141,7 @@ def log_limit_alert(
     Never raises — billing alerts must not crash the pipeline.
     """
     try:
-        overage = subscription_limit - total_extracted_pages
+        overage = max(0, total_extracted_pages - subscription_limit)
         record = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "alert_type": alert_type,
@@ -154,6 +152,8 @@ def log_limit_alert(
             "total_extracted_pages": total_extracted_pages,
             "overage": overage,
         }
+        if grace_pages_used:
+            record["grace_pages_used"] = grace_pages_used
         if extraction_id is not None:
             record["extraction_id"] = extraction_id
         line = _format_record(record, prefix="LIMIT_ALERT") + "\n"

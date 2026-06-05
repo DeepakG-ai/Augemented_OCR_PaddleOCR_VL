@@ -19,8 +19,23 @@ kept as no-ops so existing call sites keep working without change.
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 from typing import Any, Iterator
+
+# ── MLflow client hardening ──────────────────────────────────────────────
+# Tracing is NON-CRITICAL. When the tracking server is down or still starting,
+# the client must fail FAST and QUIET — it must never stall an extraction or
+# flood the pipeline logs with urllib3 retry storms. These env vars are read by
+# MLflow's REST client at request time; `setdefault` lets an explicit override
+# win. (MLflow's own defaults are 7 retries + 120s timeout — far too patient for
+# a best-effort observability path.)
+os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "0")   # one attempt, no storm
+os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "3")       # give up after 3s
+# Resolve the experiment lazily from the env so traces still land in the right
+# experiment even if the eager set_experiment() below failed because the server
+# wasn't up yet at startup.
+os.environ.setdefault("MLFLOW_EXPERIMENT_NAME", "augmented_ocr")
 
 # pyrefly: ignore [missing-import]
 import mlflow
@@ -30,15 +45,62 @@ logger = logging.getLogger(__name__)
 
 
 def setup_mlflow(experiment_name: str = "augmented_ocr", force: bool = False) -> None:
+    """Point the MLflow client at the tracking server and select the experiment.
+
+    Resilient by design: if the tracking server is unreachable (down, or still
+    starting up), this logs at debug and returns. Tracing then degrades to a
+    no-op until the server is reachable again (see `span`). It never raises and
+    never blocks startup for more than MLFLOW_HTTP_REQUEST_TIMEOUT.
+    """
     from .config import MLFLOW_ENABLED, MLFLOW_TRACKING_URI
-    if MLFLOW_ENABLED:
+    if not MLFLOW_ENABLED:
+        return
+    # urllib3 logs one WARNING per retry attempt ("Retrying (...)"). With retries
+    # capped to 0 above these should not fire, but silence the channel anyway so
+    # a flapping tracking server can never spam the pipeline logs.
+    logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
+    try:
         mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
         mlflow.set_experiment(experiment_name)
+        _reset_breaker()
+    except Exception as e:
+        logger.debug("MLflow setup skipped (tracking server unreachable): %s", e)
+        _trip_breaker()
 
 
 def _enabled() -> bool:
     from .config import MLFLOW_ENABLED
     return bool(MLFLOW_ENABLED)
+
+
+# ── Circuit breaker ──────────────────────────────────────────────────────
+# When the tracking server is down, every span would otherwise pay one full
+# MLFLOW_HTTP_REQUEST_TIMEOUT (3s) — adding 3s × N spans of latency to a single
+# document. Once a span fails to reach the server we "open" the breaker and make
+# all spans instant no-ops for a short cooldown, then probe again. When the
+# server is healthy the breaker never opens, so there is zero overhead.
+import time as _time
+
+_BREAKER_COOLDOWN_S = 30.0
+# A healthy start_span returns in milliseconds. If it takes longer than this the
+# server is unreachable and MLflow is silently eating the HTTP timeout (it does
+# NOT raise) — treat that as "down" and open the breaker.
+_BREAKER_SLOW_S = 1.0
+_breaker_open_until = 0.0
+
+
+def _breaker_open() -> bool:
+    return _time.monotonic() < _breaker_open_until
+
+
+def _trip_breaker() -> None:
+    global _breaker_open_until
+    _breaker_open_until = _time.monotonic() + _BREAKER_COOLDOWN_S
+
+
+def _reset_breaker() -> None:
+    global _breaker_open_until
+    _breaker_open_until = 0.0
 
 
 # ── The ONE real primitive: a typed, nestable span ──
@@ -69,7 +131,9 @@ def span(
                              rendered as cost/token charts in the MLflow UI
     """
     ctx: dict[str, Any] = {"outputs": None, "token_usage": None}
-    if not _enabled():
+    # Skip entirely when tracing is off, or while the breaker is open (server
+    # recently seen as down — don't pay the timeout again until it cools off).
+    if not _enabled() or _breaker_open():
         yield ctx
         return
 
@@ -77,8 +141,15 @@ def span(
     # a no-op, never break the extraction that called us.
     cm = sp = None
     try:
+        _t0 = _time.monotonic()
         cm = mlflow.start_span(name=name, span_type=span_type)
         sp = cm.__enter__()
+        # start_span swallows backend timeouts instead of raising, so judge
+        # health by latency: fast = up (close breaker), slow = down (open it).
+        if (_time.monotonic() - _t0) > _BREAKER_SLOW_S:
+            _trip_breaker()
+        else:
+            _reset_breaker()
         if inputs is not None:
             sp.set_inputs(inputs)
         if attributes:
@@ -86,6 +157,7 @@ def span(
     except Exception as e:
         logger.debug("tracing disabled for span %r due to error: %s", name, e)
         cm = sp = None
+        _trip_breaker()  # server looks down — stop trying for the cooldown window
 
     try:
         yield ctx  # caller body — its exceptions propagate untouched

@@ -1,9 +1,21 @@
 """
-config.py — Single source of truth for all environment-driven configuration.
+config.py — Single source of truth for environment-driven configuration *values*.
 
-All os.getenv calls live here. Every module imports the constants it needs
-from this module instead of reading environment variables directly.
-Defaults match the existing per-file values so no behaviour changes on upgrade.
+Modules import the constants they need from here instead of calling os.getenv
+themselves. Defaults match the historical per-file values, so upgrading changes
+no behaviour.
+
+Three deliberate exceptions do NOT route through this module:
+  • Env *side-effects* that must be set BEFORE a third-party library imports —
+    `os.environ.setdefault(...)` in `ocr_runner.py` (PaddleOCR) and
+    `mlflow_tracing.py` (MLflow client). These configure those libraries, so they
+    have to run at the top of their own module, ahead of the library import.
+  • `auth.py` re-reads `SECRET_KEY` at call time on purpose, so a rotated secret
+    (or a test override) takes effect without a process restart.
+  • `main.py` reads `ADMIN_EMAIL` / `ADMIN_PASSWORD` once during the startup
+    admin-bootstrap, and `logging_config.py` reads its CloudWatch settings where
+    the handler is built.
+Everything else — every plain configuration read — lives here.
 """
 from __future__ import annotations
 
@@ -56,7 +68,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://augocr:augocr@localhost:5
 # ---------------------------------------------------------------------------
 # LLM (Qwen3-VL via llama-server)
 # ---------------------------------------------------------------------------
-LLM_URL              = os.getenv("LLM_URL",   "http://localhost:8001/v1/chat/completions")
+LLM_URL              = os.getenv("LLM_URL",   "http://localhost:8056/v1/chat/completions")
 LLM_MODEL            = os.getenv("LLM_MODEL", "qwen3vl")
 LLM_TEMPERATURE      = _env_float("LLM_TEMPERATURE",      0.7)
 LLM_TOP_P            = _env_float("LLM_TOP_P",            0.8)
@@ -77,6 +89,26 @@ RATE_LIMIT_PER_MINUTE = os.getenv("RATE_LIMIT_PER_MINUTE", "30")
 MAX_UPLOAD_MB         = _env_int("MAX_UPLOAD_MB", 50)
 MAX_UPLOAD_BYTES      = MAX_UPLOAD_MB * 1024 * 1024
 MAX_DOCUMENT_PAGES    = _env_int("MAX_DOCUMENT_PAGES", 100)
+
+_DEFAULT_CORS_ALLOW_ORIGINS = (
+    "http://localhost:3000",
+    "http://localhost:3002",
+    "http://localhost:8000",
+    "http://localhost:8055",
+    "http://localhost:8057",
+    "http://localhost:8058",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3002",
+    "http://127.0.0.1:8000",
+    "http://127.0.0.1:8055",
+    "http://127.0.0.1:8057",
+    "http://127.0.0.1:8058",
+)
+CORS_ALLOW_ORIGINS = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv("CORS_ALLOW_ORIGINS", ",".join(_DEFAULT_CORS_ALLOW_ORIGINS)).split(",")
+    if origin.strip()
+]
 
 # ---------------------------------------------------------------------------
 # PDF / image processing
@@ -112,6 +144,12 @@ MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
 # ---------------------------------------------------------------------------
 LOG_LEVEL        = os.getenv("LOG_LEVEL", "INFO").upper()
 PIPELINE_LOG_DIR = Path(os.getenv("PIPELINE_LOG_DIR", "logs/pipeline"))
+
+# Append-only page-usage + alerts logs (used by page_logger.py). Defaults are
+# project-root-relative so they match the historical per-file values.
+_PROJECT_ROOT        = os.path.dirname(os.path.dirname(__file__))
+PAGE_USAGE_LOG_PATH  = os.getenv("PAGE_USAGE_LOG_PATH",  os.path.join(_PROJECT_ROOT, "logs", "page_usage", "log.txt"))
+PAGE_ALERTS_LOG_PATH = os.getenv("PAGE_ALERTS_LOG_PATH", os.path.join(_PROJECT_ROOT, "logs", "page_usage", "alerts.log"))
 
 # ---------------------------------------------------------------------------
 # Subscription / page limits

@@ -22,7 +22,7 @@ logging.basicConfig(
 log = logging.getLogger("rj_schinner_po")
 
 # ── Config ────────────────────────────────────────────────────────────
-LLAMA_URL = "http://localhost:8001/v1/chat/completions"
+LLAMA_URL = "http://localhost:8056/v1/chat/completions"
 
 # Add all your page image paths here in order
 IMAGE_PATHS = [
@@ -218,7 +218,7 @@ if __name__ == "__main__":
 # llama-server ^
 #   --model "Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf" ^
 #   --mmproj "mmproj-F16.gguf" ^
-#   --host 0.0.0.0 --port 8001 ^
+#   --host 0.0.0.0 --port 8056 ^
 #   --n-gpu-layers 999 ^
 #   --ctx-size 8192 ^
 #   --threads 8
@@ -227,7 +227,7 @@ if __name__ == "__main__":
   --model "Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf" ^
   --mmproj "mmproj-F16.gguf" ^
   --host 0.0.0.0 ^
-  --port 8001 ^
+  --port 8056 ^
   --n-gpu-layers 999 ^
   --ctx-size 16384 ^
   --threads 8 ^

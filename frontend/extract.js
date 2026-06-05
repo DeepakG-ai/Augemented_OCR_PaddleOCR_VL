@@ -625,6 +625,19 @@ function updatePipelineFromSSE(jobState) {
         if (_tel && _pipelineStartTime) {
             _tel.textContent = `${((Date.now() - _pipelineStartTime) / 1000).toFixed(1)}s — FAILED`;
         }
+        // Detection-time failures happen inside normalize now — mark the detect
+        // stage failed (the recovery actions are shown by streamJob).
+        const _detectErrors = ['unknown_vendor', 'no_template', 'no_fields', 'ocr_unavailable'];
+        if (_detectErrors.includes(extraction.error)) {
+            const _labels = {
+                unknown_vendor: 'Unknown vendor — no alias matched the document.',
+                no_template: 'Detected vendor has no template.',
+                no_fields: 'Detected vendor’s template has no fields.',
+                ocr_unavailable: 'OCR was unavailable for vendor detection.',
+            };
+            setPipelineStage('detect', 'failed', _labels[extraction.error]);
+            return;
+        }
         // Find which stage to mark failed: use stage from progress if present,
         // otherwise scan DOM for the last stage still showing as active.
         const _sm = { normalize: 'normalize', ocr: 'ocr', llm: 'llm', postprocess: 'postprocess' };
@@ -661,6 +674,12 @@ function updatePipelineFromSSE(jobState) {
     if (extraction.vendor_name) {
         setDetectedVendorDisplay(extraction.vendor_name, 'Detected from page 1');
         setPipelineStage('detect', 'done', `Detected: ${extraction.vendor_name}`);
+        // Auto-detected in the worker: load the vendor's config (fields, etc.)
+        // the moment detection lands, so the review panel shows the right shape.
+        if (extraction.vendor_id && db.activeVendorId !== extraction.vendor_id) {
+            db.activeVendorId = extraction.vendor_id;
+            extLoadVendorConfig();
+        }
     }
 
     // Mark all stages before current as done (preserve their live detail text)
@@ -793,6 +812,16 @@ function applyJobStatus(jobState) {
                 rs.appendChild(btn);
             }
         }
+        if (progress.review_available === false || progress.warning_code === 'ocr_failed_review_unavailable') {
+            const cs = document.getElementById('conflictSection');
+            const cm = document.getElementById('conflictMsg');
+            const cc = document.getElementById('conflictCandidates');
+            if (cs) cs.style.display = 'block';
+            if (cm) cm.textContent = 'OCR failed, so drag/drop review, bounding boxes, and spatial memory are unavailable. JSON extraction completed.';
+            if (cc) cc.innerHTML = extraction.id
+                ? `<button class="small-btn" onclick="navigate('#/review/${extraction.id}')" style="margin-top:8px">Open Review for value edits</button>`
+                : '';
+        }
     } else if (extraction.status === 'partial' || extraction.status === 'cancelled') {
         if (extraction.result) {
             lastResult = extraction.result;
@@ -855,15 +884,45 @@ async function streamJob(jobId) {
                     if (event.event === 'done' || event.event === 'failed' || event.event === 'partial') {
                         if (event.event === 'failed') {
                             const extraction = event.extraction || {};
-                            const message = extraction.error || (event.job && event.job.error) || 'Extraction failed';
                             const cs2 = document.getElementById('conflictSection'); if (cs2) cs2.style.display = 'block';
-                            const cm = document.getElementById('conflictMsg'); if (cm) cm.textContent = 'Extraction failed: ' + message;
-                            const failedExtractionId = (event.extraction && event.extraction.id) || activeExtractionId;
+                            const cm = document.getElementById('conflictMsg');
                             const cc = document.getElementById('conflictCandidates');
-                            if (cc) cc.innerHTML = failedExtractionId
-                                ? `<button class="small-btn" onclick="resumeExtract(${failedExtractionId})" style="margin-top:8px;margin-right:6px">▶ Resume Pipeline</button>
-                                   <button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">↻ Restart from Scratch</button>`
-                                : `<button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">↻ Restart from Scratch</button>`;
+                            const _vendorConfigErrors = ['unknown_vendor', 'no_template', 'no_fields'];
+                            if (_vendorConfigErrors.includes(extraction.error)) {
+                                // Detection (now in the worker) found no usable vendor.
+                                // Resuming won't help — send the user to configure it.
+                                const _msg = {
+                                    unknown_vendor: 'Unknown vendor — no alias matched the document. Add the vendor name as an alias, then retry.',
+                                    no_template: 'The detected vendor has no template. Create a template with at least one field, then retry.',
+                                    no_fields: 'The detected vendor’s template has no fields. Add at least one field, then retry.',
+                                };
+                                if (cm) cm.textContent = _msg[extraction.error];
+                                if (cc) cc.innerHTML = `<button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px;margin-right:6px">↻ Retry Extraction</button>
+                                   <button class="small-btn" onclick="navigate('#/vendors')" style="margin-top:8px">Manage Vendors</button>`;
+                            } else if (extraction.error === 'ocr_unavailable') {
+                                // Transient infrastructure problem — just let them retry.
+                                if (cm) cm.textContent = 'OCR was unavailable while reading the document for vendor detection. Please retry.';
+                                if (cc) cc.innerHTML = `<button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">↻ Retry Extraction</button>`;
+                            } else if (extraction.error === 'llm_failed') {
+                                const failedExtractionId = (event.extraction && event.extraction.id) || activeExtractionId;
+                                const p = extraction.progress || {};
+                                const failedPages = Array.isArray(p.failed_pages) && p.failed_pages.length
+                                    ? ` Failed page(s): ${p.failed_pages.join(', ')}.`
+                                    : '';
+                                if (cm) cm.textContent = `LLM extraction failed.${failedPages} Resume to retry missing pages.`;
+                                if (cc) cc.innerHTML = failedExtractionId
+                                    ? `<button class="small-btn" onclick="resumeExtract(${failedExtractionId})" style="margin-top:8px;margin-right:6px">▶ Resume Pipeline</button>
+                                       <button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">↻ Restart from Scratch</button>`
+                                    : `<button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">↻ Restart from Scratch</button>`;
+                            } else {
+                                const message = extraction.error || (event.job && event.job.error) || 'Extraction failed';
+                                if (cm) cm.textContent = 'Extraction failed: ' + message;
+                                const failedExtractionId = (event.extraction && event.extraction.id) || activeExtractionId;
+                                if (cc) cc.innerHTML = failedExtractionId
+                                    ? `<button class="small-btn" onclick="resumeExtract(${failedExtractionId})" style="margin-top:8px;margin-right:6px">▶ Resume Pipeline</button>
+                                       <button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">↻ Restart from Scratch</button>`
+                                    : `<button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">↻ Restart from Scratch</button>`;
+                            }
                             setStatus('optimal');
                             document.getElementById('rpBadge').className = 'rp-badge review';
                             document.getElementById('rpBadge').textContent = 'NEEDS REVIEW';
@@ -926,14 +985,14 @@ async function runExtract() {
 
     try {
         const payload = await apiJSON('/ingest/ui', { method: 'POST', body: formData });
-        if (payload.detected_vendor) {
-            setDetectedVendorDisplay(payload.detected_vendor.vendor_name, 'Detected from page 1');
-            setPipelineStage('detect', 'done', `Detected: ${payload.detected_vendor.vendor_name}`);
-            db.activeVendorId = payload.detected_vendor.vendor_id;
-            await extLoadVendorConfig();
-        } else if (v) {
+        // Vendor detection now happens in the worker, not in this response.
+        // For auto-detect the vendor arrives over the SSE stream (handled in
+        // updatePipelineFromSSE); show "detecting…" until then.
+        if (v) {
             setDetectedVendorDisplay(v.name, 'Manual vendor selected. Auto-detection skipped.');
             setPipelineStage('detect', 'done', `Manual vendor selected: ${v.name}. Auto-detection skipped.`);
+        } else {
+            setPipelineStage('detect', 'active', 'Detecting vendor from page 1...');
         }
         activeExtractionId = payload.extraction_id;
         await streamJob(payload.job_id);

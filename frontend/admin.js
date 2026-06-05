@@ -10,6 +10,7 @@ function _adminSubTabsHTML(activeTab) {
     <div style="display:flex;border:1px solid var(--border);border-radius:3px;overflow:hidden;align-self:flex-end;margin-bottom:2px">
         <button onclick="navigate('#/admin/users')" style="${tabStyle(activeTab === 'users')}">USERS</button>
         <button onclick="navigate('#/admin/api-keys')" style="border-left:1px solid var(--border);${tabStyle(activeTab === 'apikeys')}">API KEYS</button>
+        <button onclick="navigate('#/admin/quota-events')" style="border-left:1px solid var(--border);${tabStyle(activeTab === 'quota-events')}">QUOTA ALERTS</button>
     </div>`;
 }
 
@@ -1210,6 +1211,119 @@ function _smRenderPager() {
 async function _smGoPage(newOffset) {
     _smOffset = Math.max(0, newOffset);
     await _smReload();
+}
+
+/* ── Admin: Quota Grace Events ──────────────────────────────────────────── */
+
+async function renderAdminQuotaEventsPage(app) {
+    app.innerHTML = headerHTML() + `
+    <div class="page-content">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px">
+            <div style="display:flex;align-items:center;gap:20px">
+                <div>
+                    <div class="page-title" style="margin:0">Quota Alerts</div>
+                    <div style="font-size:10px;color:var(--text-dim);margin-top:4px;letter-spacing:0.06em">
+                        Grace overages and hard blocks across all clients
+                    </div>
+                </div>
+                ${_adminSubTabsHTML('quota-events')}
+            </div>
+        </div>
+        <div id="quotaEventsContent">
+            <div style="padding:16px;font-size:10px;color:var(--text-dim)">Loading…</div>
+        </div>
+    </div>`;
+    updateNavActive();
+
+    try {
+        const events = await apiJSON('/admin/quota-events?limit=200');
+        _renderQuotaEvents(events);
+    } catch (e) {
+        const el = document.getElementById('quotaEventsContent');
+        if (el) el.innerHTML = `<div style="padding:16px;font-size:11px;color:var(--red)">Failed to load: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function _renderQuotaEvents(events) {
+    const el = document.getElementById('quotaEventsContent');
+    if (!el) return;
+
+    if (!events.length) {
+        el.innerHTML = '<div style="padding:20px;font-size:11px;color:var(--text-dim);text-align:center">No quota events recorded yet.</div>';
+        return;
+    }
+
+    const graceCount    = events.filter(e => e.event_type === 'grace_used').length;
+    const exceededCount = events.filter(e => e.event_type === 'exceeded').length;
+    const clientSet     = new Set(events.map(e => e.email || ''));
+    const totalGracePages = events.reduce((s, e) => s + (parseInt(e.grace_pages_used, 10) || 0), 0);
+
+    const statCard = (label, val, color) => `
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:4px;padding:14px 18px">
+        <div style="font-size:18px;font-weight:700;color:${color};font-family:var(--mono)">${val}</div>
+        <div style="font-size:9px;color:var(--text-dim);margin-top:3px;letter-spacing:0.08em">${label}</div>
+    </div>`;
+
+    const cols = '1.6fr 120px 100px 100px 100px 1.2fr';
+    const rowStyle = `display:grid;grid-template-columns:${cols};align-items:center`;
+
+    const header = `
+    <div style="${rowStyle};border-bottom:2px solid var(--border);padding:6px 0;
+                font-size:9px;letter-spacing:0.1em;color:var(--text-dim);">
+        <span style="padding:0 8px">CLIENT</span>
+        <span style="padding:0 8px">TYPE</span>
+        <span style="padding:0 8px">GRACE USED</span>
+        <span style="padding:0 8px">UPLOADED</span>
+        <span style="padding:0 8px">USED / LIMIT</span>
+        <span style="padding:0 8px">FILE</span>
+    </div>`;
+
+    const rows = events.map(e => {
+        // Coerce server numbers to safe integers before interpolating into HTML.
+        const graceUsed    = parseInt(e.grace_pages_used, 10) || 0;
+        const incomingPgs  = parseInt(e.incoming_pages,   10) || 0;
+        const usedBefore   = parseInt(e.used_before,      10) || 0;
+        const limitAtTime  = parseInt(e.limit_at_time,    10) || 0;
+
+        const ts      = e.event_ts ? new Date(e.event_ts).toLocaleString() : '—';
+        const isGrace = e.event_type === 'grace_used';
+        const typeBadge = isGrace
+            ? `<span style="background:rgba(229,192,123,0.15);color:var(--amber,#e5c07b);border:1px solid rgba(229,192,123,0.3);border-radius:2px;padding:2px 7px;font-size:9px;font-weight:600;letter-spacing:0.08em">GRACE</span>`
+            : `<span style="background:rgba(224,108,117,0.12);color:var(--red,#e06c75);border:1px solid rgba(224,108,117,0.25);border-radius:2px;padding:2px 7px;font-size:9px;font-weight:600;letter-spacing:0.08em">BLOCKED</span>`;
+        const graceCell = isGrace
+            ? `<span style="color:var(--amber,#e5c07b);font-weight:600">${graceUsed} pg</span>`
+            : `<span style="color:var(--text-dim)">—</span>`;
+        const fname = e.filename
+            ? `<span title="${escapeHtml(e.filename)}" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:9px;color:var(--text-dim)">${escapeHtml(e.filename)}</span>`
+            : `<span style="color:var(--text-dim)">—</span>`;
+
+        return `
+        <div style="${rowStyle};padding:8px 0;border-bottom:1px solid var(--border);transition:background .12s"
+             onmouseover="this.style.background='var(--bg2)'" onmouseout="this.style.background='transparent'">
+            <div style="padding:0 8px">
+                <div style="font-size:10px;font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+                     title="${escapeHtml(e.email || '')}">${escapeHtml(e.email || '—')}</div>
+                <div style="font-size:9px;color:var(--text-dim);margin-top:1px">${escapeHtml(ts)}</div>
+            </div>
+            <span style="padding:0 8px">${typeBadge}</span>
+            <span style="padding:0 8px;font-size:10px">${graceCell}</span>
+            <span style="padding:0 8px;font-size:10px;color:var(--text)">${incomingPgs} pg</span>
+            <span style="padding:0 8px;font-size:10px;color:var(--text-dim)">${usedBefore} / ${limitAtTime}</span>
+            <div style="padding:0 8px;overflow:hidden">${fname}</div>
+        </div>`;
+    }).join('');
+
+    el.innerHTML = `
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px">
+        ${statCard('Grace Events',       graceCount,      'var(--amber,#e5c07b)')}
+        ${statCard('Hard Blocks',        exceededCount,   'var(--red,#e06c75)')}
+        ${statCard('Clients Affected',   clientSet.size,  'var(--blue)')}
+        ${statCard('Total Grace Pages',  totalGracePages, 'var(--text)')}
+    </div>
+    <div style="border:1px solid var(--border);border-radius:4px;overflow:hidden">
+        ${header}
+        ${rows}
+    </div>`;
 }
 
 async function _smAdminDelete(smId, fieldKey, vendorName, clientEmail) {

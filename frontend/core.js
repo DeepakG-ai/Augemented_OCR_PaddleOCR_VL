@@ -262,16 +262,11 @@ async function router() {
         activeJobId = null;
     }
 
-    // Close config SSE when leaving the settings page
-    if (!route.startsWith('/settings') && typeof _stopConfigSSE === 'function') {
-        _stopConfigSSE();
-    }
-
     // Update nav active state
     document.querySelectorAll('.nav-tab').forEach(t => {
         t.classList.remove('active');
         const r = t.dataset.route;
-        if (r === '/admin/users' && route === '/admin/api-keys') t.classList.add('active');
+        if (r === '/admin/users' && (route === '/admin/api-keys' || route === '/admin/quota-events')) t.classList.add('active');
         else if (r && route.startsWith(r)) t.classList.add('active');
     });
 
@@ -317,16 +312,15 @@ async function router() {
         app.className = 'app';
         const vendorId = decodeURIComponent(route.split('/vendor-stats/')[1] || '');
         await renderVendorStatsPage(app, vendorId);
-    } else if (route === '/settings') {
-        app.className = 'app';
-        _stopConfigSSE();  // clean up any previous SSE before re-rendering
-        await renderSettingsPage(app);
     } else if (route === '/admin/users') {
         app.className = 'app';
         await renderAdminUsersPage(app);
     } else if (route === '/admin/api-keys') {
         app.className = 'app';
         await renderApiKeysPage(app);
+    } else if (route === '/admin/quota-events') {
+        app.className = 'app';
+        await renderAdminQuotaEventsPage(app);
     } else if (route === '/admin/corrections') {
         app.className = 'app';
         await renderAdminSpatialMemoryPage(app);
@@ -389,7 +383,6 @@ function headerHTML() {
             <a class="nav-tab" data-route="/history" href="#/history">History</a>
             <a class="nav-tab" data-route="/review" href="#/review">Review</a>
             <a class="nav-tab" data-route="/dashboard" href="#/dashboard">Dashboard</a>
-            <a class="nav-tab" data-route="/settings" href="#/settings">Settings</a>
             ${isAdmin ? `<a class="nav-tab" data-route="/admin/users" href="#/admin/users">Users</a>` : ''}
             ${isAdmin ? `<a class="nav-tab" data-route="/admin/corrections" href="#/admin/corrections">Saved Regions</a>` : ''}
         </nav>
@@ -412,7 +405,7 @@ function updateNavActive() {
         const r = t.dataset.route;
         if (r === '/vendors' && (route === '/' || route === '/vendors')) t.classList.add('active');
         else if (r === '/dashboard' && route.startsWith('/admin/client/')) t.classList.add('active');
-        else if (r === '/admin/users' && route === '/admin/api-keys') t.classList.add('active');
+        else if (r === '/admin/users' && (route === '/admin/api-keys' || route === '/admin/quota-events')) t.classList.add('active');
         else if (r && route.startsWith(r)) t.classList.add('active');
     });
 }

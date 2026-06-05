@@ -230,6 +230,7 @@ class WorkerFlowIntegrationTests(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(patch.object(worker.db_mod, "upsert_qwen_layout_boxes", new=AsyncMock(return_value=0)))
             stack.enter_context(patch.object(worker.db_mod, "get_spatial_memory_for_layout", new=AsyncMock(return_value=[])))
             stack.enter_context(patch.object(worker.db_mod, "get_pages", new=AsyncMock(side_effect=fake_get_pages)))
+            stack.enter_context(patch.object(worker.db_mod, "get_latest_job_for_extraction_type", new=AsyncMock(return_value=None)))
             stack.enter_context(patch.object(worker.db_mod, "is_postprocess_ready", new=AsyncMock(side_effect=fake_is_postprocess_ready)))
             stack.enter_context(patch.object(worker.db_mod, "save_ocr_data", new=AsyncMock(side_effect=fake_save_ocr_data)))
             stack.enter_context(patch.object(worker.db_mod, "update_extraction_result", new=AsyncMock(side_effect=fake_update_extraction_result)))

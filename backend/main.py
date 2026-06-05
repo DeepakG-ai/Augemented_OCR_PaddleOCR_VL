@@ -19,7 +19,7 @@ import traceback
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, timedelta
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -37,7 +37,7 @@ from . import db as db_mod
 from . import extractor
 from . import processor
 from . import page_logger
-from .contracts import build_purchase_order_contract
+from .contracts import attach_vendor, build_purchase_order_contract
 from . import logging_config as plog
 from .logging_config import configure_logging
 from .auth import (
@@ -84,9 +84,7 @@ from .models import (
     VendorOut,
 )
 from .object_store import ARTIFACTS_BUCKET, DOCUMENTS_BUCKET, get_store
-from .scheduler import compute_next_run
 from .mlflow_tracing import (
-    setup_mlflow,
     get_current_context,
     attach_context,
     detach_context,
@@ -103,6 +101,7 @@ from .mlflow_tracing import (
 )
 
 from .config import LLM_URL, LLM_MODEL, RATE_LIMIT_PER_MINUTE as RATE_LIMIT, MAX_UPLOAD_BYTES, MAX_DOCUMENT_PAGES
+from .config import CORS_ALLOW_ORIGINS
 from .config import DEFAULT_SUBSCRIPTION_LIMIT, SUBSCRIPTION_WARNING_THRESHOLD
 from .config import PIPELINE_LOG_DIR
 
@@ -119,19 +118,6 @@ try:
     )
 except (ImportError, AttributeError):
     _DB_CONNECTION_ERRORS = ()
-
-
-class ScheduleCreate(BaseModel):
-    cron_expr: str
-    timezone: str = "UTC"
-    label: str = ""
-
-
-class ScheduleUpdate(BaseModel):
-    cron_expr: str | None = None
-    timezone: str | None = None
-    label: str | None = None
-    enabled: bool | None = None
 
 
 # ── Centralized logging (replaces inline basicConfig) ───────────────
@@ -151,204 +137,6 @@ async def render_page_1_for_detection(file_bytes: bytes, filename: str) -> list[
             "Caller must invoke _require_pdf before reaching this function."
         )
     return await processor.pdf_to_images(file_bytes, max_pages=1)
-
-
-# -- Config SSE state -------------------------------------------------------
-# Per-user list of open SSE queues for live config-change push.
-_config_sse_queues: dict[str, list[asyncio.Queue]] = {}
-
-_CONFIG_KEYS = frozenset({"input_folder", "output_folder", "upload_mode", "success_folder", "failed_folder"})
-_VALID_UPLOAD_MODES = frozenset({"ui", "folder"})
-
-
-def _broadcast_config_event(user_id: str, data: dict) -> None:
-    for q in _config_sse_queues.get(user_id, []):
-        try:
-            q.put_nowait(data)
-        except asyncio.QueueFull:
-            pass
-
-
-def _folder_ingest_result(ok: bool, pdf_path: str, reason: str | None = None, **extra) -> dict:
-    result = {"ok": ok, "path": pdf_path}
-    if reason:
-        result["reason"] = reason
-    result.update(extra)
-    return result
-
-
-def _folder_ingest_error(user_id: str, pdf_path: str, reason: str, **extra) -> dict:
-    payload = {"type": "folder_ingest_error", "path": pdf_path, "reason": reason, **extra}
-    _broadcast_config_event(user_id, payload)
-    return _folder_ingest_result(False, pdf_path, reason, **extra)
-
-
-async def _folder_ingest_callback(user_id: str, pdf_path: str) -> dict:
-    """Called by the watchdog thread (via asyncio bridge) when a new PDF lands."""
-    # app is defined at module level after the routes section; access via the
-    # global name — safe because this only runs after startup.
-    pool = app.state.pool
-    store = app.state.store
-    try:
-        import pathlib
-        path = pathlib.Path(pdf_path)
-        if not path.is_file():
-            return _folder_ingest_result(False, pdf_path, "file_not_found")
-        file_bytes = path.read_bytes()
-        filename = path.name
-
-        # Hard page cap — same rule as /ingest/ui
-        if filename.lower().endswith(".pdf"):
-            try:
-                pdf_page_count = processor.count_pdf_pages(file_bytes)
-            except ValueError:
-                logger.warning("folder_ingest: unreadable PDF path=%s", pdf_path)
-                return _folder_ingest_error(user_id, pdf_path, "unreadable_pdf")
-            if pdf_page_count > MAX_DOCUMENT_PAGES:
-                logger.warning(
-                    "folder_ingest: PDF too large (%d pages, max %d) path=%s",
-                    pdf_page_count, MAX_DOCUMENT_PAGES, pdf_path,
-                )
-                return _folder_ingest_error(
-                    user_id,
-                    pdf_path,
-                    "document_too_large",
-                    pages=pdf_page_count,
-                    max_pages=MAX_DOCUMENT_PAGES,
-                )
-        else:
-            pdf_page_count = 1
-
-        # Quota reservation — atomic, same as /ingest/ui
-        try:
-            quota = await db_mod.reserve_quota(pool, user_id, pdf_page_count)
-        except Exception as exc:
-            logger.exception("folder_ingest: quota check failed user=%s path=%s", user_id, pdf_path)
-            return _folder_ingest_error(user_id, pdf_path, "quota_check_failed", error=str(exc))
-        if not quota["allowed"]:
-            logger.warning(
-                "folder_ingest: quota exceeded user=%s used=%d limit=%d incoming=%d",
-                user_id, quota["used"], quota["limit"], pdf_page_count,
-            )
-            return _folder_ingest_error(
-                user_id,
-                pdf_path,
-                "quota_exceeded",
-                used=quota["used"],
-                limit=quota["limit"],
-            )
-
-        # Lazy imports to avoid circular import at module load time.
-        from . import geometry as geo_mod
-        from . import vendor_detector as vd_mod
-        from . import ocr_runner as ocr_mod
-
-        _job_submitted = False
-        try:
-            # Render page 1 for vendor detection.
-            rendered = await render_page_1_for_detection(file_bytes, filename)
-            if not rendered:
-                logger.warning("folder_ingest: no pages rendered path=%s", pdf_path)
-                return _folder_ingest_error(user_id, pdf_path, "no_pages_rendered")
-            page1 = rendered[0]
-            page1_meta = {"page_number": 1, "width": page1.get("width", 0), "height": page1.get("height", 0)}
-            geo_pages = geo_mod.compute_pdf_geometry(file_bytes, [page1_meta])
-            page_words = (geo_pages[0].get("words", []) if geo_pages else [])
-            if not page_words:
-                ocr_pages = await ocr_mod.run_ocr_on_pages([{
-                    "page_number": 1,
-                    "image_b64": page1["image_b64"],
-                    "mime_type": page1.get("mime_type", "image/jpeg"),
-                }])
-                ocr_page = ocr_pages[0] if ocr_pages else {}
-                if ocr_page.get("_ocr_error"):
-                    return _folder_ingest_error(
-                        user_id,
-                        pdf_path,
-                        "ocr_failed",
-                        page=ocr_page.get("page_number", 1),
-                        error=ocr_page.get("_ocr_error"),
-                    )
-                page_words = ocr_page.get("words", [])
-
-            match = await vd_mod.detect_vendor(pool, page_words, user_id=user_id)
-            if match is None:
-                logger.warning("folder_ingest: vendor not detected path=%s user=%s", pdf_path, user_id)
-                return _folder_ingest_error(user_id, pdf_path, "vendor_not_detected")
-
-            tmpl = await db_mod.get_template(pool, match.vendor_id)
-            if not tmpl:
-                logger.warning("folder_ingest: no template for vendor=%s", match.vendor_id)
-                return _folder_ingest_error(user_id, pdf_path, "no_template", vendor_id=match.vendor_id)
-
-            # Whoever logins (owns the watcher), bill to them.
-            billing_user_id = user_id
-
-            result = await _submit_ingestion_job(
-                pool,
-                store,
-                file_bytes=file_bytes,
-                filename=filename,
-                vendor_id=match.vendor_id,
-                format_type=tmpl.get("format_type", "single_po_multipage"),
-                header_fields=list(tmpl.get("header_fields") or []),
-                line_item_fields=list(tmpl.get("line_item_fields") or []),
-                source_type="folder",
-                source_ref=pdf_path,
-                metadata={"billing_user_id": billing_user_id},
-                reserved_pages=pdf_page_count,
-            )
-            _job_submitted = True
-        finally:
-            if not _job_submitted:
-                try:
-                    await db_mod.release_quota_reservation(pool, user_id, pdf_page_count)
-                except Exception as exc:
-                    logger.warning(
-                        "folder_ingest: quota release failed user=%s path=%s pages=%s: %s",
-                        user_id,
-                        pdf_path,
-                        pdf_page_count,
-                        exc,
-                    )
-        _broadcast_config_event(user_id, {
-            "type": "folder_ingest_started",
-            "path": pdf_path,
-            "vendor_id": match.vendor_id,
-            "vendor_name": match.vendor_name,
-            "job_id": result["job"]["id"],
-            "extraction_id": result["extraction"]["id"],
-        })
-        logger.info(
-            "folder_ingest: queued path=%s vendor=%s job=%s",
-            pdf_path, match.vendor_id, result["job"]["id"],
-        )
-        return _folder_ingest_result(
-            True,
-            pdf_path,
-            vendor_id=match.vendor_id,
-            vendor_name=match.vendor_name,
-            job_id=result["job"]["id"],
-            extraction_id=result["extraction"]["id"],
-        )
-    except Exception as exc:
-        logger.exception("folder_ingest: unexpected error path=%s: %s", pdf_path, exc)
-        return _folder_ingest_error(user_id, pdf_path, "ingest_error", error=str(exc))
-
-
-async def _reconfigure_user_watcher(app_ref, user_id: str) -> None:
-    """Start or stop the folder watcher for a user based on their current config."""
-    watcher_mgr = getattr(app_ref.state, "watcher_mgr", None)
-    if watcher_mgr is None:
-        return
-    config = await db_mod.get_user_config(app_ref.state.pool, user_id)
-    upload_mode = config.get("upload_mode", "ui")
-    input_folder = config.get("input_folder", "")
-    if upload_mode == "folder" and input_folder:
-        loop = asyncio.get_event_loop()
-        watcher_mgr.start_for_user(user_id, input_folder, _folder_ingest_callback, loop)
-    else:
-        watcher_mgr.stop_for_user(user_id)
 
 
 # -- Rate limiter -----------------------------------------------------------
@@ -412,7 +200,6 @@ async def lifespan(app: FastAPI):
     app.state.pool = await db_mod.create_pool()
     await db_mod.init(app.state.pool)
     app.state.store = get_store()
-    setup_mlflow()
 
     # Bootstrap admin user from env vars on first startup
     admin_email = (os.getenv("ADMIN_EMAIL") or "").strip()
@@ -437,15 +224,11 @@ async def lifespan(app: FastAPI):
                 except Exception as exc:
                     logger.warning("Failed to bootstrap admin user %s: %s", admin_email, exc)
 
-    # Folder watchers are disabled — the client agent handles folder scanning
-    app.state.watcher_mgr = None
-
-    # Suppress uvicorn access log noise for high-frequency polling routes
-    # (heartbeat, config-poll, scheduler-poll). Errors/warnings still surface.
+    # Suppress uvicorn access log noise for the health check route.
     import logging as _logging
 
     class _QuietPaths(_logging.Filter):
-        _SKIP = ("/api/client/heartbeat", "/api/config", "/api/scheduler", "/health")
+        _SKIP = ("/health",)
         def filter(self, record: _logging.LogRecord) -> bool:
             msg = record.getMessage()
             return not any(p in msg for p in self._SKIP)
@@ -458,8 +241,6 @@ async def lifespan(app: FastAPI):
     logger.info("DB pool, object store, and MLflow ready")
     yield
     logger.info("Shutting down -- closing connections")
-    if getattr(app.state, "watcher_mgr", None):
-        app.state.watcher_mgr.stop_all()
     await app.state.pool.close()
     from .logging_config import shutdown_logging
     shutdown_logging()
@@ -516,8 +297,8 @@ async def _submit_ingestion_job(
     *,
     file_bytes: bytes,
     filename: str,
-    vendor_id: str,
-    format_type: str,
+    vendor_id: str | None,
+    format_type: str | None,
     header_fields: list[str],
     line_item_fields: list[str],
     source_type: str,
@@ -526,28 +307,37 @@ async def _submit_ingestion_job(
     trace_context: dict | None = None,
     reserved_pages: int | None = None,
 ) -> dict:
-    tmpl = await db_mod.get_template(pool, vendor_id)
-    if not tmpl:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "reason": "no_template",
-                "vendor_id": vendor_id,
-                "hint": "Create a template with at least one field for this vendor before extracting.",
-            },
-        )
-    all_tmpl_fields = list(tmpl.get("header_fields") or []) + list(tmpl.get("line_item_fields") or [])
-    if not all_tmpl_fields:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "reason": "no_fields",
-                "vendor_id": vendor_id,
-                "hint": "The template for this vendor has no fields. Add at least one header or line item field before extracting.",
-            },
-        )
+    # When vendor_id is None the document is submitted for auto-detection: the
+    # normalize worker detects the vendor and fills in template/format/fields
+    # (see worker._process_normalize → db.update_extraction_vendor). Template
+    # validation only applies when the caller pre-selected a vendor.
+    template_id: int | None = None
+    resolved_format_type = format_type
+    if vendor_id:
+        tmpl = await db_mod.get_template(pool, vendor_id)
+        if not tmpl:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "reason": "no_template",
+                    "vendor_id": vendor_id,
+                    "hint": "Create a template with at least one field for this vendor before extracting.",
+                },
+            )
+        all_tmpl_fields = list(tmpl.get("header_fields") or []) + list(tmpl.get("line_item_fields") or [])
+        if not all_tmpl_fields:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "reason": "no_fields",
+                    "vendor_id": vendor_id,
+                    "hint": "The template for this vendor has no fields. Add at least one header or line item field before extracting.",
+                },
+            )
+        template_id = tmpl["id"]
+        resolved_format_type = format_type or tmpl["format_type"]
 
-    object_key = f"documents/{vendor_id}/{uuid4().hex}_{filename}"
+    object_key = f"documents/{vendor_id or '_pending'}/{uuid4().hex}_{filename}"
     mime_type = _guess_mime_type(filename)
     store.put_bytes(DOCUMENTS_BUCKET, object_key, file_bytes, mime_type)
     document_metadata = dict(metadata or {})
@@ -568,8 +358,6 @@ async def _submit_ingestion_job(
         metadata=document_metadata,
     )
 
-    template_id = tmpl["id"]
-    resolved_format_type = format_type or tmpl["format_type"]
     extraction = await db_mod.create_extraction(
         pool,
         vendor_id=vendor_id,
@@ -582,12 +370,12 @@ async def _submit_ingestion_job(
         document_id=document["id"],
     )
 
-    # If caller didn't provide a trace context (e.g. /ingest, folder-watcher),
-    # create a root span here so all 4 pipeline stages share one MLflow trace.
+    # If caller didn't provide a trace context (e.g. /ingest), create a root
+    # span here so all 4 pipeline stages share one MLflow trace.
     if not trace_context:
         with trace_extraction_root(
-            extraction["id"], vendor_id, filename, 0,
-            resolved_format_type, header_fields, line_item_fields,
+            extraction["id"], vendor_id or "", filename, 0,
+            resolved_format_type or "", header_fields, line_item_fields,
         ):
             trace_context = current_trace_context()
 
@@ -629,9 +417,7 @@ def _peek_user(request: Request) -> str:
         return "-"
 
 
-_QUIET_PATHS = frozenset({
-    "/api/client/heartbeat", "/api/config", "/api/scheduler", "/health",
-})
+_QUIET_PATHS = frozenset({"/health"})
 
 
 class AccessLogMiddleware(BaseHTTPMiddleware):
@@ -688,14 +474,7 @@ app.state.limiter = limiter
 app.add_middleware(MaxUploadSizeMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:3002",
-        "http://localhost:8000",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:3002",
-        "http://127.0.0.1:8000",
-    ],
+    allow_origins=CORS_ALLOW_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -742,6 +521,75 @@ def _error_body(status: int, detail) -> dict:
             "message": str(detail),
         }
     return {"error": error}
+
+
+_LLM_UNAVAILABLE_MARKERS = (
+    "all connection attempts failed",
+    "connection refused",
+    "connect error",
+    "failed to establish a new connection",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "network is unreachable",
+    "connection reset",
+    "timed out",
+    "timeout",
+)
+
+
+def _collect_extraction_errors(result: Any, page_results: Any) -> list[str]:
+    errors: list[str] = []
+    if isinstance(result, dict):
+        raw_errors = result.get("errors")
+        if isinstance(raw_errors, list):
+            errors.extend(str(err) for err in raw_errors if err)
+        elif raw_errors:
+            errors.append(str(raw_errors))
+        for key in ("_error", "error"):
+            if result.get(key):
+                errors.append(str(result[key]))
+    if isinstance(page_results, list):
+        for page_result in page_results:
+            if isinstance(page_result, dict) and page_result.get("_error"):
+                errors.append(str(page_result["_error"]))
+    return list(dict.fromkeys(errors))
+
+
+def _all_pages_failed(result: Any, page_results: Any) -> bool:
+    if isinstance(result, dict) and result.get("_all_pages_failed"):
+        return True
+    if isinstance(page_results, list) and page_results:
+        return all(isinstance(page_result, dict) and "_error" in page_result for page_result in page_results)
+    return False
+
+
+def _llm_unavailable(errors: list[str]) -> bool:
+    text = " ".join(errors).lower()
+    return any(marker in text for marker in _LLM_UNAVAILABLE_MARKERS)
+
+
+def _raise_for_terminal_extraction_error(extraction: dict, result: Any, extraction_id: int) -> None:
+    """Convert persisted LLM failure sentinels into HTTP errors for sync API clients."""
+    page_results = extraction.get("page_results")
+    errors = _collect_extraction_errors(result, page_results)
+    llm_failed = extraction.get("error") == "llm_failed"
+    if not llm_failed and not _all_pages_failed(result, page_results):
+        return
+
+    unavailable = _llm_unavailable(errors)
+    raise HTTPException(
+        status_code=503 if unavailable else 500,
+        detail={
+            "code": "LLM_UNAVAILABLE" if unavailable else "EXTRACTION_FAILED",
+            "message": (
+                "LLM service is unavailable. Make sure llama-server is running on port 8056 and retry."
+                if unavailable
+                else "Extraction failed during LLM processing."
+            ),
+            "extraction_id": extraction_id,
+            "errors": errors[:5],
+        },
+    )
 
 
 @app.exception_handler(HTTPException)
@@ -1979,6 +1827,7 @@ async def save_template(
                     pool, vendor_id, tmpl["id"],
                     new_header_map, new_line_map,
                     new_header, new_line, notices,
+                    schema_id=existing_map.get("schema_id"),
                 )
                 if header_renames or line_renames:
                     logger.info(
@@ -1996,102 +1845,6 @@ async def save_template(
     except Exception:
         logger.error("Template save FAILED vendor=%s:\n%s", vendor_id, traceback.format_exc())
         raise
-
-
-# -- Output Schemas ---------------------------------------------------------
-
-@app.get("/schemas")
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def list_schemas(request: Request, user: dict = Depends(get_current_user)):
-    """List all output schemas (any authenticated user — needed for mapper dropdown)."""
-    schemas = await db_mod.get_all_schemas(request.app.state.pool)
-    return schemas
-
-
-@app.post("/schemas")
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def create_schema(
-    request: Request,
-    body: dict = Body(...),
-    user: dict = Depends(require_admin),
-):
-    """Create a new output schema (admin only)."""
-    name = (body.get("name") or "").strip()
-    header_fields = body.get("header_fields") or []
-    line_fields = body.get("line_fields") or []
-    if not name:
-        raise HTTPException(400, detail="name is required")
-    if not isinstance(header_fields, list) or not isinstance(line_fields, list):
-        raise HTTPException(400, detail="header_fields and line_fields must be arrays")
-    try:
-        schema = await db_mod.create_schema(
-            request.app.state.pool,
-            name=name,
-            header_fields=[str(f) for f in header_fields],
-            line_fields=[str(f) for f in line_fields],
-        )
-    except Exception as exc:
-        raise HTTPException(400, detail=str(exc))
-    return schema
-
-
-@app.put("/schemas/{schema_id}")
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def update_schema(
-    request: Request,
-    schema_id: int,
-    body: dict = Body(...),
-    user: dict = Depends(require_admin),
-):
-    """Edit a schema's name and fields; commits a new snapshot (admin only)."""
-    name = (body.get("name") or "").strip()
-    header_fields = body.get("header_fields") or []
-    line_fields = body.get("line_fields") or []
-    if not name:
-        raise HTTPException(400, detail="name is required")
-    if not isinstance(header_fields, list) or not isinstance(line_fields, list):
-        raise HTTPException(400, detail="header_fields and line_fields must be arrays")
-    try:
-        schema = await db_mod.update_schema(
-            request.app.state.pool,
-            schema_id,
-            name=name,
-            header_fields=[str(f) for f in header_fields],
-            line_fields=[str(f) for f in line_fields],
-        )
-    except ValueError as exc:
-        raise HTTPException(404, detail=str(exc))
-    return schema
-
-
-@app.delete("/schemas/{schema_id}")
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def delete_schema(
-    request: Request,
-    schema_id: int,
-    user: dict = Depends(require_admin),
-):
-    """Delete a non-system schema (admin only)."""
-    try:
-        await db_mod.delete_schema(request.app.state.pool, schema_id)
-    except ValueError as exc:
-        raise HTTPException(400, detail=str(exc))
-    return {"status": "ok"}
-
-
-@app.post("/schemas/{schema_id}/reset")
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def reset_schema(
-    request: Request,
-    schema_id: int,
-    user: dict = Depends(require_admin),
-):
-    """Restore a schema's fields from the last-saved snapshot (admin only)."""
-    try:
-        schema = await db_mod.reset_schema(request.app.state.pool, schema_id)
-    except ValueError as exc:
-        raise HTTPException(404, detail=str(exc))
-    return schema
 
 
 # -- ERP Field Mapping -----------------------------------------------------
@@ -2309,7 +2062,12 @@ async def resume_extraction(request: Request, extraction_id: int):
 
 # -- Durable Job APIs -------------------------------------------------------
 
-@app.post("/ingest/{source_type}", response_model=ExtractionJobStartOut)
+@app.post(
+    "/ingest/{source_type}",
+    response_model=ExtractionJobStartOut,
+    status_code=201,
+    response_model_exclude_none=True,
+)
 @limiter.limit("10/minute")
 async def ingest_document(
     request: Request,
@@ -2335,13 +2093,6 @@ async def ingest_document(
 
     pool = request.app.state.pool
 
-    # Active schedules are allowed to wait quietly. Block manual UI uploads only
-    # while the desktop agent has explicitly marked a due schedule as running.
-    if source_type == "ui" and await db_mod.get_user_is_executing(pool, user["id"]):
-        raise HTTPException(
-            409,
-            detail="Scheduler is currently running. Please wait for it to finish before uploading manually.",
-        )
 
     # If caller pre-selected a vendor, enforce ownership before doing any work.
     if vendor_id:
@@ -2349,7 +2100,6 @@ async def ingest_document(
     file_bytes = await file.read()
     filename = file.filename or "unknown"
     _require_pdf(filename, file_bytes)
-    detected_vendor = None
     try:
         req_header = json.loads(header_fields) if header_fields else []
         req_items = json.loads(line_item_fields) if line_item_fields else []
@@ -2397,6 +2147,16 @@ async def ingest_document(
                 alert_type="exceeded",
                 filename=filename,
             )
+            await db_mod.insert_quota_grace_event(
+                pool,
+                user_id=user["id"],
+                event_type="exceeded",
+                grace_pages_used=0,
+                incoming_pages=incoming_pages,
+                used_before=quota["used"],
+                limit_at_time=quota["limit"],
+                filename=filename,
+            )
             overage = max(quota["used"] - quota["limit"], 0)
             raise HTTPException(
                 status_code=402,
@@ -2419,24 +2179,44 @@ async def ingest_document(
         u_pct = quota["used"] / max(quota["limit"], 1)
         if quota["reason"] == "grace":
             _user_record = await db_mod.get_user_by_id(pool, user["id"])
+            _user_email = (_user_record or {}).get("email")
+            grace_pages_used = quota.get("grace_pages_used", 0)
             page_logger.log_limit_alert(
                 user_id=user["id"],
-                email=(_user_record or {}).get("email"),
+                email=_user_email,
                 total_extracted_pages=quota["used"],
                 subscription_limit=quota["limit"],
                 alert_type="small_overage",
+                filename=filename,
+                grace_pages_used=grace_pages_used,
+            )
+            logger.warning(
+                "QUOTA_GRACE: user=%s email=%s limit=%d used=%d incoming=%d grace_pages_used=%d file=%s",
+                user["id"], _user_email, quota["limit"], quota["used"],
+                incoming_pages, grace_pages_used, filename,
+            )
+            await db_mod.insert_quota_grace_event(
+                pool,
+                user_id=user["id"],
+                event_type="grace_used",
+                grace_pages_used=grace_pages_used,
+                incoming_pages=incoming_pages,
+                used_before=quota["used"],
+                limit_at_time=quota["limit"],
                 filename=filename,
             )
             usage_warning = {
                 "level": "warning",
                 "message": (
                     f"This upload ({incoming_pages} pages) slightly exceeds your remaining "
-                    f"quota ({quota['remaining']} pages). It has been allowed as a small overage."
+                    f"quota ({quota['remaining']} pages). It has been allowed as a small overage "
+                    f"({grace_pages_used} grace page{'s' if grace_pages_used != 1 else ''} used)."
                 ),
                 "subscription_limit": quota["limit"],
                 "total_extracted_pages": quota["used"],
                 "incoming_pages": incoming_pages,
                 "remaining": quota["remaining"],
+                "grace_pages_used": grace_pages_used,
             }
         elif u_pct >= SUBSCRIPTION_WARNING_THRESHOLD:
             _user_record = await db_mod.get_user_by_id(pool, user["id"])
@@ -2476,240 +2256,54 @@ async def ingest_document(
     logger.info("File received: %s (%d bytes, source=%s, vendor=%s)",
                 filename, len(file_bytes), source_type, vendor_id)
 
-    with trace_extraction_pipeline(
-        0,
-        vendor_id or "auto_detect",
-        filename,
-        0,
-        format_type or "template_default",
-        req_header,
-        req_items,
-    ) as pipeline:
-        trace_context = current_trace_context()
+    # Vendor detection used to run synchronously HERE (render page 1 → geometry
+    # → PaddleOCR fallback → match). It now happens inside the normalize worker
+    # so uploads return fast and don't depend on the OCR service being up. When
+    # vendor_id is None the document is submitted for auto-detection; an unknown
+    # vendor surfaces later as extraction status=failed / error=unknown_vendor
+    # over the SSE stream (no synchronous 409 anymore).
+    billing_user_id = user["id"]
+    # Scope auto-detection to one client's vendors/aliases to avoid cross-tenant
+    # collisions. Admins may act as a specific client; everyone else is scoped to
+    # themselves. The worker reads metadata.detect_user_id directly.
+    detect_user_id = user["id"]
+    if user.get("role") == "admin" and act_as_client_id:
+        detect_user_id = act_as_client_id
+    ingest_metadata = {
+        "billing_user_id": billing_user_id,
+        "detect_user_id": detect_user_id,
+    }
 
-        with trace_named_step(
-            "vendor_detection",
-            input_data={"filename": filename, "preselected_vendor_id": vendor_id},
-        ) as vendor_trace:
-            # If vendor_id not provided, detect from page-1 text
-            if not vendor_id:
-                from . import geometry as _geo
-                from . import vendor_detector as _vd
-                from . import ocr_runner as _ocr
-
-                # Render page 1 only for detection
-                try:
-                    with plog.timed("render_p1") as t:
-                        rendered = await render_page_1_for_detection(file_bytes, filename)
-                except HTTPException:
-                    await _release_reserved_quota_once()
-                    raise
-                except Exception as exc:
-                    await _release_reserved_quota_once()
-                    logger.warning("Vendor detection render failed for %s: %s", filename, exc)
-                    raise HTTPException(
-                        status_code=400,
-                        detail={
-                            "code": "PDF_RENDER_FAILED",
-                            "message": "Could not render the first page for vendor detection.",
-                        },
-                    ) from exc
-                logger.info("Rendered page-1 for vendor detection (%d pages, %.0fms)", len(rendered), t["ms"])
-
-                if not rendered:
-                    logger.warning("Vendor detection failed: no rendered pages")
-                    await _release_reserved_quota_once()
-                    raise HTTPException(400, detail="Could not render any pages from the uploaded file")
-
-                page1 = rendered[0]
-                page1_meta = {"page_number": 1, "width": page1.get("width", 0), "height": page1.get("height", 0)}
-
-                # Digital-first text extraction
-                if filename.lower().endswith(".pdf"):
-                    try:
-                        with plog.timed("geometry_p1") as t:
-                            geo_pages = _geo.compute_pdf_geometry(file_bytes, [page1_meta])
-                            geo_page = geo_pages[0] if geo_pages else {}
-                        logger.info("Page-1 text: source=%s, %d chars, %d words (%.0fms)",
-                                    geo_page.get("source"), geo_page.get("char_count", 0),
-                                    len(geo_page.get("words", []) or []), t["ms"])
-                        page_words = geo_pages[0].get("words", []) if geo_pages else []
-                        page_source = (geo_pages[0].get("source") if geo_pages else None) or "paddleocr"
-                    except Exception as exc:
-                        logger.warning(
-                            "Page-1 PDF geometry failed for %s: %s; falling back to PaddleOCR",
-                            filename, exc,
-                        )
-                        page_words = []
-                        page_source = "paddleocr"
-                else:
-                    page_words = []
-                    page_source = "paddleocr"
-
-                # Scanned fallback if needed
-                if not page_words:
-                    logger.info("Page-1 has no digital text — falling back to PaddleOCR")
-                    try:
-                        with plog.timed("paddleocr_p1") as t:
-                            ocr_pages = await _ocr.run_ocr_on_pages([{
-                                "page_number": 1,
-                                "image_b64": page1["image_b64"],
-                                "mime_type": page1.get("mime_type", "image/jpeg"),
-                            }])
-                            if ocr_pages:
-                                page_words = ocr_pages[0].get("words", [])
-                    except Exception as exc:
-                        await _release_reserved_quota_once()
-                        logger.warning("Page-1 PaddleOCR failed for %s: %s", filename, exc)
-                        raise HTTPException(
-                            status_code=503,
-                            detail={
-                                "code": "OCR_UNAVAILABLE",
-                                "message": "PaddleOCR failed during vendor detection. Please retry.",
-                            },
-                        ) from exc
-                    logger.info("PaddleOCR fallback: %d words (%.0fms)", len(page_words), t["ms"])
-                    page_source = "paddleocr"
-
-                # Vendor detection is ALWAYS scoped to a specific client.
-                # • For regular clients: always their own user_id.
-                # • For admin: use act_as_client_id if supplied (chosen via UI
-                #   dropdown); fall back to admin's own user_id.
-                # We never pass None (global) to avoid cross-tenant collisions
-                # where two clients both have a vendor named e.g. "Aegis".
-                if user.get("role") == "admin":
-                    _detect_uid = act_as_client_id if act_as_client_id else user["id"]
-                    if not act_as_client_id:
-                        logger.info(
-                            "[VendorDetect] Admin upload with no act_as_client_id — "
-                            "scoping to admin's own vendors (user_id=%s)",
-                            user["id"],
-                        )
-                    else:
-                        logger.info(
-                            "[VendorDetect] Admin acting as client user_id=%s for vendor detection",
-                            _detect_uid,
-                        )
-                else:
-                    _detect_uid = user["id"]
-                try:
-                    with plog.timed("vendor_match") as t:
-                        match = await _vd.detect_vendor(pool, page_words, user_id=_detect_uid)
-                except Exception as exc:
-                    await _release_reserved_quota_once()
-                    logger.warning("Vendor detection failed for %s: %s", filename, exc)
-                    raise HTTPException(
-                        status_code=503,
-                        detail={
-                            "code": "VENDOR_DETECTION_UNAVAILABLE",
-                            "message": "Vendor detection failed. Please retry.",
-                        },
-                    ) from exc
-                if match:
-                    logger.info("Vendor matched: %s (id=%s, score=%.2f, %.0fms)",
-                                match.vendor_name, match.vendor_id, match.score, t["ms"])
-                if match is None:
-                    vendor_trace["output"] = {
-                        "detected": False,
-                        "reason": "unknown_vendor",
-                        "page_source": page_source,
-                        "word_count": len(page_words),
-                    }
-                    logger.warning("Unknown vendor blocked for %s (%d words)", filename, len(page_words))
-                    page_logger.append_log({
-                        "extraction_id": None,
-                        "filename": filename,
-                        "vendor_id": None,
-                        "total_pages": None,
-                        "billable_pages": 0,
-                        "qwen_extracted_pages": 0,
-                        "qwen_failed_pages": 0,
-                        "qwen_skipped_pages": 0,
-                        "duration_ms": None,
-                        "status": "blocked_unknown_vendor",
-                        "errors": None,
-                    })
-                    await _release_reserved_quota_once()
-                    raise HTTPException(
-                        status_code=409,
-                        detail={
-                            "reason": "unknown_vendor",
-                            "hint": "Create the vendor and vendor id first, then retry this document.",
-                            "word_count": len(page_words),
-                        },
-                    )
-                vendor_id = match.vendor_id
-                # Enforce ownership on the detected vendor — clients can't
-                # ingest into a vendor they don't own, even if the document
-                # text matches that vendor's aliases.
-                try:
-                    await assert_vendor_access(pool, vendor_id, user)
-                except Exception:
-                    await _release_reserved_quota_once()
-                    raise
-                detected_vendor = {
-                    "vendor_id": match.vendor_id,
-                    "vendor_name": match.vendor_name,
-                    "score": match.score,
-                    "match_type": getattr(match, "match_type", "unknown"),
-                    "matched_patterns": match.matched_patterns,
-                }
-                vendor_trace["output"] = {
-                    "detected": True,
-                    "page_source": page_source,
-                    "word_count": len(page_words),
-                    **detected_vendor,
-                }
-            else:
-                vendor_trace["output"] = {"mode": "preselected", "vendor_id": vendor_id}
-
-        # Whoever logins, bill to them.
-        billing_user_id = user["id"]
-
-        try:
-            submitted = await _submit_ingestion_job(
-                pool,
-                request.app.state.store,
-                file_bytes=file_bytes,
-                filename=filename,
-                vendor_id=vendor_id,
-                format_type=format_type,
-                header_fields=req_header,
-                line_item_fields=req_items,
-                source_type=source_type,
-                source_ref=source_ref,
-                trace_context=trace_context,
-                metadata={"billing_user_id": billing_user_id} if billing_user_id else None,
-                reserved_pages=incoming_pages if user.get("role") != "admin" else None,
-            )
-        except Exception:
-            await _release_reserved_quota_once()
-            raise
-        resp = ExtractionJobStartOut(
-            job_id=submitted["job"]["id"],
-            extraction_id=submitted["extraction"]["id"],
-            status=submitted["job"]["status"],
+    try:
+        submitted = await _submit_ingestion_job(
+            pool,
+            request.app.state.store,
+            file_bytes=file_bytes,
+            filename=filename,
+            vendor_id=vendor_id,
+            format_type=format_type,
+            header_fields=req_header,
+            line_item_fields=req_items,
+            source_type=source_type,
+            source_ref=source_ref,
+            metadata=ingest_metadata,
+            reserved_pages=incoming_pages if user.get("role") != "admin" else None,
         )
-        # Include detection result in response if auto-detected
-        result = resp.model_dump() if hasattr(resp, "model_dump") else resp.dict()
-        if detected_vendor:
-            result["detected_vendor"] = detected_vendor
-        if usage_warning:
-            result["usage_warning"] = usage_warning
-        pipeline["status"] = "queued"
-        pipeline["extraction_id"] = submitted["extraction"]["id"]
-        pipeline["document_id"] = submitted["extraction"].get("document_id")
-        pipeline["job_id"] = submitted["job"]["id"]
-        pipeline["vendor_id"] = vendor_id
-        pipeline["result"] = {
-            "extraction_id": submitted["extraction"]["id"],
-            "job_id": submitted["job"]["id"],
-            "vendor_id": vendor_id,
-            "vendor_name": (detected_vendor or {}).get("vendor_name"),
-        }
-        logger.info("Ingestion job created: ext=%s vendor=%s file=%s",
-                    submitted["extraction"]["id"], vendor_id, filename)
-        return result
+    except Exception:
+        await _release_reserved_quota_once()
+        raise
+
+    resp = ExtractionJobStartOut(
+        job_id=submitted["job"]["id"],
+        extraction_id=submitted["extraction"]["id"],
+        status=submitted["job"]["status"],
+    )
+    result = resp.model_dump() if hasattr(resp, "model_dump") else resp.dict()
+    if usage_warning:
+        result["usage_warning"] = usage_warning
+    logger.info("Ingestion job created: ext=%s vendor=%s file=%s",
+                submitted["extraction"]["id"], vendor_id or "auto-detect", filename)
+    return result
 
 
 @app.get("/jobs/{job_id}", response_model=JobStatusOut)
@@ -2934,6 +2528,16 @@ async def queue_resume_extraction(
                 alert_type="exceeded",
                 filename=extraction.get("filename"),
             )
+            await db_mod.insert_quota_grace_event(
+                pool,
+                user_id=user["id"],
+                event_type="exceeded",
+                grace_pages_used=0,
+                incoming_pages=incoming_pages,
+                used_before=quota["used"],
+                limit_at_time=quota["limit"],
+                filename=extraction.get("filename"),
+            )
             overage = max(quota["used"] - quota["limit"], 0)
             raise HTTPException(
                 status_code=402,
@@ -2950,6 +2554,34 @@ async def queue_resume_extraction(
                     "remaining": quota["remaining"],
                     "overage": overage,
                 },
+            )
+        if quota["reason"] == "grace":
+            _user_record = await db_mod.get_user_by_id(pool, user["id"])
+            _user_email = (_user_record or {}).get("email")
+            _grace_used = quota.get("grace_pages_used", 0)
+            page_logger.log_limit_alert(
+                user_id=user["id"],
+                email=_user_email,
+                total_extracted_pages=quota["used"],
+                subscription_limit=quota["limit"],
+                alert_type="small_overage",
+                filename=extraction.get("filename"),
+                grace_pages_used=_grace_used,
+            )
+            logger.warning(
+                "QUOTA_GRACE (resume): user=%s email=%s limit=%d used=%d incoming=%d grace_pages_used=%d",
+                user["id"], _user_email, quota["limit"], quota["used"],
+                incoming_pages, _grace_used,
+            )
+            await db_mod.insert_quota_grace_event(
+                pool,
+                user_id=user["id"],
+                event_type="grace_used",
+                grace_pages_used=_grace_used,
+                incoming_pages=incoming_pages,
+                used_before=quota["used"],
+                limit_at_time=quota["limit"],
+                filename=extraction.get("filename"),
             )
         quota_reserved = True
 
@@ -3018,6 +2650,11 @@ async def get_extraction(
     if not row:
         raise HTTPException(404, detail="Extraction not found")
 
+    _vendor_name = row.get("vendor_name")
+    if row.get("result") is not None:
+        row["result"] = attach_vendor(row["result"], _vendor_name)
+    if row.get("corrected_result") is not None:
+        row["corrected_result"] = attach_vendor(row["corrected_result"], _vendor_name)
     return ExtractionOut(**row)
 
 
@@ -3178,6 +2815,32 @@ async def upload_preview(
 
 # -- Review: OCR Data for Click-to-Select -----------------------------------
 
+REVIEW_UNAVAILABLE_OCR_FAILED = "REVIEW_UNAVAILABLE_OCR_FAILED"
+REVIEW_UNAVAILABLE_OCR_MESSAGE = (
+    "OCR failed for this extraction. Drag/drop review, bounding boxes, and spatial memory are unavailable."
+)
+
+
+def _has_field_locations(value) -> bool:
+    if isinstance(value, list):
+        return any(bool(item) for item in value if isinstance(item, dict))
+    return bool(value)
+
+
+async def _raise_if_ocr_review_unavailable(pool, extraction_id: int) -> None:
+    latest_ocr_job = await db_mod.get_latest_job_for_extraction_type(pool, extraction_id, "ocr")
+    if latest_ocr_job and latest_ocr_job.get("status") == "failed":
+        raise HTTPException(
+            409,
+            detail={
+                "code": REVIEW_UNAVAILABLE_OCR_FAILED,
+                "message": REVIEW_UNAVAILABLE_OCR_MESSAGE,
+                "extraction_id": extraction_id,
+                "ocr_error": latest_ocr_job.get("error"),
+            },
+        )
+
+
 @app.get("/extractions/{extraction_id}/ocr")
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def get_extraction_ocr(
@@ -3188,6 +2851,7 @@ async def get_extraction_ocr(
     await assert_extraction_access(pool, extraction_id, user)
     ocr_data = await db_mod.get_ocr_data(pool, extraction_id)
     if ocr_data is None:
+        await _raise_if_ocr_review_unavailable(pool, extraction_id)
         raise HTTPException(404, detail="No OCR data found for this extraction")
     return {"extraction_id": extraction_id, "ocr_pages": ocr_data}
 
@@ -3210,6 +2874,8 @@ async def get_extraction_geometry(
         raise HTTPException(404, detail="No pages found for this extraction")
 
     ocr_data = await db_mod.get_ocr_data(pool, extraction_id)
+    if ocr_data is None:
+        await _raise_if_ocr_review_unavailable(pool, extraction_id)
     ocr_by_page = {
         entry.get("page_number"): entry
         for entry in (ocr_data or [])
@@ -3331,6 +2997,8 @@ async def save_extraction_corrections(
     extraction = await db_mod.get_extraction(pool, extraction_id)
     if not extraction:
         raise HTTPException(404, detail=f"Extraction {extraction_id} not found")
+    if _has_field_locations(field_locations) and not extraction.get("ocr_data"):
+        await _raise_if_ocr_review_unavailable(pool, extraction_id)
 
     original_result = extraction.get("result") or {}
     base = {
@@ -3539,6 +3207,32 @@ async def delete_spatial_memory_entry(
         "field_key": entry.get("field_key"),
         "gold_correction_fields_deleted": gold_deleted,
     }
+
+
+@app.get("/admin/quota-events")
+@limiter.limit(f"{RATE_LIMIT}/minute")
+async def admin_list_quota_events(
+    request: Request,
+    limit: int = 100,
+    _user: dict = Depends(require_admin),
+):
+    """Return recent quota grace/exceeded events for admin monitoring."""
+    pool = request.app.state.pool
+    events = await db_mod.get_admin_quota_events(pool, limit=min(limit, 500))
+    out = []
+    for e in events:
+        out.append({
+            "id": e["id"],
+            "event_ts": e["event_ts"].isoformat() if e["event_ts"] else None,
+            "event_type": e["event_type"],
+            "email": e["email"],
+            "grace_pages_used": e["grace_pages_used"],
+            "incoming_pages": e["incoming_pages"],
+            "used_before": e["used_before"],
+            "limit_at_time": e["limit_at_time"],
+            "filename": e["filename"],
+        })
+    return out
 
 
 @app.get("/admin/spatial-memory")
@@ -3890,193 +3584,6 @@ async def get_extraction_contract(
     return build_purchase_order_contract(extraction)
 
 
-# -- Config API -------------------------------------------------------------
-
-@app.get("/api/config")
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def get_my_config(request: Request, user: dict = Depends(get_current_user)):
-    """Return the calling user's runtime configuration."""
-    config = await db_mod.get_user_config(request.app.state.pool, user["id"])
-    watcher_mgr = getattr(request.app.state, "watcher_mgr", None)
-
-    client_online = False
-    heartbeat_str = config.get("last_client_heartbeat")
-    if heartbeat_str:
-        try:
-            last_beat = datetime.fromisoformat(heartbeat_str)
-            client_online = (datetime.now(UTC) - last_beat).total_seconds() < 60
-        except Exception:
-            pass
-
-    return {
-        "user_id": user["id"],
-        "config": config,
-        "watcher_active": watcher_mgr.is_active(user["id"]) if watcher_mgr else False,
-        "client_online": client_online,
-    }
-
-
-@app.post("/api/client/heartbeat")
-@limiter.limit("10/minute")
-async def client_heartbeat(request: Request, user: dict = Depends(get_current_user)):
-    """Client exe calls this every 30 s so the UI can show ACTIVE / INACTIVE."""
-    await db_mod.set_user_config(
-        request.app.state.pool,
-        user["id"],
-        {"last_client_heartbeat": datetime.now(UTC).isoformat()},
-    )
-    return {"status": "ok"}
-
-
-@app.put("/api/config")
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def update_my_config(request: Request, user: dict = Depends(get_current_user)):
-    """Update the calling user's runtime configuration and restart watcher if needed."""
-    body = await request.json()
-    unknown = set(body) - _CONFIG_KEYS
-    if unknown:
-        raise HTTPException(400, detail=f"Unknown config keys: {sorted(unknown)}")
-    if "upload_mode" in body and body["upload_mode"] not in _VALID_UPLOAD_MODES:
-        raise HTTPException(400, detail=f"upload_mode must be one of {sorted(_VALID_UPLOAD_MODES)}")
-
-    pool = request.app.state.pool
-    updates = {k: str(v) for k, v in body.items() if k in _CONFIG_KEYS}
-    await db_mod.set_user_config(pool, user["id"], updates)
-    await _reconfigure_user_watcher(request.app, user["id"])
-
-    config = await db_mod.get_user_config(pool, user["id"])
-    watcher_mgr = getattr(request.app.state, "watcher_mgr", None)
-    payload = {
-        "user_id": user["id"],
-        "config": config,
-        "watcher_active": watcher_mgr.is_active(user["id"]) if watcher_mgr else False,
-    }
-    _broadcast_config_event(user["id"], {"type": "config_updated", **payload})
-    return payload
-
-
-@app.get("/api/config/stream")
-async def config_sse_stream(request: Request, user: dict = Depends(get_current_user_sse)):
-    """SSE stream — pushes config_updated and folder_ingest_* events to this user."""
-    uid = user["id"]
-    queue: asyncio.Queue = asyncio.Queue(maxsize=64)
-    _config_sse_queues.setdefault(uid, []).append(queue)
-
-    async def _gen():
-        try:
-            config = await db_mod.get_user_config(request.app.state.pool, uid)
-            watcher_mgr = getattr(request.app.state, "watcher_mgr", None)
-            sse_client_online = False
-            hb_str = config.get("last_client_heartbeat")
-            if hb_str:
-                try:
-                    last_beat = datetime.fromisoformat(hb_str)
-                    sse_client_online = (datetime.now(UTC) - last_beat).total_seconds() < 60
-                except Exception:
-                    pass
-            connected_event = json.dumps({
-                "type": "connected",
-                "config": config,
-                "watcher_active": watcher_mgr.is_active(uid) if watcher_mgr else False,
-                "client_online": sse_client_online,
-            })
-            yield f"data: {connected_event}\n\n"
-            while not await request.is_disconnected():
-                try:
-                    data = await asyncio.wait_for(queue.get(), timeout=25)
-                    yield f"data: {json.dumps(data)}\n\n"
-                except asyncio.TimeoutError:
-                    yield ": keepalive\n\n"
-        finally:
-            try:
-                _config_sse_queues[uid].remove(queue)
-            except (KeyError, ValueError):
-                pass
-
-    return StreamingResponse(
-        _gen(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
-@app.get("/admin/config/users")
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def admin_get_all_configs(request: Request, _: dict = Depends(require_admin)):
-    """Admin: list every user's config."""
-    rows = await db_mod.get_all_user_configs(request.app.state.pool)
-    watcher_mgr = getattr(request.app.state, "watcher_mgr", None)
-    now = datetime.now(UTC)
-    for row in rows:
-        row["watcher_active"] = watcher_mgr.is_active(row["user_id"]) if watcher_mgr else False
-        client_online = False
-        heartbeat_str = row.get("config", {}).get("last_client_heartbeat")
-        if heartbeat_str:
-            try:
-                last_beat = datetime.fromisoformat(heartbeat_str)
-                client_online = (now - last_beat).total_seconds() < 60
-            except Exception:
-                pass
-        row["client_online"] = client_online
-    return rows
-
-
-@app.get("/admin/config/users/{target_user_id}")
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def admin_get_user_config(
-    request: Request, target_user_id: str, _: dict = Depends(require_admin)
-):
-    """Admin: get one user's config."""
-    config = await db_mod.get_user_config(request.app.state.pool, target_user_id)
-    watcher_mgr = getattr(request.app.state, "watcher_mgr", None)
-    client_online = False
-    heartbeat_str = config.get("last_client_heartbeat")
-    if heartbeat_str:
-        try:
-            last_beat = datetime.fromisoformat(heartbeat_str)
-            client_online = (datetime.now(UTC) - last_beat).total_seconds() < 60
-        except Exception:
-            pass
-    return {
-        "user_id": target_user_id,
-        "config": config,
-        "watcher_active": watcher_mgr.is_active(target_user_id) if watcher_mgr else False,
-        "client_online": client_online,
-    }
-
-
-@app.put("/admin/config/users/{target_user_id}")
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def admin_update_user_config(
-    request: Request, target_user_id: str, admin: dict = Depends(require_admin)
-):
-    """Admin: update any user's config and restart their watcher."""
-    pool = request.app.state.pool
-    target = await db_mod.get_user_by_id(pool, target_user_id)
-    if not target:
-        raise HTTPException(404, detail="User not found")
-    body = await request.json()
-    unknown = set(body) - _CONFIG_KEYS
-    if unknown:
-        raise HTTPException(400, detail=f"Unknown config keys: {sorted(unknown)}")
-    if "upload_mode" in body and body["upload_mode"] not in _VALID_UPLOAD_MODES:
-        raise HTTPException(400, detail=f"upload_mode must be one of {sorted(_VALID_UPLOAD_MODES)}")
-
-    updates = {k: str(v) for k, v in body.items() if k in _CONFIG_KEYS}
-    await db_mod.set_user_config(pool, target_user_id, updates)
-    await _reconfigure_user_watcher(request.app, target_user_id)
-
-    config = await db_mod.get_user_config(pool, target_user_id)
-    watcher_mgr = getattr(request.app.state, "watcher_mgr", None)
-    payload = {
-        "user_id": target_user_id,
-        "config": config,
-        "watcher_active": watcher_mgr.is_active(target_user_id) if watcher_mgr else False,
-    }
-    _broadcast_config_event(target_user_id, {"type": "config_updated", **payload})
-    return payload
-
-
 # -- Vendor dashboard stats -------------------------------------------------
 
 @app.get("/admin/dashboard/vendors")
@@ -4131,232 +3638,6 @@ async def user_vendor_stats(
     daily = await db_mod.get_vendor_extraction_daily(pool, vendor_id, limit=days)
     pages = await db_mod.get_vendor_page_stats(pool, vendor_id)
     return {"vendor_id": vendor_id, "daily": daily, "pages": pages}
-
-
-# -- Schedule CRUD ----------------------------------------------------------
-
-@app.get("/api/schedules")
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def list_user_schedules(request: Request, user: dict = Depends(get_current_user)):
-    return await db_mod.get_user_schedules(request.app.state.pool, user["id"])
-
-
-@app.post("/api/schedules", status_code=201)
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def create_schedule(
-    request: Request, body: ScheduleCreate, user: dict = Depends(get_current_user)
-):
-    current = await db_mod.get_user_schedules(request.app.state.pool, user["id"])
-    if len(current) >= _SCHED_MAX:
-        raise HTTPException(400, detail=f"Maximum {_SCHED_MAX} schedules allowed per user")
-    if any(s["cron_expr"] == body.cron_expr for s in current):
-        raise HTTPException(400, detail="A schedule with this time already exists")
-    row = await db_mod.create_user_schedule(
-        request.app.state.pool, user["id"], body.cron_expr, body.timezone, body.label
-    )
-    return row
-
-
-@app.get("/api/schedules/{schedule_id}")
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def get_schedule_route(
-    request: Request, schedule_id: int, user: dict = Depends(get_current_user)
-):
-    row = await db_mod.get_schedule(request.app.state.pool, schedule_id)
-    if not row or str(row.get("user_id")) != user["id"]:
-        raise HTTPException(status_code=404, detail="Schedule not found")
-    return row
-
-
-@app.put("/api/schedules/{schedule_id}")
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def update_schedule_route(
-    request: Request,
-    schedule_id: int,
-    body: ScheduleUpdate,
-    user: dict = Depends(get_current_user),
-):
-    existing = await db_mod.get_schedule(request.app.state.pool, schedule_id)
-    if not existing or str(existing.get("user_id")) != user["id"]:
-        raise HTTPException(status_code=404, detail="Schedule not found")
-    if body.cron_expr is not None:
-        all_schedules = await db_mod.get_user_schedules(request.app.state.pool, user["id"])
-        if any(s["cron_expr"] == body.cron_expr and s["id"] != schedule_id for s in all_schedules):
-            raise HTTPException(400, detail="A schedule with this time already exists")
-    row = await db_mod.update_user_schedule(
-        request.app.state.pool, schedule_id,
-        **{k: v for k, v in body.model_dump().items() if v is not None},
-    )
-    return row
-
-
-@app.delete("/api/schedules/{schedule_id}", status_code=204)
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def delete_schedule_route(
-    request: Request, schedule_id: int, user: dict = Depends(get_current_user)
-):
-    existing = await db_mod.get_schedule(request.app.state.pool, schedule_id)
-    if not existing or str(existing.get("user_id")) != user["id"]:
-        raise HTTPException(status_code=404, detail="Schedule not found")
-    await db_mod.delete_user_schedule(request.app.state.pool, schedule_id)
-
-
-@app.get("/api/schedules/{schedule_id}/next")
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def schedule_next_runs(
-    request: Request,
-    schedule_id: int,
-    count: int = 5,
-    user: dict = Depends(get_current_user),
-):
-    existing = await db_mod.get_schedule(request.app.state.pool, schedule_id)
-    if not existing or str(existing.get("user_id")) != user["id"]:
-        raise HTTPException(status_code=404, detail="Schedule not found")
-    cron_expr = existing.get("cron_expr", "")
-    next_runs = []
-    t = None
-    for _ in range(count):
-        t = compute_next_run(cron_expr, after=t)
-        if t is None:
-            break
-        next_runs.append(t.isoformat())
-    return {"schedule_id": schedule_id, "next_runs": next_runs}
-
-
-@app.get("/admin/schedules")
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def admin_list_schedules(request: Request, _: dict = Depends(require_admin)):
-    return await db_mod.get_all_schedules(request.app.state.pool)
-
-
-# -- Per-user scheduler (up to 3 daily times per user) ----------------------
-
-_SCHED_MAX = 3
-
-
-def _row_to_sched(row: dict) -> dict:
-    """Convert a user_schedules DB row to API shape."""
-    parts = (row.get("cron_expr") or "").split()
-    utc_hour   = int(parts[1]) if len(parts) >= 2 else None
-    utc_minute = int(parts[0]) if len(parts) >= 1 else None
-    next_run_dt = compute_next_run(row.get("cron_expr", ""))
-    next_run_str = next_run_dt.isoformat() if next_run_dt and row.get("enabled") else None
-    last_ran   = row.get("last_ran_at")
-    last_ran_str = last_ran.isoformat() if last_ran else None
-    return {
-        "id":           row["id"],
-        "enabled":      row.get("enabled", False),
-        "is_executing": row.get("is_executing", False),
-        "utc_hour":     utc_hour,
-        "utc_minute":   utc_minute,
-        "next_run":     next_run_str,
-        "last_ran_at":  last_ran_str,
-    }
-
-
-@app.get("/api/scheduler")
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def get_user_scheduler(request: Request, user: dict = Depends(get_current_user)):
-    pool = request.app.state.pool
-    # Also clears stale running flags from crashed agents before the UI renders.
-    await db_mod.get_user_is_executing(pool, user["id"])
-    rows = await db_mod.get_user_schedules(pool, user["id"])
-    return {"schedules": [_row_to_sched(r) for r in rows], "max_schedules": _SCHED_MAX}
-
-
-@app.post("/api/scheduler/start")
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def start_user_scheduler(request: Request, user: dict = Depends(get_current_user)):
-    """Create a new schedule or re-enable an existing one. Max 3 per user."""
-    body = await request.json()
-    utc_hour   = int(body.get("hour",   8))
-    utc_minute = int(body.get("minute", 0))
-    schedule_id = body.get("schedule_id")  # if provided, update that specific row
-    if not (0 <= utc_hour <= 23 and 0 <= utc_minute <= 59):
-        raise HTTPException(400, detail="hour must be 0-23 and minute must be 0-59")
-    cron_expr = f"{utc_minute} {utc_hour} * * *"
-    pool = request.app.state.pool
-
-    time_label = f"{utc_hour:02d}:{utc_minute:02d}"
-    if schedule_id:
-        # Update existing — verify it belongs to this user
-        existing = await db_mod.get_schedule(pool, int(schedule_id))
-        if not existing or str(existing.get("user_id")) != str(user["id"]):
-            raise HTTPException(404, detail="Schedule not found")
-        all_schedules = await db_mod.get_user_schedules(pool, user["id"])
-        if any(s["cron_expr"] == cron_expr and s["id"] != int(schedule_id) for s in all_schedules):
-            raise HTTPException(400, detail=f"A schedule at {time_label} already exists")
-        row = await db_mod.update_user_schedule(pool, int(schedule_id), cron_expr=cron_expr, enabled=True)
-    else:
-        # Create new — enforce max limit and duplicate time
-        current = await db_mod.get_user_schedules(pool, user["id"])
-        if len(current) >= _SCHED_MAX:
-            raise HTTPException(400, detail=f"Maximum {_SCHED_MAX} schedules allowed per user")
-        if any(s["cron_expr"] == cron_expr for s in current):
-            raise HTTPException(400, detail=f"A schedule at {time_label} already exists")
-        row = await db_mod.create_user_schedule(pool, user["id"], cron_expr, "UTC", "daily run")
-
-    return _row_to_sched(row)
-
-
-@app.post("/api/scheduler/stop")
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def stop_user_scheduler(request: Request, user: dict = Depends(get_current_user)):
-    """Disable a specific schedule without deleting it."""
-    body = await request.json()
-    schedule_id = body.get("schedule_id")
-    if not schedule_id:
-        raise HTTPException(400, detail="schedule_id required")
-    pool = request.app.state.pool
-    existing = await db_mod.get_schedule(pool, int(schedule_id))
-    if not existing or str(existing.get("user_id")) != str(user["id"]):
-        raise HTTPException(404, detail="Schedule not found")
-    row = await db_mod.update_user_schedule(pool, int(schedule_id), enabled=False)
-    return _row_to_sched(row)
-
-
-@app.delete("/api/scheduler/{schedule_id}")
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def delete_user_schedule(
-    request: Request, schedule_id: int, user: dict = Depends(get_current_user)
-):
-    """Delete a schedule entirely."""
-    pool = request.app.state.pool
-    existing = await db_mod.get_schedule(pool, schedule_id)
-    if not existing or str(existing.get("user_id")) != str(user["id"]):
-        raise HTTPException(404, detail="Schedule not found")
-    await db_mod.delete_user_schedule(pool, schedule_id)
-    return {"deleted": True, "schedule_id": schedule_id}
-
-
-@app.post("/api/scheduler/{schedule_id}/running")
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def mark_schedule_running_endpoint(
-    request: Request, schedule_id: int, user: dict = Depends(get_current_user)
-):
-    """Mark a due schedule as actively executing on the desktop agent."""
-    pool = request.app.state.pool
-    existing = await db_mod.get_schedule(pool, schedule_id)
-    if not existing or str(existing.get("user_id")) != str(user["id"]):
-        raise HTTPException(404, detail="Schedule not found")
-    if not existing.get("enabled", False):
-        raise HTTPException(409, detail="Schedule is disabled")
-    await db_mod.set_schedule_executing(pool, schedule_id, True)
-    return {"status": "running"}
-
-
-@app.post("/api/scheduler/{schedule_id}/ran")
-@limiter.limit(f"{RATE_LIMIT}/minute")
-async def mark_schedule_ran_endpoint(
-    request: Request, schedule_id: int, user: dict = Depends(get_current_user)
-):
-    """Mark a schedule as run."""
-    pool = request.app.state.pool
-    existing = await db_mod.get_schedule(pool, schedule_id)
-    if not existing or str(existing.get("user_id")) != str(user["id"]):
-        raise HTTPException(404, detail="Schedule not found")
-    await db_mod.mark_schedule_ran(pool, schedule_id)
-    return {"status": "ok"}
 
 
 # -- Programmatic Extraction API (API Key clients) ---------------------------
@@ -4434,6 +3715,8 @@ async def extract_via_api_key(
                         raise HTTPException(500, detail="Extraction record missing")
                     mapped_result = await db_mod.get_extraction_mapped_result(pool, extraction_id)
                     mapping_applied = mapped_result is not None
+                    api_result = mapped_result if mapping_applied else extraction.get("result")
+                    _raise_for_terminal_extraction_error(extraction, api_result, extraction_id)
                     return {
                         "extraction_id": extraction_id,
                         "vendor_id": extraction.get("vendor_id"),
@@ -4441,7 +3724,7 @@ async def extract_via_api_key(
                         "duration_ms": extraction.get("duration_ms"),
                         "mapping_applied": mapping_applied,
                         "completed_at": extraction.get("updated_at").isoformat() if extraction.get("updated_at") else datetime.now(UTC).isoformat(),
-                        "result": mapped_result if mapping_applied else extraction.get("result"),
+                        "result": attach_vendor(api_result, extraction.get("vendor_name")),
                         "cached": True,
                     }
                 else:
@@ -4512,52 +3795,19 @@ async def extract_via_api_key(
             logger.info("[v1/extract] File received: %s (%d bytes, auth=%s, user=%s)",
                         filename, len(file_bytes), user.get("auth_method"), user.get("email"))
 
-            # -- Vendor detection (scoped to API key owner) ----------------------------
-            if not vendor_id:
-                from . import geometry as _geo
-                from . import vendor_detector as _vd
-                from . import ocr_runner as _ocr
-
-                # Render page 1 only for detection
-                rendered = await render_page_1_for_detection(file_bytes, filename)
-
-                if not rendered:
-                    raise HTTPException(400, detail="Could not render any pages from the uploaded file")
-
-                page1 = rendered[0]
-                page1_meta = {"page_number": 1, "width": page1.get("width", 0), "height": page1.get("height", 0)}
-
-                # Digital-first text extraction
-                page_words = []
-                if filename.lower().endswith(".pdf"):
-                    geo_pages = _geo.compute_pdf_geometry(file_bytes, [page1_meta])
-                    page_words = geo_pages[0].get("words", []) if geo_pages else []
-
-                # PaddleOCR fallback
-                if not page_words:
-                    ocr_pages = await _ocr.run_ocr_on_pages([{
-                        "page_number": 1,
-                        "image_b64": page1["image_b64"],
-                        "mime_type": page1.get("mime_type", "image/jpeg"),
-                    }])
-                    page_words = ocr_pages[0].get("words", []) if ocr_pages else []
-
-                # Always scope to this user's vendors
-                detect_uid = user["id"]
-                match = await _vd.detect_vendor(pool, page_words, user_id=detect_uid)
-                if match is None:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="No vendor template found for this document. Please create a vendor and template first.",
-                    )
-                vendor_id = match.vendor_id
-
-            # Enforce ownership
-            await assert_vendor_access(pool, vendor_id, user)
+            # Vendor detection moved into the normalize worker. When the caller
+            # pre-selects a vendor, enforce ownership now; otherwise submit for
+            # auto-detection (vendor_id=None) and let normalize detect it. An
+            # unknown vendor surfaces below as status=failed / unknown_vendor,
+            # which we map back to the original 400 for sync callers (async
+            # callers discover it via status polling).
+            if vendor_id:
+                await assert_vendor_access(pool, vendor_id, user)
 
             # -- Ingestion metadata including hash/key
             doc_metadata = {
                 "billing_user_id": user["id"],
+                "detect_user_id": user["id"],
                 "auth_method": user.get("auth_method"),
                 "api_key_id": user.get("api_key_id"),
             }
@@ -4664,6 +3914,23 @@ async def extract_via_api_key(
 
     ext_status = extraction.get("status", "unknown")
     if ext_status == "failed":
+        # Detection now happens in the worker. Preserve the original synchronous
+        # contracts for the failures that used to be raised inline:
+        #  • unknown / unconfigured vendor → 400 (client must set the vendor up)
+        #  • OCR unavailable during detection → 503 (transient infra, retry)
+        _err = extraction.get("error")
+        if _err in ("unknown_vendor", "no_template", "no_fields"):
+            raise HTTPException(
+                status_code=400,
+                detail="No vendor template found for this document. Please create a vendor and template first.",
+            )
+        if _err == "ocr_unavailable":
+            raise HTTPException(
+                status_code=503,
+                detail="OCR was unavailable while processing this document. Please retry.",
+            )
+        if _err == "llm_failed":
+            _raise_for_terminal_extraction_error(extraction, extraction.get("result"), extraction_id)
         raise HTTPException(
             status_code=500,
             detail={
@@ -4688,6 +3955,8 @@ async def extract_via_api_key(
     # stored a canonical-field copy — send that to the client instead of raw.
     mapped_result = await db_mod.get_extraction_mapped_result(pool, extraction_id)
     mapping_applied = mapped_result is not None
+    api_result = mapped_result if mapping_applied else extraction.get("result")
+    _raise_for_terminal_extraction_error(extraction, api_result, extraction_id)
     return {
         "extraction_id": extraction_id,
         "vendor_id": extraction.get("vendor_id"),
@@ -4695,13 +3964,13 @@ async def extract_via_api_key(
         "duration_ms": extraction.get("duration_ms"),
         "mapping_applied": mapping_applied,
         "completed_at": extraction.get("updated_at").isoformat() if extraction.get("updated_at") else datetime.now(UTC).isoformat(),
-        "result": mapped_result if mapping_applied else extraction.get("result"),
+        "result": attach_vendor(api_result, extraction.get("vendor_name")),
     }
 
 
 # -- Static Frontend --------------------------------------------------------
 
-# Mount the static frontend directory so it's accessible at http://localhost:8000/
+# Mount the static frontend directory so it's accessible at http://localhost:8055/
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
 
@@ -4715,4 +3984,4 @@ else:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8055, reload=True)

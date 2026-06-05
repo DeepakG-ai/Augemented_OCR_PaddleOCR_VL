@@ -61,6 +61,18 @@ class TracingNonFatalTests(unittest.TestCase):
                                side_effect=RuntimeError("no active trace")):
             mlf.trace_tags(extraction_id=1, vendor="V1", model="qwen3vl")
 
+    def test_setup_failure_opens_breaker(self):
+        mlf._reset_breaker()
+        try:
+            with mock.patch("backend.config.MLFLOW_ENABLED", True), \
+                 mock.patch.object(mlf.mlflow, "set_tracking_uri"), \
+                 mock.patch.object(mlf.mlflow, "set_experiment",
+                                   side_effect=RuntimeError("tracking down")):
+                mlf.setup_mlflow()
+            self.assertTrue(mlf._breaker_open())
+        finally:
+            mlf._reset_breaker()
+
 
 class CleanChatMessagesTests(unittest.TestCase):
     def test_base64_image_is_stripped(self):

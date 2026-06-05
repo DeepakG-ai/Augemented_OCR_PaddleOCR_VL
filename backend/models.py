@@ -6,6 +6,7 @@ Users define these freely in the UI.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any
 
@@ -103,10 +104,22 @@ class TokenOut(BaseModel):
     user: UserOut
 
 
+# Accepts local@domain.tld with any TLD (not just .com); rejects missing @, domain, or TLD.
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
 class UserCreate(BaseModel):
     email: str = Field(..., min_length=3, max_length=256)
     password: str = Field(..., min_length=8, max_length=256)
     role: str = Field("client", pattern=r"^(admin|client)$")
+
+    @field_validator("email")
+    @classmethod
+    def _valid_email(cls, v: str) -> str:
+        v = v.strip()
+        if not _EMAIL_RE.match(v):
+            raise ValueError("Invalid email address")
+        return v
 
 
 class UserResetPassword(BaseModel):

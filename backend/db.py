@@ -582,48 +582,6 @@ async def _init_db(pool: asyncpg.Pool) -> None:
                 END IF;
             END $$;
         """)
-        # Migration: per-user runtime configuration (input/output folders, upload mode)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_config (
-                user_id    UUID REFERENCES users(id) ON DELETE CASCADE,
-                key        TEXT NOT NULL,
-                value      TEXT,
-                updated_at TIMESTAMPTZ DEFAULT NOW(),
-                PRIMARY KEY (user_id, key)
-            );
-            CREATE INDEX IF NOT EXISTS user_config_user_id_idx ON user_config (user_id);
-        """)
-        # Migration: per-user ingestion schedules
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_schedules (
-                id          SERIAL PRIMARY KEY,
-                user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                label       TEXT NOT NULL DEFAULT '',
-                cron_expr   TEXT NOT NULL,
-                timezone    TEXT NOT NULL DEFAULT 'UTC',
-                enabled     BOOLEAN NOT NULL DEFAULT TRUE,
-                last_ran_at TIMESTAMPTZ,
-                created_at  TIMESTAMPTZ DEFAULT NOW(),
-                updated_at  TIMESTAMPTZ DEFAULT NOW()
-            );
-            CREATE INDEX IF NOT EXISTS user_schedules_user_id_idx ON user_schedules (user_id);
-        """)
-        # Migration: is_executing flag for conflict detection between UI uploads and scheduler
-        await conn.execute("""
-            DO $$ BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='user_schedules' AND column_name='is_executing'
-                ) THEN
-                    ALTER TABLE user_schedules ADD COLUMN is_executing BOOLEAN NOT NULL DEFAULT FALSE;
-                END IF;
-            END $$;
-        """)
-        # Migration: prevent duplicate schedule times per user
-        await conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS user_schedules_user_cron_uniq
-            ON user_schedules (user_id, cron_expr);
-        """)
         # Migration: API keys table for programmatic access
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS api_keys (
@@ -827,6 +785,26 @@ async def _init_db(pool: asyncpg.Pool) -> None:
                 ON topup_requests (user_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS topup_requests_status_idx
                 ON topup_requests (status, created_at DESC);
+        """)
+        # Migration: quota event log — records every grace overage and hard block
+        # so admins can see which clients are burning through grace pages.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS quota_grace_events (
+                id               SERIAL PRIMARY KEY,
+                user_id          UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                event_ts         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                event_type       TEXT NOT NULL
+                                 CHECK (event_type IN ('grace_used', 'exceeded')),
+                grace_pages_used INT NOT NULL DEFAULT 0,
+                incoming_pages   INT NOT NULL,
+                used_before      INT NOT NULL,
+                limit_at_time    INT NOT NULL,
+                filename         TEXT
+            );
+            CREATE INDEX IF NOT EXISTS quota_grace_events_user_idx
+                ON quota_grace_events (user_id, event_ts DESC);
+            CREATE INDEX IF NOT EXISTS quota_grace_events_ts_idx
+                ON quota_grace_events (event_ts DESC);
         """)
 
 
@@ -2153,7 +2131,7 @@ def _normalize_mapped_result(val: Any) -> Any:
 
 async def create_document(
     pool: asyncpg.Pool,
-    vendor_id: str,
+    vendor_id: str | None,
     filename: str,
     mime_type: str,
     size_bytes: int,
@@ -2240,15 +2218,19 @@ _EXTRACTION_COLS = """
 
 async def create_extraction(
     pool: asyncpg.Pool,
-    vendor_id: str,
+    vendor_id: str | None,
     template_id: int | None,
     filename: str,
     total_pages: int,
-    format_type: str,
+    format_type: str | None,
     header_fields: list[str],
     line_item_fields: list[str],
     document_id: int | None = None,
 ) -> dict:
+    # vendor_id/format_type/fields may be None/empty when the document is
+    # submitted for auto-detection — the normalize stage fills them in once it
+    # detects the vendor (see update_extraction_vendor). The columns are
+    # nullable, so this is a no-op at the schema level.
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -2263,6 +2245,49 @@ async def create_extraction(
             json.dumps({"stage": "queued", "message": "Queued for processing"}),
         )
         return await get_extraction(pool, row["id"]) or {}
+
+
+async def update_extraction_vendor(
+    pool: asyncpg.Pool,
+    extraction_id: int,
+    *,
+    vendor_id: str,
+    template_id: int | None,
+    format_type: str | None,
+    header_fields: list[str],
+    line_item_fields: list[str],
+) -> None:
+    """Persist a vendor detected during the normalize stage.
+
+    Sets the extraction's vendor/template/format/field lists AND the parent
+    document's vendor_id in one transaction so the two never drift apart.
+    """
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                UPDATE extractions
+                   SET vendor_id        = $2,
+                       template_id      = $3,
+                       format_type      = $4,
+                       header_fields    = $5::jsonb,
+                       line_item_fields = $6::jsonb,
+                       updated_at       = NOW()
+                 WHERE id = $1
+                """,
+                extraction_id, vendor_id, template_id, format_type,
+                json.dumps(header_fields), json.dumps(line_item_fields),
+            )
+            await conn.execute(
+                """
+                UPDATE documents d
+                   SET vendor_id  = $2,
+                       updated_at = NOW()
+                  FROM extractions e
+                 WHERE e.id = $1 AND d.id = e.document_id
+                """,
+                extraction_id, vendor_id,
+            )
 
 
 async def update_extraction_result(
@@ -2566,14 +2591,31 @@ async def is_postprocess_ready(pool: asyncpg.Pool, extraction_id: int) -> bool:
     """Lightweight check for postprocess prerequisites.
 
     Hybrid extraction needs current-document geometry before postprocess because
-    spatial memory reads text from the current OCR/pdfium word boxes.
+    spatial memory reads text from the current OCR/pdfium word boxes. If the
+    OCR branch failed, postprocess may still finalize the LLM JSON as partial
+    and explicitly disable OCR-backed review features.
     """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT (result IS NOT NULL AND ocr_data IS NOT NULL) AS ready
-            FROM extractions
-            WHERE id = $1
+            WITH latest_ocr AS (
+                SELECT status
+                FROM jobs
+                WHERE extraction_id = $1
+                  AND job_type = 'ocr'
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+            )
+            SELECT (
+                e.status = 'processing'
+                AND e.result IS NOT NULL
+                AND (
+                    e.ocr_data IS NOT NULL
+                    OR COALESCE((SELECT status = 'failed' FROM latest_ocr), FALSE)
+                )
+            ) AS ready
+            FROM extractions e
+            WHERE e.id = $1
             """,
             extraction_id,
         )
@@ -3072,6 +3114,37 @@ async def recover_stale_jobs(pool: asyncpg.Pool, stage: str, stale_minutes: int 
                 if r["status"] == "failed" and r["extraction_id"] is not None
             ]
             if failed_ext_ids:
+                if stage == "ocr":
+                    await conn.execute(
+                        """
+                        UPDATE extractions
+                        SET progress = jsonb_build_object(
+                                'stage', 'ocr',
+                                'message', 'JSON extraction may still complete, but OCR-backed review is unavailable.',
+                                'review_available', false,
+                                'ocr_error', 'Worker crash - max attempts reached'
+                            ),
+                            updated_at = NOW()
+                        WHERE id = ANY($1::int[])
+                          AND status NOT IN ('done', 'failed', 'partial', 'cancelled')
+                        """,
+                        failed_ext_ids,
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO jobs (extraction_id, document_id, job_type, payload)
+                        SELECT e.id, e.document_id, 'postprocess', jsonb_build_object('extraction_id', e.id)
+                        FROM extractions e
+                        WHERE e.id = ANY($1::int[])
+                          AND e.status = 'processing'
+                          AND e.result IS NOT NULL
+                        ON CONFLICT (extraction_id, job_type)
+                        WHERE status IN ('queued', 'running') AND extraction_id IS NOT NULL
+                        DO NOTHING
+                        """,
+                        failed_ext_ids,
+                    )
+                    return len(rows)
                 await conn.execute(
                     """
                     UPDATE extractions
@@ -3150,6 +3223,34 @@ async def get_latest_job_for_extraction(pool: asyncpg.Pool, extraction_id: int) 
             extraction_id,
         )
         return _record(row, "payload", "progress")
+
+
+async def get_latest_job_for_extraction_type(
+    pool: asyncpg.Pool,
+    extraction_id: int,
+    job_type: str,
+) -> dict | None:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, extraction_id, document_id, job_type, status, payload, progress,
+                   attempts, max_attempts, priority, locked_by, locked_at,
+                   started_at, finished_at, error, created_at, updated_at
+            FROM jobs
+            WHERE extraction_id = $1
+              AND job_type = $2
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            extraction_id,
+            job_type,
+        )
+        return _record(row, "payload", "progress")
+
+
+async def latest_job_failed(pool: asyncpg.Pool, extraction_id: int, job_type: str) -> bool:
+    job = await get_latest_job_for_extraction_type(pool, extraction_id, job_type)
+    return bool(job and job.get("status") == "failed")
 
 
 async def list_jobs_for_extraction(pool: asyncpg.Pool, extraction_id: int) -> list[dict]:
@@ -3411,9 +3512,16 @@ async def reserve_quota(
             if not would_exceed:
                 reason, allowed = "ok", True
             elif committed < effective_limit and incoming_pages <= grace_pages:
+                # Grace applies only when the user still has headroom (committed
+                # strictly under the limit). At exactly limit==committed there is
+                # no room left, so block — no grace.
                 reason, allowed = "grace", True
             else:
                 reason, allowed = "exceeded", False
+
+            grace_pages_used = 0
+            if reason == "grace":
+                grace_pages_used = max(0, committed + incoming_pages - effective_limit)
 
             if allowed:
                 await conn.execute(
@@ -3427,6 +3535,7 @@ async def reserve_quota(
                 "limit": effective_limit,
                 "remaining": remaining,
                 "pending": pending,
+                "grace_pages_used": grace_pages_used,
             }
 
 
@@ -3448,6 +3557,62 @@ async def release_quota_reservation(
             "UPDATE users SET pending_pages = GREATEST(0, pending_pages - $1) WHERE id = $2",
             pages, uid,
         )
+
+
+async def insert_quota_grace_event(
+    pool: asyncpg.Pool,
+    *,
+    user_id: str,
+    event_type: str,
+    grace_pages_used: int,
+    incoming_pages: int,
+    used_before: int,
+    limit_at_time: int,
+    filename: str | None = None,
+) -> None:
+    """Record one grace overage or hard-block event for admin visibility.
+
+    event_type: 'grace_used' | 'exceeded'
+    Never raises — event logging must not crash the upload path.
+    """
+    uid = _uuid_or_none(user_id)
+    if uid is None:
+        return
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO quota_grace_events
+                    (user_id, event_type, grace_pages_used, incoming_pages,
+                     used_before, limit_at_time, filename)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """,
+                uid, event_type, grace_pages_used, incoming_pages,
+                used_before, limit_at_time, filename,
+            )
+    except Exception:
+        pass  # best-effort — never crash the upload path
+
+
+async def get_admin_quota_events(
+    pool: asyncpg.Pool,
+    limit: int = 100,
+) -> list[dict]:
+    """Return recent quota grace/exceeded events with the user's email."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT qge.id, qge.event_ts, qge.event_type, qge.grace_pages_used,
+                   qge.incoming_pages, qge.used_before, qge.limit_at_time,
+                   qge.filename, u.email
+            FROM quota_grace_events qge
+            JOIN users u ON u.id = qge.user_id
+            ORDER BY qge.event_ts DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+    return [dict(r) for r in rows]
 
 
 async def release_quota_once(pool: asyncpg.Pool, document_id: int | None, user_id: str | None) -> int:
@@ -3961,68 +4126,6 @@ async def get_user_history(
     }
 
 
-# -- User config -----------------------------------------------------------
-
-async def get_user_config(pool: asyncpg.Pool, user_id: str) -> dict[str, str]:
-    """Return all config key-value pairs for a user."""
-    uid = _uuid_or_none(user_id)
-    if uid is None:
-        return {}
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT key, value FROM user_config WHERE user_id = $1 ORDER BY key",
-            uid,
-        )
-    return {r["key"]: r["value"] for r in rows}
-
-
-async def set_user_config(pool: asyncpg.Pool, user_id: str, updates: dict[str, str]) -> None:
-    """Upsert config key-value pairs for a user."""
-    uid = _uuid_or_none(user_id)
-    if uid is None:
-        return
-    async with pool.acquire() as conn:
-        for key, value in updates.items():
-            await conn.execute(
-                """
-                INSERT INTO user_config (user_id, key, value, updated_at)
-                VALUES ($1, $2, $3, NOW())
-                ON CONFLICT (user_id, key)
-                DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
-                """,
-                uid,
-                key,
-                value,
-            )
-
-
-async def get_all_user_configs(pool: asyncpg.Pool) -> list[dict]:
-    """Admin: return config grouped by user (email + role + config dict)."""
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT u.id::TEXT AS user_id, u.email, u.role,
-                   uc.key, uc.value, uc.updated_at
-            FROM users u
-            LEFT JOIN user_config uc ON uc.user_id = u.id
-            ORDER BY u.email, uc.key
-            """
-        )
-    users: dict[str, dict] = {}
-    for r in rows:
-        uid = r["user_id"]
-        if uid not in users:
-            users[uid] = {
-                "user_id": uid,
-                "email": r["email"],
-                "role": r["role"],
-                "config": {},
-            }
-        if r["key"]:
-            users[uid]["config"][r["key"]] = r["value"]
-    return list(users.values())
-
-
 # -- Vendor dashboard stats ------------------------------------------------
 
 async def get_client_vendor_summary(pool: asyncpg.Pool) -> list[dict]:
@@ -4120,143 +4223,6 @@ async def get_vendor_page_stats(pool: asyncpg.Pool, vendor_id: str) -> list[dict
             vendor_id,
         )
     return [dict(r) for r in rows]
-
-
-# -- Schedule queries -------------------------------------------------------
-
-async def create_user_schedule(
-    pool: asyncpg.Pool,
-    user_id: str,
-    cron_expr: str,
-    timezone: str = "UTC",
-    label: str = "",
-) -> dict:
-    uid = _uuid_or_none(user_id)
-    if uid is None:
-        raise ValueError(f"Invalid user_id: {user_id!r}")
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO user_schedules (user_id, cron_expr, timezone, label)
-            VALUES ($1, $2, $3, $4)
-            RETURNING *
-            """,
-            uid, cron_expr, timezone or "UTC", label or "",
-        )
-    return dict(row) if row else {}
-
-
-async def get_user_schedules(pool: asyncpg.Pool, user_id: str) -> list[dict]:
-    uid = _uuid_or_none(user_id)
-    if uid is None:
-        return []
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM user_schedules WHERE user_id = $1 ORDER BY created_at DESC",
-            uid,
-        )
-    return [dict(r) for r in rows]
-
-
-async def get_schedule(pool: asyncpg.Pool, schedule_id: int) -> dict | None:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM user_schedules WHERE id = $1", schedule_id
-        )
-    return dict(row) if row else None
-
-
-async def update_user_schedule(
-    pool: asyncpg.Pool,
-    schedule_id: int,
-    **kwargs,
-) -> dict | None:
-    allowed = {"label", "cron_expr", "timezone", "enabled", "is_executing"}
-    updates = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
-    if not updates:
-        return await get_schedule(pool, schedule_id)
-    set_parts = [f"{k} = ${i + 2}" for i, k in enumerate(updates)]
-    set_clause = ", ".join(set_parts)
-    values = list(updates.values())
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            f"UPDATE user_schedules SET {set_clause}, updated_at = NOW() WHERE id = $1 RETURNING *",
-            schedule_id,
-            *values,
-        )
-    return dict(row) if row else None
-
-
-async def delete_user_schedule(pool: asyncpg.Pool, schedule_id: int) -> bool:
-    async with pool.acquire() as conn:
-        result = await conn.execute(
-            "DELETE FROM user_schedules WHERE id = $1", schedule_id
-        )
-    return result == "DELETE 1"
-
-
-async def get_all_schedules_enabled(pool: asyncpg.Pool) -> list[dict]:
-    """All enabled schedules — used at startup to reload APScheduler jobs."""
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM user_schedules WHERE enabled = TRUE ORDER BY id"
-        )
-    return [dict(r) for r in rows]
-
-
-async def get_all_schedules(pool: asyncpg.Pool) -> list[dict]:
-    """Admin: all schedules joined with user email."""
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT s.*, u.email
-            FROM user_schedules s
-            JOIN users u ON u.id = s.user_id
-            ORDER BY s.created_at DESC
-            """
-        )
-    return [dict(r) for r in rows]
-
-
-async def mark_schedule_ran(pool: asyncpg.Pool, schedule_id: int) -> None:
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE user_schedules SET last_ran_at = NOW(), is_executing = FALSE, updated_at = NOW() WHERE id = $1",
-            schedule_id,
-        )
-
-
-async def set_schedule_executing(pool: asyncpg.Pool, schedule_id: int, executing: bool) -> None:
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE user_schedules SET is_executing = $1, updated_at = NOW() WHERE id = $2",
-            executing, schedule_id,
-        )
-
-
-async def get_user_is_executing(pool: asyncpg.Pool, user_id: str) -> bool:
-    uid = _uuid_or_none(user_id)
-    if uid is None:
-        return False
-    async with pool.acquire() as conn:
-        # Auto-clear stale execution locks. If an agent crashes after marking a
-        # schedule running but before clearing it, the flag would otherwise block
-        # manual uploads forever. updated_at is maintained by set_schedule_executing.
-        await conn.execute(
-            """
-            UPDATE user_schedules
-               SET is_executing = FALSE
-             WHERE user_id = $1
-               AND is_executing = TRUE
-               AND updated_at < NOW() - INTERVAL '10 minutes'
-            """,
-            uid,
-        )
-        row = await conn.fetchrow(
-            "SELECT EXISTS(SELECT 1 FROM user_schedules WHERE user_id = $1 AND is_executing = TRUE) AS running",
-            uid,
-        )
-    return bool(row["running"]) if row else False
 
 
 # -- API Key CRUD ----------------------------------------------------------

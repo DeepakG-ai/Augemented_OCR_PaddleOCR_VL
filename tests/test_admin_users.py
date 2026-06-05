@@ -171,6 +171,44 @@ class AdminCreateUserTests(unittest.TestCase):
         })
         self.assertEqual(r.status_code, 422)
 
+    def test_email_without_at_returns_422(self) -> None:
+        r = self.client.post("/admin/users", json={
+            "email": "noatsign",
+            "password": "strongpass1",
+            "role": "client",
+        })
+        self.assertEqual(r.status_code, 422)
+
+    def test_email_without_domain_returns_422(self) -> None:
+        r = self.client.post("/admin/users", json={
+            "email": "john@",
+            "password": "strongpass1",
+            "role": "client",
+        })
+        self.assertEqual(r.status_code, 422)
+
+    def test_email_without_tld_returns_422(self) -> None:
+        r = self.client.post("/admin/users", json={
+            "email": "john@acme",
+            "password": "strongpass1",
+            "role": "client",
+        })
+        self.assertEqual(r.status_code, 422)
+
+    def test_non_com_tld_is_accepted(self) -> None:
+        created = _user_row("io-uuid", "john@firm.io", "client")
+        with patch.object(main.db_mod, "get_user_by_email",
+                          new=AsyncMock(return_value=None)), \
+             patch.object(main.db_mod, "create_user",
+                          new=AsyncMock(return_value=created)):
+            r = self.client.post("/admin/users", json={
+                "email": "john@firm.io",
+                "password": "strongpass1",
+                "role": "client",
+            })
+        self.assertEqual(r.status_code, 201)
+        self.assertEqual(r.json()["email"], "john@firm.io")
+
     def test_client_cannot_create_user(self) -> None:
         with _ScopedOverrides(main.app, {get_current_user: lambda: _client_user()}):
             main.app.dependency_overrides.pop(require_admin, None)
