@@ -24,6 +24,8 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+from .config import OCR_WORKERS
+
 os.environ.setdefault("HUB_DATASET_ENDPOINT", "https://modelscope.cn/api/v1/datasets")
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 
@@ -36,7 +38,7 @@ if not logger.handlers:
     logger.propagate = True
 
 
-_executor = ThreadPoolExecutor(max_workers=3)
+_executor = ThreadPoolExecutor(max_workers=OCR_WORKERS)
 
 class OCRUnavailable(Exception):
     """Exception raised when PaddleOCR fails to initialize or run."""
@@ -76,6 +78,48 @@ def _get_ocr_engine():
         logger.info("PaddleOCR engine ready for thread %s in %.0fms", threading.current_thread().name, elapsed)
         sys.stderr.flush()
     return _ocr_local.engine
+
+
+def _warmup_ocr_thread(slot: int, barrier: threading.Barrier | None = None) -> str:
+    if barrier is not None:
+        try:
+            barrier.wait(timeout=30)
+        except threading.BrokenBarrierError:
+            logger.warning("PaddleOCR warmup barrier broke for slot %d", slot)
+    _get_ocr_engine()
+    return threading.current_thread().name
+
+
+async def warmup_ocr_engines(workers: int | None = None) -> None:
+    count = OCR_WORKERS if workers is None else workers
+    if count <= 0:
+        return
+    count = min(count, OCR_WORKERS)
+
+    t0 = time.perf_counter()
+    logger.info("Warming PaddleOCR engines for %d thread(s)...", count)
+    sys.stderr.flush()
+
+    loop = asyncio.get_running_loop()
+    barrier = threading.Barrier(count) if count > 1 else None
+    tasks = [
+        loop.run_in_executor(_executor, _warmup_ocr_thread, slot, barrier)
+        for slot in range(count)
+    ]
+    thread_names = await asyncio.gather(*tasks)
+    unique_threads = sorted(set(thread_names))
+    elapsed = (time.perf_counter() - t0) * 1000
+
+    if len(unique_threads) < count:
+        logger.warning(
+            "PaddleOCR warmup initialized %d unique thread(s), expected %d: %s",
+            len(unique_threads), count, unique_threads,
+        )
+    logger.info(
+        "PaddleOCR warmup complete: %d thread engine(s) ready in %.0fms",
+        len(unique_threads), elapsed,
+    )
+    sys.stderr.flush()
 
 
 def _run_ocr_on_page(image_b64: str, page_number: int) -> dict:

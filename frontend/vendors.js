@@ -365,6 +365,7 @@ function tplRenderLines() {
 function tplAddRule() {
     const inp = document.getElementById('tplRuleInput');
     const val = inp.value.trim(); if (!val) return;
+    if (extractionRules.includes(val)) { inp.value = ''; return; }
     extractionRules.push(val); inp.value = ''; tplRenderRules();
 }
 function tplAddRuleText(text) { extractionRules.push(text); tplRenderRules(); }
@@ -439,7 +440,11 @@ async function saveTplConfig() {
     try {
         const resp = await apiJSON(`/vendors/${tplVendorId}/template`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
         showToast(`Template saved — hash: ${(resp.prompt_hash || 'none').slice(0, 12)}...`);
-    } catch (e) { showToast('Save failed: ' + e.message); }
+    } catch (e) {
+        const fields = e.error && Array.isArray(e.error.fields) ? e.error.fields : null;
+        const detail = fields ? fields.map(f => f.msg || f.message || JSON.stringify(f)).join('; ') : e.message;
+        showToast('Save failed: ' + detail);
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════

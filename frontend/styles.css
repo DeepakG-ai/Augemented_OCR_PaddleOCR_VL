@@ -139,6 +139,10 @@ html, body {
     box-shadow: 0 0 8px rgba(245, 158, 11, 0.6);
     animation: blink 1s infinite;
 }
+.status-dot.failed {
+    background: var(--red);
+    box-shadow: 0 0 8px rgba(239, 68, 68, 0.6);
+}
 
 .status-label {
     font-size: 10px; letter-spacing: 0.12em;
@@ -146,6 +150,7 @@ html, body {
 }
 .status-label span { color: var(--green); }
 .status-label.processing span { color: var(--amber); }
+.status-label.failed span { color: var(--red); }
 
 @keyframes blink { 0%,100% { opacity: 1 } 50% { opacity: 0.4 } }
 

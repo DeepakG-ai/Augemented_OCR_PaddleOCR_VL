@@ -511,8 +511,27 @@ function buildPipelineHTML() {
     `;
 }
 
+function _extractHasPipelineFailure(extraction) {
+    if (!extraction) return false;
+    const result = extraction.result;
+    return extraction.error
+        || (result && typeof result === 'object' && result._all_pages_failed === true)
+        || (Array.isArray(extraction.page_results) && extraction.page_results.some(pr => pr && pr._error));
+}
+
+function resetPipelinePanelMarkup() {
+    const panel = document.getElementById('pipelinePanel');
+    if (!panel || panel.querySelector('.pipeline-stages')) return;
+    const holder = document.createElement('div');
+    holder.innerHTML = buildPipelineHTML().trim();
+    const fresh = holder.firstElementChild;
+    if (fresh) panel.replaceWith(fresh);
+}
+
 function showPipelinePanel(options = {}) {
     const selectedVendorName = options.selectedVendorName || null;
+    resetPipelinePanelMarkup();
+    _pipelineSeenStages = new Set();
 
     // Reset all stages to pending
     PIPELINE_STAGES.forEach(s => {
@@ -594,12 +613,27 @@ function setPipelineProgress(stageId, current, total) {
 // Track which stages we've seen as active so we can mark them done
 let _pipelineSeenStages = new Set();
 
+// One short, human-readable headline for any pipeline failure.
+function _pipelineErrorMessage(extraction, message) {
+    const map = {
+        unknown_vendor: 'Unknown vendor — no alias matched the document.',
+        no_template: 'The detected vendor has no template.',
+        no_fields: 'The detected vendor’s template has no fields.',
+        ocr_unavailable: 'OCR was unavailable while reading the document.',
+        llm_failed: 'Vision (LLM) extraction failed — the model server was unreachable or returned an error.',
+    };
+    if (_extractHasPipelineFailure(extraction) && !extraction.error) {
+        return map.llm_failed;
+    }
+    return map[extraction.error] || message || extraction.error || 'Extraction failed.';
+}
+
 function updatePipelineFromSSE(jobState) {
     const extraction = jobState.extraction || {};
     const progress = extraction.progress || {};
     const stage = progress.stage;
     const message = progress.message || '';
-    const event = jobState.event;
+    const event = (jobState.event === 'done' && _extractHasPipelineFailure(extraction)) ? 'failed' : jobState.event;
     const stageOrder = ['upload', 'detect', 'normalize', 'ocr', 'llm', 'json', 'postprocess'];
 
     // Terminal events may omit extraction.progress.stage, especially in tests
@@ -621,34 +655,25 @@ function updatePipelineFromSSE(jobState) {
     // events from the backend (e.g. status=unverified) often omit progress.stage.
     if (event === 'failed') {
         if (_pipelineTimerInterval) { clearInterval(_pipelineTimerInterval); _pipelineTimerInterval = null; }
-        const _tel = document.getElementById('pipelineTimer');
-        if (_tel && _pipelineStartTime) {
-            _tel.textContent = `${((Date.now() - _pipelineStartTime) / 1000).toFixed(1)}s — FAILED`;
+        // On ANY error, hide the whole pipeline sequence — no half-finished
+        // stages, no stalled orange dots — and show the error in its place.
+        // The recovery actions (Resume / Retry) are rendered separately by streamJob.
+        const _elapsed = _pipelineStartTime ? ((Date.now() - _pipelineStartTime) / 1000).toFixed(1) : '0.0';
+        const panel = document.getElementById('pipelinePanel');
+        if (panel) {
+            panel.innerHTML = `
+                <div class="pipeline-header">
+                    <div class="pipeline-title" style="color:var(--red)">Extraction Failed</div>
+                    <div class="pipeline-subtitle">Stopped after ${_elapsed}s</div>
+                </div>
+                <div style="display:flex;gap:12px;align-items:flex-start;padding:18px 4px 6px">
+                    <div style="font-size:26px;line-height:1">⛔</div>
+                    <div style="flex:1;min-width:0">
+                        <div style="color:var(--red);font-weight:600;font-size:13px;margin-bottom:6px;letter-spacing:0.02em">${escapeHtml(_pipelineErrorMessage(extraction, message))}</div>
+                        <div style="color:var(--text-dim);font-size:11px">See the recovery options below to resume or restart.</div>
+                    </div>
+                </div>`;
         }
-        // Detection-time failures happen inside normalize now — mark the detect
-        // stage failed (the recovery actions are shown by streamJob).
-        const _detectErrors = ['unknown_vendor', 'no_template', 'no_fields', 'ocr_unavailable'];
-        if (_detectErrors.includes(extraction.error)) {
-            const _labels = {
-                unknown_vendor: 'Unknown vendor — no alias matched the document.',
-                no_template: 'Detected vendor has no template.',
-                no_fields: 'Detected vendor’s template has no fields.',
-                ocr_unavailable: 'OCR was unavailable for vendor detection.',
-            };
-            setPipelineStage('detect', 'failed', _labels[extraction.error]);
-            return;
-        }
-        // Find which stage to mark failed: use stage from progress if present,
-        // otherwise scan DOM for the last stage still showing as active.
-        const _sm = { normalize: 'normalize', ocr: 'ocr', llm: 'llm', postprocess: 'postprocess' };
-        let _failStage = stage ? (_sm[stage] || stage) : null;
-        if (!_failStage) {
-            for (let i = stageOrder.length - 1; i >= 0; i--) {
-                const _se = document.getElementById(`pipeStage_${stageOrder[i]}`);
-                if (_se && _se.classList.contains('active')) { _failStage = stageOrder[i]; break; }
-            }
-        }
-        if (_failStage) setPipelineStage(_failStage, 'failed', message || 'Extraction failed');
         return;
     }
 
@@ -790,7 +815,25 @@ function applyJobStatus(jobState) {
 
     if (!extraction) return;
 
+    if (_extractHasPipelineFailure(extraction)) {
+        const failedExtractionId = extraction.id || activeExtractionId;
+        setStatus('failed');
+        document.getElementById('rpBadge').className = 'rp-badge review';
+        document.getElementById('rpBadge').textContent = extraction.error === 'llm_failed' || (extraction.result && extraction.result._all_pages_failed) ? 'LLM FAILED' : 'FAILED';
+        const cs = document.getElementById('conflictSection');
+        const cm = document.getElementById('conflictMsg');
+        const cc = document.getElementById('conflictCandidates');
+        if (cs) cs.style.display = 'block';
+        if (cm) cm.textContent = 'LLM extraction failed. Restart from scratch after the model server is running.';
+        if (cc) cc.innerHTML = failedExtractionId
+            ? `<button class="small-btn" onclick="resumeExtract(${failedExtractionId})" style="margin-top:8px;margin-right:6px">▶ Resume Pipeline</button>
+               <button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">↻ Restart from Scratch</button>`
+            : `<button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">↻ Restart from Scratch</button>`;
+        return;
+    }
+
     if (extraction.status === 'done') {
+        const reviewDisabled = progress.review_available === false || progress.warning_code === 'ocr_failed_review_unavailable';
         lastResult = extraction.corrected_result || extraction.result;
         totalPages = extraction.total_pages || totalPages;
         showResult(lastResult);
@@ -801,7 +844,7 @@ function applyJobStatus(jobState) {
         reviewExtractionId = extraction.id;
         reviewFieldLocations = extraction.field_locations || {};
         if (extraction.id) loadExtractionPages(extraction.id);
-        if (extraction.id) {
+        if (extraction.id && !reviewDisabled) {
             const rs = document.getElementById('resultSection');
             if (rs && !rs.querySelector('.review-link-btn')) {
                 const btn = document.createElement('button');
@@ -812,15 +855,13 @@ function applyJobStatus(jobState) {
                 rs.appendChild(btn);
             }
         }
-        if (progress.review_available === false || progress.warning_code === 'ocr_failed_review_unavailable') {
+        if (reviewDisabled) {
             const cs = document.getElementById('conflictSection');
             const cm = document.getElementById('conflictMsg');
             const cc = document.getElementById('conflictCandidates');
             if (cs) cs.style.display = 'block';
-            if (cm) cm.textContent = 'OCR failed, so drag/drop review, bounding boxes, and spatial memory are unavailable. JSON extraction completed.';
-            if (cc) cc.innerHTML = extraction.id
-                ? `<button class="small-btn" onclick="navigate('#/review/${extraction.id}')" style="margin-top:8px">Open Review for value edits</button>`
-                : '';
+            if (cm) cm.textContent = 'OCR failed, so review, corrections, bounding boxes, and spatial memory are unavailable. JSON extraction completed.';
+            if (cc) cc.innerHTML = '';
         }
     } else if (extraction.status === 'partial' || extraction.status === 'cancelled') {
         if (extraction.result) {
@@ -923,9 +964,9 @@ async function streamJob(jobId) {
                                        <button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">↻ Restart from Scratch</button>`
                                     : `<button class="small-btn" onclick="retryLastExtract()" style="margin-top:8px">↻ Restart from Scratch</button>`;
                             }
-                            setStatus('optimal');
+                            setStatus('failed');
                             document.getElementById('rpBadge').className = 'rp-badge review';
-                            document.getElementById('rpBadge').textContent = 'NEEDS REVIEW';
+                            document.getElementById('rpBadge').textContent = extraction.error === 'llm_failed' ? 'LLM FAILED' : 'FAILED';
                         }
                         activeJobId = null;
                         return event;
@@ -1099,6 +1140,10 @@ async function resumeExtract(extractionId) {
 }
 
 function retryLastExtract() {
+    const cs = document.getElementById('conflictSection'); if (cs) cs.style.display = 'none';
+    const cm = document.getElementById('conflictMsg'); if (cm) cm.textContent = '';
+    const cc = document.getElementById('conflictCandidates'); if (cc) cc.innerHTML = '';
+    resetPipelinePanelMarkup();
     return runExtract();
 }
 
@@ -1139,5 +1184,6 @@ function setStatus(state) {
     const lbl = document.getElementById('hdrStatus');
     if (!dot || !lbl) return;
     if (state === 'processing') { dot.className = 'status-dot processing'; lbl.className = 'status-label processing'; lbl.innerHTML = 'System Status: <span>PROCESSING</span>'; }
+    else if (state === 'failed') { dot.className = 'status-dot failed'; lbl.className = 'status-label failed'; lbl.innerHTML = 'System Status: <span>FAILED</span>'; }
     else { dot.className = 'status-dot'; lbl.className = 'status-label'; lbl.innerHTML = 'System Status: <span>OPTIMAL</span>'; }
 }

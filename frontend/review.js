@@ -196,6 +196,60 @@ async function renderReviewPage(app, extractionId) {
     // Always fetch fresh data from API to avoid stale in-memory snapshots.
     try {
         const data = await apiJSON(`/extractions/${extractionId}`);
+
+        // One rule, same as the backend: review is available only for a clean
+        // completed extraction. Failed/partial/disabled-review extractions have
+        // no trustworthy review state, so the review system is blocked entirely.
+        const progress = data.progress || {};
+        const allPagesFailed = data.result && typeof data.result === 'object' && data.result._all_pages_failed === true;
+        const pageErrors = Array.isArray(data.page_results) && data.page_results.some(pr => pr && pr._error);
+        const reviewDisabledByOcr = progress.review_available === false
+            || progress.warning_code === 'ocr_failed_review_unavailable'
+            || progress.ocr_error;
+        const extractionFailed = data.status !== 'done'
+            || data.error
+            || allPagesFailed
+            || pageErrors
+            || (progress.warning_code && !reviewDisabledByOcr);
+        if (extractionFailed) {
+            app.className = 'app';
+            const why = data.error === 'llm_failed' || allPagesFailed || pageErrors
+                ? 'The LLM extraction failed (the model server was unreachable or returned an error).'
+                : 'This extraction is not available for review.';
+            app.innerHTML = headerHTML() + `
+                <div class="page-content" style="text-align:center;padding-top:60px">
+                    <div style="font-size:48px;margin-bottom:16px">⛔</div>
+                    <div class="page-title">Review Unavailable</div>
+                    <p style="color:var(--text-dim);margin:12px auto;max-width:520px">
+                        ${escapeHtml(why)} There is no valid review state for this extraction.
+                    </p>
+                    <button class="small-btn" onclick="navigate('#/extract')" style="margin-top:12px">Back to Extraction</button>
+                    <button class="small-btn" onclick="navigate('#/history')" style="margin-top:12px">View History</button>
+                </div>`;
+            updateNavActive();
+            return;
+        }
+
+        // OCR failed but the LLM still produced JSON: the extraction passed.
+        // The review system needs OCR word boxes, so it can't run for this PDF.
+        // Show only a message (the JSON itself is valid and lives in History).
+        if (reviewDisabledByOcr) {
+            app.className = 'app';
+            app.innerHTML = headerHTML() + `
+                <div class="page-content" style="text-align:center;padding-top:60px">
+                    <div style="font-size:48px;margin-bottom:16px">i</div>
+                    <div class="page-title">Review Not Available for This PDF</div>
+                    <p style="color:var(--text-dim);margin:12px auto;max-width:540px">
+                        Extraction succeeded and the JSON is ready, but OCR failed for this document, so the
+                        review system (box drawing, click-to-select, and spatial memory) is unavailable for this PDF.
+                    </p>
+                    <button class="small-btn" onclick="navigate('#/history')" style="margin-top:12px">View History</button>
+                    <button class="small-btn" onclick="navigate('#/extract')" style="margin-top:12px">Back to Extraction</button>
+                </div>`;
+            updateNavActive();
+            return;
+        }
+
         let effectiveResult = data.corrected_result || data.result || {};
         let origResult = data.result || {};
         _rvVendorId = data.vendor_id || null;
@@ -1167,7 +1221,7 @@ function _rvShowReasonModal(sel, callback) {
     backdrop.innerHTML = `
         <div class="rv-reason-modal" onclick="event.stopPropagation()">
             <div class="rv-reason-title">Confirm Correction</div>
-            <div class="rv-reason-field-name">${fieldLabel}</div>
+            <div class="rv-reason-field-name">${escapeHtml(fieldLabel)}</div>
             <div class="rv-reason-detected-label">Detected text</div>
             <div class="rv-reason-detected-text">${escapeHtml(displayText)}</div>
             <div class="rv-reason-ask">Why are you correcting this field?</div>

@@ -23,7 +23,7 @@ from typing import Any, AsyncGenerator
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -57,6 +57,7 @@ from .auth import (
 from .models import (
     ApiKeyCreate,
     ApiKeyOut,
+    CorrectionSaveRequest,
     ExtractionJobStartOut,
     ExtractionOut,
     HealthOut,
@@ -64,6 +65,7 @@ from .models import (
     JobStatusOut,
     LoginRequest,
     SubscriptionCreate,
+    SubscriptionLimitUpdate,
     SubscriptionOut,
     TemplateSaveResponse,
     TemplateCreate,
@@ -81,7 +83,10 @@ from .models import (
     VendorAliasCreate,
     VendorAliasOut,
     VendorCreate,
+    VendorMappingSave,
     VendorOut,
+    VendorOwnerAssign,
+    validate_field_name_list,
 )
 from .object_store import ARTIFACTS_BUCKET, DOCUMENTS_BUCKET, get_store
 from .mlflow_tracing import (
@@ -461,6 +466,30 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
             plog.current_stage.reset(stage_token)
 
 
+# -- Security headers -------------------------------------------------------
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        # Only add CSP and nosniff to HTML responses.
+        # Applying nosniff to static files on Windows can cause the browser to
+        # reject CSS/JS served with wrong MIME types from Python's mimetypes module.
+        content_type = response.headers.get("content-type", "")
+        if "text/html" in content_type:
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; "
+                "script-src 'self' 'unsafe-inline'; "
+                "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+                "font-src 'self' https://fonts.gstatic.com; "
+                "img-src 'self' data: blob:; "
+                "connect-src 'self'"
+            )
+        return response
+
+
 # -- App --------------------------------------------------------------------
 
 app = FastAPI(
@@ -471,6 +500,7 @@ app = FastAPI(
 )
 
 app.state.limiter = limiter
+app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(MaxUploadSizeMiddleware)
 app.add_middleware(
     CORSMiddleware,
@@ -947,7 +977,7 @@ async def admin_get_user_usage(
 async def admin_update_subscription_limit(
     request: Request,
     user_id: str,
-    body: dict,
+    body: SubscriptionLimitUpdate,
     user: dict = Depends(require_admin),
 ):
     """Update a user's subscription page limit at runtime.
@@ -955,14 +985,11 @@ async def admin_update_subscription_limit(
     Body: {"subscription_limit": 2000}
     """
     pool = request.app.state.pool
-    new_limit = body.get("subscription_limit")
-    if new_limit is None or not isinstance(new_limit, int) or new_limit < 0:
-        raise HTTPException(status_code=400, detail="subscription_limit must be a non-negative integer")
-    ok = await db_mod.update_user_subscription_limit(pool, user_id, new_limit)
+    ok = await db_mod.update_user_subscription_limit(pool, user_id, body.subscription_limit)
     if not ok:
         raise HTTPException(status_code=404, detail="User not found")
-    logger.info("Admin %s updated subscription_limit for user %s to %d", user["id"], user_id, new_limit)
-    return {"status": "updated", "user_id": user_id, "subscription_limit": new_limit}
+    logger.info("Admin %s updated subscription_limit for user %s to %d", user["id"], user_id, body.subscription_limit)
+    return {"status": "updated", "user_id": user_id, "subscription_limit": body.subscription_limit}
 
 
 # -- Admin: Subscriptions & Top-ups -----------------------------------------
@@ -1262,9 +1289,10 @@ async def admin_create_api_key(
     """Create a new API key for an existing client user."""
     pool = request.app.state.pool
     label = body.label.strip()
+    owner_user_id = str(body.owner_user_id)
 
     # Validate owner user exists and is a client
-    owner = await db_mod.get_user_by_id(pool, body.owner_user_id)
+    owner = await db_mod.get_user_by_id(pool, owner_user_id)
     if not owner:
         raise HTTPException(status_code=404, detail="User not found")
     if owner.get("role") not in ("client", "admin"):
@@ -1282,7 +1310,7 @@ async def admin_create_api_key(
     try:
         key_row = await db_mod.create_api_key(
             pool,
-            user_id=body.owner_user_id,
+            user_id=owner_user_id,
             label=label,
             key_hash=key_hash,
             prefix=prefix,
@@ -1294,7 +1322,7 @@ async def admin_create_api_key(
             status_code=409,
             detail=f"A key named '{label}' already exists for this user. Choose a different name.",
         )
-    logger.info("Admin %s created API key '%s' for user %s (expires=%s)", user["id"], label, body.owner_user_id, expires_at)
+    logger.info("Admin %s created API key '%s' for user %s (expires=%s)", user["id"], label, owner_user_id, expires_at)
 
     return {"id": key_row.get("id"), "raw_key": raw_key, "label": label, "prefix": prefix}
 
@@ -1318,6 +1346,11 @@ async def admin_reveal_api_key(
         )
     from .auth import decrypt_api_key
     raw = decrypt_api_key(row["encrypted_key"])
+    logger.warning(
+        "API_KEY_REVEALED key_id=%s label=%r actor=%s actor_email=%s ip=%s",
+        key_id, row.get("label"), _user.get("id"), _user.get("email"),
+        request.client.host if request.client else "unknown",
+    )
     return {"raw_key": raw, "label": row["label"]}
 
 
@@ -1424,12 +1457,18 @@ async def create_vendor(request: Request, body: VendorCreate, user: dict = Depen
     pool = request.app.state.pool
 
     if user["role"] == "admin":
-        owner_id = body.user_id
-        if not owner_id:
+        if not body.user_id:
             raise HTTPException(
                 status_code=400,
                 detail="Admin must specify user_id when creating a new vendor",
             )
+        try:
+            owner_id = str(uuid.UUID(str(body.user_id)))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="user_id must be a valid UUID")
+        owner = await db_mod.get_user_by_id(pool, owner_id)
+        if not owner:
+            raise HTTPException(status_code=404, detail="User not found")
     else:
         # Clients always own vendors they create; ignore any user_id in body.
         owner_id = user["id"]
@@ -1486,12 +1525,9 @@ async def delete_alias(request: Request, alias_id: int, user: dict = Depends(get
 
 @app.patch("/vendors/{vendor_id}/owner", response_model=VendorOut)
 @limiter.limit(f"{RATE_LIMIT}/minute")
-async def assign_vendor_owner(request: Request, vendor_id: str, body: dict, _user: dict = Depends(require_admin)):
+async def assign_vendor_owner(request: Request, vendor_id: str, body: VendorOwnerAssign, _user: dict = Depends(require_admin)):
     pool = request.app.state.pool
-    new_owner_id = body.get("user_id")
-    if not new_owner_id:
-        raise HTTPException(status_code=400, detail="user_id is required")
-    # Verify target user exists
+    new_owner_id = str(body.user_id)
     target = await db_mod.get_user_by_id(pool, new_owner_id)
     if not target:
         raise HTTPException(status_code=404, detail="Target user not found")
@@ -1696,6 +1732,8 @@ async def get_spatial_memory_fields(
     extraction = await db_mod.get_extraction(pool, extraction_id)
     if not extraction:
         raise HTTPException(404, detail="Extraction not found")
+    _raise_if_review_unavailable(extraction)
+    await _raise_if_ocr_review_unavailable(pool, extraction_id)
 
     vendor_id = extraction.get("vendor_id")
     template_id = extraction.get("template_id")
@@ -1900,7 +1938,7 @@ async def get_vendor_mapping(
 async def save_vendor_mapping(
     request: Request,
     vendor_id: str,
-    body: dict = Body(...),
+    body: VendorMappingSave,
     user: dict = Depends(require_admin),
 ):
     """Save (upsert) a vendor's ERP field mapping. Admin only."""
@@ -1914,29 +1952,38 @@ async def save_vendor_mapping(
             detail="Configure a template for this vendor before saving a mapping.",
         )
 
-    header_map = body.get("header_map")
-    line_map = body.get("line_map")
-    if not isinstance(header_map, dict) or not isinstance(line_map, dict):
-        raise HTTPException(400, detail="header_map and line_map must be objects.")
-
     # Resolve the assigned schema so we can validate target field names.
-    schema_id = body.get("schema_id")
-    if schema_id is not None:
-        schema_id = int(schema_id)
     schema = None
-    if schema_id:
-        schema = await db_mod.get_schema_by_id(pool, schema_id)
+    if body.schema_id:
+        schema = await db_mod.get_schema_by_id(pool, body.schema_id)
+        if not schema:
+            raise HTTPException(status_code=404, detail=f"Schema {body.schema_id} not found")
     if not schema:
         schema = await db_mod.get_schema_by_slug(pool, "ap_automation")
 
+    header_sources = set(tmpl.get("header_fields") or [])
+    line_sources = set(tmpl.get("line_item_fields") or [])
     header_targets = set((schema or {}).get("header_fields") or [])
     line_targets = set((schema or {}).get("line_fields") or [])
 
-    # Keep only entries that point at a known target field in the selected schema.
-    header_map = {str(k): v for k, v in header_map.items()
-                  if not header_targets or v in header_targets}
-    line_map = {str(k): v for k, v in line_map.items()
-                if not line_targets or v in line_targets}
+    def _reject_invalid_mapping(kind: str, mapping: dict[str, str], sources: set[str], targets: set[str]) -> None:
+        bad_sources = sorted(k for k in mapping if k not in sources)
+        bad_targets = sorted({v for v in mapping.values() if targets and v not in targets})
+        if bad_sources or bad_targets:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "INVALID_MAPPING",
+                    "message": f"{kind} mapping contains unknown source or target fields.",
+                    "unknown_sources": bad_sources,
+                    "unknown_targets": bad_targets,
+                },
+            )
+
+    _reject_invalid_mapping("header", body.header_map, header_sources, header_targets)
+    _reject_invalid_mapping("line", body.line_map, line_sources, line_targets)
+    header_map = dict(body.header_map)
+    line_map = dict(body.line_map)
 
     existing = await db_mod.get_field_mapping(pool, vendor_id)
     saved = await db_mod.upsert_field_mapping(
@@ -2105,6 +2152,11 @@ async def ingest_document(
         req_items = json.loads(line_item_fields) if line_item_fields else []
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail={"code": "INVALID_JSON_FIELD", "message": f"header_fields or line_item_fields is not valid JSON: {exc}"}) from exc
+    try:
+        req_header = validate_field_name_list(req_header)
+        req_items = validate_field_name_list(req_items)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_FIELD_LIST", "message": f"header_fields/line_item_fields: {exc}"}) from exc
 
     # -- Page count + hard cap -------------------------------------------------
     if filename.lower().endswith(".pdf"):
@@ -2268,6 +2320,13 @@ async def ingest_document(
     # themselves. The worker reads metadata.detect_user_id directly.
     detect_user_id = user["id"]
     if user.get("role") == "admin" and act_as_client_id:
+        try:
+            act_as_client_id = str(uuid.UUID(str(act_as_client_id)))
+        except ValueError:
+            raise HTTPException(status_code=400, detail={"code": "INVALID_CLIENT_ID", "message": "act_as_client_id must be a valid UUID"})
+        target_client = await db_mod.get_user_by_id(pool, act_as_client_id)
+        if not target_client:
+            raise HTTPException(status_code=404, detail={"code": "CLIENT_NOT_FOUND", "message": "act_as_client_id user not found"})
         detect_user_id = act_as_client_id
     ingest_metadata = {
         "billing_user_id": billing_user_id,
@@ -2750,7 +2809,7 @@ async def get_extraction_pages(
 @app.get("/vendors/{vendor_id}/extractions", response_model=list[ExtractionOut])
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def list_vendor_extractions(
-    request: Request, vendor_id: str, limit: int = 20,
+    request: Request, vendor_id: str, limit: int = Query(20, ge=1, le=100),
     user: dict = Depends(get_current_user),
 ):
     await assert_vendor_access(request.app.state.pool, vendor_id, user)
@@ -2776,7 +2835,10 @@ async def list_all_templates(request: Request, user: dict = Depends(get_current_
 @app.get("/extractions", response_model=list[ExtractionOut])
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def list_all_extractions(
-    request: Request, limit: int = 10, offset: int = 0, user: dict = Depends(get_current_user),
+    request: Request,
+    limit: int = Query(10, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    user: dict = Depends(get_current_user),
 ):
     filter_user = None if user["role"] == "admin" else user["id"]
     rows = await db_mod.list_all_extractions(
@@ -2820,11 +2882,76 @@ REVIEW_UNAVAILABLE_OCR_MESSAGE = (
     "OCR failed for this extraction. Drag/drop review, bounding boxes, and spatial memory are unavailable."
 )
 
+REVIEW_UNAVAILABLE_EXTRACTION_FAILED = "REVIEW_UNAVAILABLE_EXTRACTION_FAILED"
+REVIEW_UNAVAILABLE_FAILED_MESSAGE = (
+    "This extraction failed and cannot be reviewed. Re-run the extraction once the problem is fixed."
+)
+REVIEW_UNAVAILABLE_NOT_READY = "REVIEW_UNAVAILABLE_NOT_READY"
+REVIEW_UNAVAILABLE_NOT_READY_MESSAGE = (
+    "Review is available only after a successful extraction completes."
+)
 
-def _has_field_locations(value) -> bool:
-    if isinstance(value, list):
-        return any(bool(item) for item in value if isinstance(item, dict))
-    return bool(value)
+
+def _page_results_have_errors(page_results) -> bool:
+    if not isinstance(page_results, list):
+        return False
+    return any(
+        isinstance(page_result, dict) and page_result.get("_error")
+        for page_result in page_results
+    )
+
+
+def _review_unavailable_detail(extraction: dict) -> dict | None:
+    progress = extraction.get("progress") if isinstance(extraction.get("progress"), dict) else {}
+    result = extraction.get("result")
+    page_results = extraction.get("page_results")
+    status = extraction.get("status")
+
+    if status != "done":
+        failed_status = status in {"failed", "partial", "cancelled", "unverified"}
+        return {
+            "code": REVIEW_UNAVAILABLE_EXTRACTION_FAILED if failed_status else REVIEW_UNAVAILABLE_NOT_READY,
+            "message": REVIEW_UNAVAILABLE_FAILED_MESSAGE if failed_status else REVIEW_UNAVAILABLE_NOT_READY_MESSAGE,
+            "extraction_id": extraction.get("id"),
+            "status": status,
+            "error": extraction.get("error"),
+        }
+
+    if extraction.get("error") or _all_pages_failed(result, page_results) or _page_results_have_errors(page_results):
+        return {
+            "code": REVIEW_UNAVAILABLE_EXTRACTION_FAILED,
+            "message": REVIEW_UNAVAILABLE_FAILED_MESSAGE,
+            "extraction_id": extraction.get("id"),
+            "status": status,
+            "error": extraction.get("error"),
+            "errors": _collect_extraction_errors(result, page_results)[:5],
+        }
+
+    if progress.get("review_available") is False or progress.get("warning_code") or progress.get("ocr_error"):
+        return {
+            "code": progress.get("warning_code") or REVIEW_UNAVAILABLE_OCR_FAILED,
+            "message": REVIEW_UNAVAILABLE_OCR_MESSAGE,
+            "extraction_id": extraction.get("id"),
+            "status": status,
+            "ocr_error": progress.get("ocr_error"),
+        }
+
+    return None
+
+
+def _raise_if_review_unavailable(extraction: dict) -> None:
+    """Backend source of truth for review availability.
+
+    Review and corrections are available only for a clean completed extraction.
+    Any pipeline failure or explicit review-disabled warning blocks every review
+    API path so the frontend and backend cannot disagree.
+    """
+    detail = _review_unavailable_detail(extraction)
+    if detail:
+        raise HTTPException(
+            409,
+            detail=detail,
+        )
 
 
 async def _raise_if_ocr_review_unavailable(pool, extraction_id: int) -> None:
@@ -2849,9 +2976,13 @@ async def get_extraction_ocr(
     """Return PaddleOCR word data for the click-to-select correction UI."""
     pool = request.app.state.pool
     await assert_extraction_access(pool, extraction_id, user)
+    extraction = await db_mod.get_extraction(pool, extraction_id)
+    if not extraction:
+        raise HTTPException(404, detail="Extraction not found")
+    _raise_if_review_unavailable(extraction)
+    await _raise_if_ocr_review_unavailable(pool, extraction_id)
     ocr_data = await db_mod.get_ocr_data(pool, extraction_id)
     if ocr_data is None:
-        await _raise_if_ocr_review_unavailable(pool, extraction_id)
         raise HTTPException(404, detail="No OCR data found for this extraction")
     return {"extraction_id": extraction_id, "ocr_pages": ocr_data}
 
@@ -2869,13 +3000,18 @@ async def get_extraction_geometry(
     """
     pool = request.app.state.pool
     await assert_extraction_access(pool, extraction_id, user)
+    extraction = await db_mod.get_extraction(pool, extraction_id)
+    if not extraction:
+        raise HTTPException(404, detail="Extraction not found")
+    _raise_if_review_unavailable(extraction)
+    await _raise_if_ocr_review_unavailable(pool, extraction_id)
     pages = await db_mod.get_pages(pool, extraction_id)
     if not pages:
         raise HTTPException(404, detail="No pages found for this extraction")
 
     ocr_data = await db_mod.get_ocr_data(pool, extraction_id)
     if ocr_data is None:
-        await _raise_if_ocr_review_unavailable(pool, extraction_id)
+        raise HTTPException(404, detail="No OCR data found for this extraction")
     ocr_by_page = {
         entry.get("page_number"): entry
         for entry in (ocr_data or [])
@@ -2971,7 +3107,10 @@ def _compute_correction_diff(original, corrected) -> dict:
 @app.put("/extractions/{extraction_id}/corrections")
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def save_extraction_corrections(
-    request: Request, extraction_id: int, user: dict = Depends(get_current_user),
+    request: Request,
+    extraction_id: int,
+    body: CorrectionSaveRequest,
+    user: dict = Depends(get_current_user),
 ):
     """Persist user corrections from the Review page.
 
@@ -2981,15 +3120,12 @@ async def save_extraction_corrections(
     """
     pool_for_check = request.app.state.pool
     await assert_extraction_access(pool_for_check, extraction_id, user)
-    body = await request.json()
-    corrected_result = body.get("corrected_result")
-    field_locations = body.get("field_locations", {})
-    actor = body.get("actor") or "ui"
-    reason_code = body.get("reason_code") or "manual_review"
-    note = body.get("note")
-
-    if corrected_result is None:
-        raise HTTPException(400, detail="corrected_result is required")
+    payload = body.model_dump(exclude_none=True)
+    corrected_result = payload["corrected_result"]
+    field_locations = payload.get("field_locations") or {}
+    actor = payload.get("actor") or "ui"
+    reason_code = payload.get("reason_code") or "manual_review"
+    note = payload.get("note")
 
     pool = request.app.state.pool
 
@@ -2997,8 +3133,10 @@ async def save_extraction_corrections(
     extraction = await db_mod.get_extraction(pool, extraction_id)
     if not extraction:
         raise HTTPException(404, detail=f"Extraction {extraction_id} not found")
-    if _has_field_locations(field_locations) and not extraction.get("ocr_data"):
-        await _raise_if_ocr_review_unavailable(pool, extraction_id)
+    _raise_if_review_unavailable(extraction)
+    await _raise_if_ocr_review_unavailable(pool, extraction_id)
+    if not extraction.get("ocr_data"):
+        raise HTTPException(404, detail="No OCR data found for this extraction")
 
     original_result = extraction.get("result") or {}
     base = {
@@ -3144,6 +3282,8 @@ async def get_extraction_reviews(
     extraction = await db_mod.get_extraction(pool, extraction_id)
     if not extraction:
         raise HTTPException(404, detail="Extraction not found")
+    _raise_if_review_unavailable(extraction)
+    await _raise_if_ocr_review_unavailable(pool, extraction_id)
     return {"extraction_id": extraction_id, "reviews": await db_mod.list_review_events(pool, extraction_id)}
 
 
@@ -3213,7 +3353,7 @@ async def delete_spatial_memory_entry(
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def admin_list_quota_events(
     request: Request,
-    limit: int = 100,
+    limit: int = Query(100, ge=1),
     _user: dict = Depends(require_admin),
 ):
     """Return recent quota grace/exceeded events for admin monitoring."""
@@ -3239,8 +3379,8 @@ async def admin_list_quota_events(
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def admin_list_spatial_memory(
     request: Request,
-    limit: int = 500,
-    offset: int = 0,
+    limit: int = Query(500, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     _user: dict = Depends(require_admin),
 ):
     """Admin: list all active spatial memory entries across all vendors."""
@@ -3261,7 +3401,7 @@ async def admin_list_spatial_memory(
 @app.get("/extractions/{extraction_id}/trace")
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def get_extraction_trace(
-    request: Request, extraction_id: int, limit: int | None = None,
+    request: Request, extraction_id: int, limit: int | None = Query(None, ge=1, le=1000),
     user: dict = Depends(get_current_user),
 ):
     pool = request.app.state.pool
@@ -3370,7 +3510,7 @@ async def get_admin_usage_clients(request: Request, _: dict = Depends(require_ad
 async def get_client_documents_usage(
     request: Request,
     client_user_id: str,
-    limit: int = 50,
+    limit: int = Query(50, ge=1, le=500),
     date_from: str | None = None,
     date_to: str | None = None,
     range: str | None = None,
@@ -3396,7 +3536,7 @@ async def get_client_documents_usage(
 async def get_client_usage_dashboard(
     request: Request,
     client_user_id: str,
-    limit: int = 100,
+    limit: int = Query(100, ge=1, le=500),
     date_from: str | None = None,
     date_to: str | None = None,
     range: str | None = None,
@@ -3487,7 +3627,7 @@ async def get_extraction_page_usage(
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def get_user_documents(
     request: Request,
-    limit: int = 200,
+    limit: int = Query(200, ge=1, le=500),
     date_from: str | None = None,
     date_to: str | None = None,
     range: str | None = None,
@@ -3538,7 +3678,7 @@ async def get_user_extraction_page_usage(
 @limiter.limit(f"{RATE_LIMIT}/minute")
 async def get_admin_usage(
     request: Request,
-    limit: int = 50,
+    limit: int = Query(50, ge=1, le=500),
     vendor_id: str | None = None,
     doc_id: str | None = None,
     include_calls: bool = False,
@@ -3607,7 +3747,7 @@ async def admin_client_vendors(
 async def admin_vendor_stats(
     request: Request,
     vendor_id: str,
-    days: int = 30,
+    days: int = Query(30, ge=1, le=365),
     _: dict = Depends(require_admin),
 ):
     """Admin: per-day + per-page stats for one vendor."""
@@ -3629,7 +3769,7 @@ async def user_vendor_summary(request: Request, user: dict = Depends(get_current
 async def user_vendor_stats(
     request: Request,
     vendor_id: str,
-    days: int = 30,
+    days: int = Query(30, ge=1, le=365),
     user: dict = Depends(get_current_user),
 ):
     """Client: per-day + per-page breakdown for one of their own vendors."""
@@ -3670,6 +3810,16 @@ async def extract_via_api_key(
     # Compute file hash
     file_sha256 = hashlib.sha256(file_bytes).hexdigest()
     idempotency_key = request.headers.get("Idempotency-Key")
+    if idempotency_key is not None:
+        idempotency_key = idempotency_key.strip()
+        if not idempotency_key or len(idempotency_key) > 128 or any(ord(c) < 32 for c in idempotency_key):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "INVALID_IDEMPOTENCY_KEY",
+                    "message": "Idempotency-Key must be 1-128 printable characters.",
+                },
+            )
 
     claim = None
     extraction_id = None

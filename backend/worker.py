@@ -8,6 +8,7 @@ import asyncio
 import base64
 import json as _json
 import logging
+import math
 import os
 import time
 from uuid import uuid4
@@ -200,6 +201,53 @@ async def _maybe_enqueue_postprocess(
     if trace_context:
         payload["trace_context"] = trace_context
     await db_mod.ensure_job(pool, extraction_id, document_id, "postprocess", payload)
+
+
+def _page_results_have_errors(page_results) -> bool:
+    if not isinstance(page_results, list):
+        return False
+    return any(
+        isinstance(page_result, dict) and page_result.get("_error")
+        for page_result in page_results
+    )
+
+
+def _all_pages_failed(result, page_results) -> bool:
+    if isinstance(result, dict) and result.get("_all_pages_failed"):
+        return True
+    if isinstance(page_results, list) and page_results:
+        return all(isinstance(page_result, dict) and "_error" in page_result for page_result in page_results)
+    return False
+
+
+def _postprocess_failure_reason(extraction_row: dict) -> str | None:
+    result = extraction_row.get("result")
+    page_results = extraction_row.get("page_results")
+    if extraction_row.get("error") == LLM_FAILED_ERROR:
+        return LLM_FAILED_MESSAGE
+    if _all_pages_failed(result, page_results) or _page_results_have_errors(page_results):
+        return LLM_FAILED_MESSAGE
+    if extraction_row.get("status") in {"failed", "partial", "cancelled", "unverified"}:
+        return extraction_row.get("error") or f"Extraction is {extraction_row.get('status')}"
+    return None
+
+
+async def _update_processing_progress_if_not_failed(pool, extraction_id: int, progress: dict) -> bool:
+    current = await db_mod.get_extraction(pool, extraction_id)
+    if not current:
+        return False
+    failure_reason = _postprocess_failure_reason(current)
+    if failure_reason:
+        await db_mod.set_extraction_status(
+            pool,
+            extraction_id,
+            "failed",
+            progress={"stage": progress.get("stage"), "message": failure_reason},
+            error=current.get("error") or LLM_FAILED_ERROR,
+        )
+        return False
+    await db_mod.update_extraction_progress(pool, extraction_id, progress, status="processing")
+    return True
 
 
 # dynamic qwen_ocr module helper removed
@@ -613,19 +661,19 @@ async def _process_ocr(pool, job: dict) -> None:
             job["id"],
             {"stage": "ocr", "pages_processed": 0, "message": "All pages digital — OCR skipped"},
         )
-        await db_mod.update_extraction_progress(
+        await _update_processing_progress_if_not_failed(
             pool,
             extraction_id,
             {"stage": "ocr", "message": "All pages digital — OCR skipped"},
-            status="processing",
         )
     else:
-        await db_mod.update_extraction_progress(
+        can_continue = await _update_processing_progress_if_not_failed(
             pool,
             extraction_id,
             {"stage": "ocr", "message": f"Running OCR on {len(scanned_page_numbers)} scanned page(s)"},
-            status="processing",
         )
+        if not can_continue:
+            return
         # Load only scanned page images for OCR
         scanned_set = set(scanned_page_numbers)
         all_pages_loaded = await _load_pages(pool, extraction_id)
@@ -689,6 +737,17 @@ async def _process_ocr(pool, job: dict) -> None:
     if await _stop_if_cancelled(pool, extraction_id, "ocr", "Cancelled during OCR"):
         raise JobCancelled("Cancelled during OCR")
     logger.info("── OCR completed ── ext=%s", extraction_id)
+    current = await db_mod.get_extraction(pool, extraction_id)
+    failure_reason = _postprocess_failure_reason(current or {})
+    if failure_reason:
+        await db_mod.set_extraction_status(
+            pool,
+            extraction_id,
+            "failed",
+            progress={"stage": "ocr", "message": failure_reason},
+            error=(current or {}).get("error") or LLM_FAILED_ERROR,
+        )
+        return
     await _maybe_enqueue_postprocess(pool, extraction_id, job["document_id"], _job_trace_context(job))
 
 
@@ -875,10 +934,13 @@ async def _process_llm(pool, job: dict) -> None:
             for field_key, raw_box in _p1_boxes.items():
                 if not isinstance(raw_box, list) or len(raw_box) != 4:
                     continue
-                nx0 = max(0.0, raw_box[0] / 1000.0)
-                ny0 = max(0.0, raw_box[1] / 1000.0)
-                nx1 = min(1.0, raw_box[2] / 1000.0)
-                ny1 = min(1.0, raw_box[3] / 1000.0)
+                if any(not isinstance(coord, (int, float)) or not math.isfinite(coord) for coord in raw_box):
+                    continue
+                x0, y0, x1, y1 = (float(coord) for coord in raw_box)
+                nx0 = max(0.0, x0 / 1000.0)
+                ny0 = max(0.0, y0 / 1000.0)
+                nx1 = min(1.0, x1 / 1000.0)
+                ny1 = min(1.0, y1 / 1000.0)
                 if nx1 <= nx0 or ny1 <= ny0:
                     continue
                 field_type = "line_item_column" if field_key in req_items_set else "header"
@@ -1051,6 +1113,28 @@ async def _process_postprocess(pool, job: dict) -> None:
     page_results = extraction_row.get("page_results")
     vendor_id = extraction_row.get("vendor_id")
     template_id = extraction_row.get("template_id")
+
+    failure_reason = _postprocess_failure_reason(extraction_row)
+    if failure_reason:
+        logger.warning(
+            "Postprocess blocked for failed extraction: ext=%s status=%s error=%s",
+            extraction_id,
+            extraction_row.get("status"),
+            extraction_row.get("error"),
+        )
+        await db_mod.set_extraction_status(
+            pool,
+            extraction_id,
+            "failed",
+            progress={"stage": "postprocess", "message": failure_reason},
+            error=extraction_row.get("error") or LLM_FAILED_ERROR,
+        )
+        raise ValueError(failure_reason)
+    if extraction_row.get("status") == "done":
+        logger.info("Postprocess skipped: extraction already done ext=%s", extraction_id)
+        return
+    if extraction_row.get("status") != "processing":
+        raise ValueError(f"Postprocess prerequisites not satisfied (status={extraction_row.get('status')})")
 
     # ── Debug dump: save OCR + Qwen outputs for offline analysis ──
     if DEBUG_DUMP_BBOX:
@@ -1311,6 +1395,8 @@ async def process_job(pool, stage: str, job: dict) -> None:
 async def run_worker(stage: str, worker_name: str) -> None:
     if stage == "llm":
         setup_mlflow()
+    if stage == "ocr":
+        await ocr_runner.warmup_ocr_engines()
     pool = await db_mod.create_pool()
     await db_mod.init(pool)
     plog.current_worker.set(worker_name)

@@ -69,6 +69,23 @@ def _strip_newlines(obj: Any) -> Any:
     return obj
 
 
+def _coerce_page_json(parsed: Any, page_num: int, raw: str) -> dict:
+    """Return a page result object or a page-level error for malformed JSON shape."""
+    if not isinstance(parsed, dict):
+        plog.error(
+            f"page {page_num} malformed response (top-level JSON is not an object)",
+            logger=__name__,
+            json_type=type(parsed).__name__,
+            raw=raw[:200],
+        )
+        return {
+            "_error": "invalid_json_shape",
+            "_page": page_num,
+            "_raw": raw[:200],
+        }
+    return _strip_newlines(parsed)
+
+
 # v5.4 = removed vendor_confirmed and restored verified gold correction diffs.
 PROMPT_VERSION = "v5.4"
 
@@ -489,21 +506,23 @@ async def call_llm(
     # Attempt JSON parse with progressive fallback
     try:
         parsed = json.loads(raw)
+        page_payload = _coerce_page_json(parsed, page_num, raw)
         if pipeline_context is not None:
-            fields = parsed.get("fields", parsed) if isinstance(parsed, dict) else {}
+            fields = page_payload.get("fields", page_payload) if "_error" not in page_payload else {}
             fc = len([k for k in fields.keys() if k != "line_items"]) if isinstance(fields, dict) else 0
             li = len(fields.get("line_items") or []) if isinstance(fields, dict) else 0
             logger.info("Parsed page %d/%d: %d fields, %d line items", page_num, total_pages, fc, li)
         await _record_usage_if_needed()
-        return _strip_newlines(parsed)
+        return page_payload
     except json.JSONDecodeError:
         # Fallback 1: fix leading-zero numbers (e.g. 0070 -> "0070")
         raw_fixed = re.sub(r'([\[:,]\s*)(-?0[0-9]+)(\s*[\]},])', r'\1"\2"\3', raw)
         try:
             parsed = json.loads(raw_fixed)
             logger.warning("LLM JSON recovered via leading-zero fix (page %d)", page_num)
+            page_payload = _coerce_page_json(parsed, page_num, raw_fixed)
             await _record_usage_if_needed()
-            return _strip_newlines(parsed)
+            return page_payload
         except json.JSONDecodeError:
             pass
 

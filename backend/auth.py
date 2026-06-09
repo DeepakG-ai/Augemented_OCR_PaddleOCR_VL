@@ -184,12 +184,13 @@ async def get_current_user(
     role = payload.get("role")
     email = payload.get("email")
     pool = getattr(request.app.state, "pool", None)
-    if pool is not None:
-        record = await db_mod.get_user_by_id(pool, user_id)
-        if not record or not record.get("is_active", True):
-            raise HTTPException(status_code=401, detail="User disabled or missing")
-        role = record.get("role")
-        email = record.get("email")
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Database pool unavailable")
+    record = await db_mod.get_user_by_id(pool, user_id)
+    if not record or not record.get("is_active", True):
+        raise HTTPException(status_code=401, detail="User disabled or missing")
+    role = record.get("role")
+    email = record.get("email")
 
     if not role:
         raise HTTPException(status_code=401, detail="Malformed token")
@@ -255,12 +256,13 @@ async def get_current_user_or_api_key(
 
     role = payload.get("role")
     email = payload.get("email")
-    if pool is not None:
-        record = await db_mod.get_user_by_id(pool, user_id)
-        if not record or not record.get("is_active", True):
-            raise HTTPException(status_code=401, detail="User disabled or missing")
-        role = record.get("role")
-        email = record.get("email")
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Database pool unavailable")
+    record = await db_mod.get_user_by_id(pool, user_id)
+    if not record or not record.get("is_active", True):
+        raise HTTPException(status_code=401, detail="User disabled or missing")
+    role = record.get("role")
+    email = record.get("email")
 
     if not role:
         raise HTTPException(status_code=401, detail="Malformed token")
@@ -298,12 +300,13 @@ async def get_current_user_sse(
     role = payload.get("role")
     email = payload.get("email")
     pool = getattr(request.app.state, "pool", None)
-    if pool is not None:
-        record = await db_mod.get_user_by_id(pool, user_id)
-        if not record or not record.get("is_active", True):
-            raise HTTPException(status_code=401, detail="User disabled or missing")
-        role = record.get("role")
-        email = record.get("email")
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Database pool unavailable")
+    record = await db_mod.get_user_by_id(pool, user_id)
+    if not record or not record.get("is_active", True):
+        raise HTTPException(status_code=401, detail="User disabled or missing")
+    role = record.get("role")
+    email = record.get("email")
 
     if not role:
         raise HTTPException(status_code=401, detail="Malformed token")

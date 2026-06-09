@@ -6,7 +6,30 @@
 const HISTORY_PAGE_SIZE = 10;
 window._historyCurrentPage = 1;
 
+function _historyReviewUnavailable(e) {
+    const progress = e.progress || {};
+    return e.status !== 'done'
+        || e.error
+        || progress.review_available === false
+        || progress.warning_code
+        || progress.ocr_error
+        || (e.result && typeof e.result === 'object' && e.result._all_pages_failed === true)
+        || (Array.isArray(e.page_results) && e.page_results.some(pr => pr && pr._error));
+}
+
+function _historyHasPipelineFailure(e) {
+    return e.error
+        || (e.result && typeof e.result === 'object' && e.result._all_pages_failed === true)
+        || (Array.isArray(e.page_results) && e.page_results.some(pr => pr && pr._error));
+}
+
+function _historyEffectiveStatus(e) {
+    return _historyHasPipelineFailure(e) ? 'failed' : e.status;
+}
+
 function _historyItemHTML(e, showDelete = false) {
+    const reviewUnavailable = _historyReviewUnavailable(e);
+    const effectiveStatus = _historyEffectiveStatus(e);
     return `
     <div class="history-item" onclick="showHistoryDetailSafe(${e.id})">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
@@ -14,10 +37,12 @@ function _historyItemHTML(e, showDelete = false) {
                 <div class="history-filename">${escapeHtml(e.filename || 'Unknown')}</div>
                 <div class="history-meta">
                     <span style="color:var(--blue);font-weight:500">${escapeHtml(e.vendor_name || e.vendor_id)}</span>
-                    <span class="history-status status-${safeClassToken(e.status)}">${escapeHtml(e.status)}</span>
+                    <span class="history-status status-${safeClassToken(effectiveStatus)}">${escapeHtml(effectiveStatus)}</span>
                     <span>${e.total_pages || 0} pages</span>
                     <span>${new Date(e.created_at).toLocaleString()}</span>
-                    <a class="link-btn" href="#/review/${e.id}" onclick="event.stopPropagation()" style="font-size:9px">Review</a>
+                    ${reviewUnavailable
+                        ? `<span class="link-btn" style="font-size:9px;color:var(--text-dim);cursor:not-allowed" title="Review unavailable for this extraction">Review N/A</span>`
+                        : `<a class="link-btn" href="#/review/${e.id}" onclick="event.stopPropagation()" style="font-size:9px">Review</a>`}
                 </div>
             </div>
             <div class="history-actions">
@@ -196,8 +221,9 @@ async function showHistoryDetailSafe(id) {
 
         const statusEl = document.getElementById('historyDetailStatus');
         if (statusEl) {
-            statusEl.className = `rp-badge ${data.status === 'done' ? 'optimal' : data.status === 'failed' ? 'review' : 'processing'}`;
-            statusEl.textContent = data.status || 'unknown';
+            const effectiveStatus = _historyEffectiveStatus(data);
+            statusEl.className = `rp-badge ${effectiveStatus === 'done' ? 'optimal' : effectiveStatus === 'failed' ? 'review' : 'processing'}`;
+            statusEl.textContent = effectiveStatus || 'unknown';
         }
 
         setText('historyDetailTitle', `${data.filename || 'Extraction'} - ${data.vendor_name || data.vendor_id}`);

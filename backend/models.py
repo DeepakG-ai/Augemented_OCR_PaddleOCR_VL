@@ -6,11 +6,54 @@ Users define these freely in the UI.
 """
 from __future__ import annotations
 
-import re
+import math
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+
+
+# -- Shared field-list limits ---------------------------------------------
+# Caps to keep user-defined field/rule lists sane (and the LLM prompt bounded).
+MAX_FIELD_COUNT = 200
+MAX_FIELD_NAME_LEN = 128
+MAX_RULE_LEN = 512
+RESERVED_FIELD_NAMES = {"line_items", "fields", "boxes", "_page", "_error", "_raw"}
+
+
+def validate_field_name_list(
+    values: Any,
+    *,
+    max_len: int = MAX_FIELD_NAME_LEN,
+    check_reserved: bool = True,
+    check_duplicates: bool = True,
+) -> list[str]:
+    """Validate a list of user-supplied field names / rules.
+
+    Rejects non-lists, oversized lists, non-string items, and overly long
+    items. Returns the list with each item stripped.
+    """
+    if not isinstance(values, list):
+        raise ValueError("must be a list")
+    if len(values) > MAX_FIELD_COUNT:
+        raise ValueError(f"too many entries (max {MAX_FIELD_COUNT})")
+    cleaned: list[str] = []
+    for item in values:
+        if not isinstance(item, str):
+            raise ValueError("each entry must be a string")
+        item = item.strip()
+        if not item:
+            raise ValueError("entries must not be blank")
+        if len(item) > max_len:
+            raise ValueError(f"entry too long (max {max_len} chars)")
+        lowered = item.lower()
+        if check_reserved and (lowered in RESERVED_FIELD_NAMES or lowered.startswith("_")):
+            raise ValueError(f"{item!r} is a reserved field name")
+        if check_duplicates and lowered in {existing.lower() for existing in cleaned}:
+            raise ValueError(f"duplicate field name: {item!r}")
+        cleaned.append(item)
+    return cleaned
 
 
 # -- Vendor ---------------------------------------------------------------
@@ -26,11 +69,27 @@ class VendorCreate(BaseModel):
     )
 
 
+    @field_validator("name")
+    @classmethod
+    def _clean_name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("name must not be blank")
+        if any(ord(ch) < 32 for ch in v):
+            raise ValueError("control characters are not allowed")
+        return v
+
+
 # -- Auth ------------------------------------------------------------------
 
 class LoginRequest(BaseModel):
-    email: str = Field(..., min_length=3, max_length=256)
+    email: EmailStr = Field(..., max_length=256)
     password: str = Field(..., min_length=1, max_length=256)
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def _normalize_email(cls, v: str) -> str:
+        return str(v).strip().lower()
 
 
 class UserOut(BaseModel):
@@ -104,22 +163,15 @@ class TokenOut(BaseModel):
     user: UserOut
 
 
-# Accepts local@domain.tld with any TLD (not just .com); rejects missing @, domain, or TLD.
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-
-
 class UserCreate(BaseModel):
-    email: str = Field(..., min_length=3, max_length=256)
+    email: EmailStr = Field(..., max_length=256)
     password: str = Field(..., min_length=8, max_length=256)
     role: str = Field("client", pattern=r"^(admin|client)$")
 
-    @field_validator("email")
+    @field_validator("email", mode="before")
     @classmethod
-    def _valid_email(cls, v: str) -> str:
-        v = v.strip()
-        if not _EMAIL_RE.match(v):
-            raise ValueError("Invalid email address")
-        return v
+    def _normalize_email(cls, v: str) -> str:
+        return str(v).strip().lower()
 
 
 class UserResetPassword(BaseModel):
@@ -133,11 +185,11 @@ class ApiKeyCreate(BaseModel):
         max_length=64,
         description="Human-readable name for this key (e.g. ap_automation, client.6)",
     )
-    owner_user_id: str = Field(
+    owner_user_id: UUID = Field(
         ...,
         description="UUID of the existing client user who owns this key.",
     )
-    expires_days: int | None = Field(
+    expires_days: Literal[30, 90, 365] | None = Field(
         None,
         description="Expiry in days from now. 30, 90, 365, or null for no expiry.",
     )
@@ -175,6 +227,16 @@ class VendorAliasCreate(BaseModel):
     pattern: str = Field(..., min_length=1, max_length=256)
     weight: int = Field(1, ge=1, le=10)
 
+    @field_validator("pattern")
+    @classmethod
+    def _clean_pattern(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("pattern must not be blank")
+        if any(ord(ch) < 32 for ch in v):
+            raise ValueError("control characters are not allowed")
+        return v
+
 
 class VendorAliasOut(BaseModel):
     id: int
@@ -195,6 +257,7 @@ class TemplateCreate(BaseModel):
     )
     vendor_name: str | None = Field(
         None,
+        max_length=256,
         description="Vendor display name — used to auto-upsert vendor if not in DB yet",
     )
     header_fields: list[str] = Field(
@@ -206,11 +269,31 @@ class TemplateCreate(BaseModel):
         description="Line item column names (e.g. no, description, qty, amount)",
     )
     prompt_instructions: str | None = Field(
-        None, description="Free-text layout hints from user"
+        None, max_length=4000, description="Free-text layout hints from user"
     )
     extraction_rules: list[str] = Field(
-        default_factory=list, description="Extraction rules"
+        default_factory=list, description="Extraction rules — free-text, max 512 chars each"
     )
+
+    @field_validator("header_fields", "line_item_fields")
+    @classmethod
+    def _validate_field_names(cls, v: list[str]) -> list[str]:
+        return validate_field_name_list(v)
+
+    @field_validator("extraction_rules")
+    @classmethod
+    def _validate_rules(cls, v: list[str]) -> list[str]:
+        cleaned = []
+        for item in v:
+            if not isinstance(item, str):
+                raise ValueError("each rule must be a string")
+            item = item.strip()
+            if not item:
+                continue
+            if len(item) > MAX_RULE_LEN:
+                raise ValueError(f"rule too long (max {MAX_RULE_LEN} chars): {item[:40]!r}...")
+            cleaned.append(item)
+        return cleaned
 
 
 class TemplateOut(BaseModel):
@@ -245,7 +328,7 @@ class ExtractionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
     document_id: int | None = None
-    vendor_id: str
+    vendor_id: str | None = None
     vendor_name: str | None = None
     template_id: int | None
     filename: str | None
@@ -380,6 +463,101 @@ class TopupRequestCreate(BaseModel):
 
 class TopupRequestResolve(BaseModel):
     resolution_note: str | None = Field(None, max_length=500)
+
+
+# -- Admin typed request bodies -------------------------------------------
+
+class SubscriptionLimitUpdate(BaseModel):
+    subscription_limit: int = Field(..., ge=0)
+
+
+class VendorOwnerAssign(BaseModel):
+    user_id: UUID
+
+
+class CorrectionFieldLocation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    page: int = Field(..., ge=1)
+    # box is nullable: line-item column cells the model couldn't anchor are
+    # saved with box=None (strategy "qwen_column_header_missing"), and they
+    # round-trip through the Review save unchanged.
+    box: list[float] | None = Field(None, min_length=4, max_length=4)
+    matched_text: str | None = Field(None, max_length=5000)
+    score: float | None = Field(None, ge=0, le=1)
+    strategy: str | None = Field(None, max_length=128)
+    confidence: str | None = Field(None, max_length=32)
+    word_boxes: list[Any] | None = Field(None, max_length=500)
+
+    @field_validator("box")
+    @classmethod
+    def _valid_box(cls, v: list[float] | None) -> list[float] | None:
+        if v is None:
+            return v
+        if any(not math.isfinite(coord) for coord in v):
+            raise ValueError("box coordinates must be finite numbers")
+        x0, y0, x1, y1 = v
+        if x1 <= x0 or y1 <= y0:
+            raise ValueError("box must have positive width and height")
+        return v
+
+    @field_validator("strategy", "confidence")
+    @classmethod
+    def _no_control_text(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if any(ord(ch) < 32 for ch in v):
+            raise ValueError("control characters are not allowed")
+        return v.strip()
+
+
+class CorrectionSaveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    corrected_result: dict[str, Any] | list[dict[str, Any]]
+    field_locations: dict[str, CorrectionFieldLocation] | list[dict[str, CorrectionFieldLocation]] = Field(
+        default_factory=dict
+    )
+    actor: str = Field("ui", min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.:-]+$")
+    reason_code: str = Field(
+        "manual_review",
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    )
+    note: str | None = Field(None, max_length=500)
+
+
+class VendorMappingSave(BaseModel):
+    """ERP field-mapping save body: {source_field: canonical_target} dicts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    header_map: dict[str, str] = Field(default_factory=dict)
+    line_map: dict[str, str] = Field(default_factory=dict)
+    schema_id: int | None = Field(None, ge=1)
+
+    @field_validator("header_map", "line_map", mode="before")
+    @classmethod
+    def _bounded_map(cls, v: Any) -> dict[str, str]:
+        if not isinstance(v, dict):
+            raise ValueError("mapping must be an object")
+        if len(v) > MAX_FIELD_COUNT:
+            raise ValueError(f"too many mappings (max {MAX_FIELD_COUNT})")
+        cleaned: dict[str, str] = {}
+        for key, value in v.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise ValueError("mapping keys and values must be strings")
+            key = key.strip()
+            value = value.strip()
+            if not key or not value:
+                raise ValueError("mapping keys and values must not be blank")
+            if len(key) > MAX_FIELD_NAME_LEN or len(value) > MAX_FIELD_NAME_LEN:
+                raise ValueError(f"field name too long (max {MAX_FIELD_NAME_LEN} chars)")
+            if any(ord(ch) < 32 for ch in key + value):
+                raise ValueError("control characters are not allowed")
+            cleaned[key] = value
+        return cleaned
 
 
 class TopupRequestOut(BaseModel):

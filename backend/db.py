@@ -2608,7 +2608,14 @@ async def is_postprocess_ready(pool: asyncpg.Pool, extraction_id: int) -> bool:
             )
             SELECT (
                 e.status = 'processing'
+                AND e.error IS NULL
                 AND e.result IS NOT NULL
+                AND NOT COALESCE((e.result->>'_all_pages_failed') = 'true', FALSE)
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements(COALESCE(e.page_results, '[]'::jsonb)) AS pr
+                    WHERE pr ? '_error'
+                )
                 AND (
                     e.ocr_data IS NOT NULL
                     OR COALESCE((SELECT status = 'failed' FROM latest_ocr), FALSE)
