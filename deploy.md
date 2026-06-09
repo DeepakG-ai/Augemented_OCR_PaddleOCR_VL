@@ -578,6 +578,7 @@ LD_LIBRARY_PATH="$LLAMA_LIB_DIR" "$LLAMA_BIN" \
   -c "${LLAMA_CTX_SIZE:-8192}" \
   -b "${LLAMA_BATCH_SIZE:-4096}" \
   --parallel "${LLAMA_PARALLEL:-1}" \
+  --cont-batching \
   --image-min-tokens "${LLAMA_IMAGE_MIN_TOKENS:-1024}" \
   --image-max-tokens "${LLAMA_IMAGE_MAX_TOKENS:-2048}" \
   --cache-ram 0 \
@@ -687,6 +688,7 @@ LD_LIBRARY_PATH=/workspace/llama-server /workspace/llama-server/llama-server \
   -c 8192 \
   -b 4096 \
   --parallel 1 \
+  --cont-batching \
   --image-min-tokens 1024 \
   --image-max-tokens 2048 \
   --cache-ram 0 \
