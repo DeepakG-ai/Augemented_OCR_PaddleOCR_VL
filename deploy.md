@@ -129,7 +129,7 @@ Create this layout on the pod:
 |   |-- llama-server
 |   |-- libggml*.so*
 |   `-- libllama.so
-|-- models/qwen3vl/
+|-- models/qwen3.5/
 |   |-- Qwen3.5-9B-UD-Q4_K_XL.gguf
 |   `-- mmproj-F16.gguf
 |-- pgdata/                      # Postgres data
@@ -143,7 +143,7 @@ Create this layout on the pod:
 
 Why not `/opt`? Your local WSL build uses `/opt/llama-server` and `/opt/models`.
 That is fine locally, but on RunPod the durable place is `/workspace`. Use
-`/workspace/llama-server` and `/workspace/models/qwen3vl` so the build and model
+`/workspace/llama-server` and `/workspace/models/qwen3.5` so the build and model
 survive pod restarts.
 
 ## 3. Create The RunPod Pod
@@ -336,20 +336,17 @@ Recommended path: build on RunPod once, store the result in
 Create the model folder:
 
 ```bash
-mkdir -p /workspace/models/qwen3vl
-```
+mkdir -p /workspace/models/qwen3.5
+cd /workspace/models/qwen3.5
 
-Copy your two files there:
-
-```text
-/workspace/models/qwen3vl/Qwen3.5-9B-UD-Q4_K_XL.gguf
-/workspace/models/qwen3vl/mmproj-F16.gguf
+wget "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-UD-Q4_K_XL.gguf"
+wget "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/mmproj-F16.gguf"
 ```
 
 Verify:
 
 ```bash
-ls -lh /workspace/models/qwen3vl/
+ls -lh /workspace/models/qwen3.5/
 ```
 
 ## 9. Install MinIO
@@ -408,8 +405,8 @@ MLFLOW_TRACKING_URI=http://127.0.0.1:5000
 MLFLOW_EXPERIMENT_NAME=augmented_ocr
 
 # llama-server command settings used by start.sh
-MODEL_GGUF=/workspace/models/qwen3vl/Qwen3.5-9B-UD-Q4_K_XL.gguf
-MMPROJ_GGUF=/workspace/models/qwen3vl/mmproj-F16.gguf
+MODEL_GGUF=/workspace/models/qwen3.5/Qwen3.5-9B-UD-Q4_K_XL.gguf
+MMPROJ_GGUF=/workspace/models/qwen3.5/mmproj-F16.gguf
 LLAMA_SERVER_DIR=/workspace/llama-server
 LLAMA_HOST=127.0.0.1
 LLAMA_PORT=8056
@@ -680,8 +677,8 @@ use.
 
 ```bash
 LD_LIBRARY_PATH=/workspace/llama-server /workspace/llama-server/llama-server \
-  -m /workspace/models/qwen3vl/Qwen3.5-9B-UD-Q4_K_XL.gguf \
-  --mmproj /workspace/models/qwen3vl/mmproj-F16.gguf \
+  -m /workspace/models/qwen3.5/Qwen3.5-9B-UD-Q4_K_XL.gguf \
+  --mmproj /workspace/models/qwen3.5/mmproj-F16.gguf \
   --host 127.0.0.1 \
   --port 8056 \
   -ngl 99 \
