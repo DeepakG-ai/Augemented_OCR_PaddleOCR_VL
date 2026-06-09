@@ -21,7 +21,7 @@ inside the pod.
 
 ### Where does `.env` go?
 
-The real production `.env` goes on the RunPod network volume:
+The real production `.env` goes under `/workspace` on the pod:
 
 ```bash
 /workspace/.env
@@ -30,6 +30,11 @@ The real production `.env` goes on the RunPod network volume:
 Do not commit it. Do not put it inside the git repo. Do not include it in a zip.
 
 The repo file `.env.example` is only a template.
+
+Important: `/workspace` is only safe across pod deletion/recreation when the pod
+has an explicit RunPod network volume attached. If the pod only has the default
+volume disk, `/workspace` survives normal stop/start and pod edits, but it is
+not portable and is deleted with the pod.
 
 ### Do we use Docker on RunPod?
 
@@ -105,11 +110,13 @@ RunPod Ubuntu GPU Pod
   |-- llama-server           127.0.0.1:8056     private
   |-- workers                local processes
   |
-  `-- /workspace network volume
+  `-- /workspace storage
 ```
 
-The network volume is the only durable disk. Anything important must live under
-`/workspace`.
+`/workspace` is the only place this plan writes durable app state. For
+production, attach a RunPod network volume at `/workspace` before deploying. If
+IT gives you only a default volume disk, do not treat it as a backup or as data
+that can survive pod termination.
 
 ## 2. Persistent File Layout
 
@@ -142,9 +149,10 @@ Create this layout on the pod:
 ```
 
 Why not `/opt`? Your local WSL build uses `/opt/llama-server` and `/opt/models`.
-That is fine locally, but on RunPod the durable place is `/workspace`. Use
-`/workspace/llama-server` and `/workspace/models/qwen3.5` so the build and model
-survive pod restarts.
+That is fine locally, but on RunPod the intended persistent place is
+`/workspace`. Use `/workspace/llama-server` and `/workspace/models/qwen3.5` so
+the build and model survive normal restarts. For deletion/recreation safety,
+confirm that `/workspace` is backed by a network volume.
 
 ## 3. Create The RunPod Pod
 
@@ -153,7 +161,7 @@ Recommended pod settings:
 - Cloud type: Secure Cloud
 - GPU: RTX 5090 x1
 - Base image: Ubuntu/CUDA image with NVIDIA drivers visible in the pod
-- Network volume: mounted at `/workspace`
+- Storage: attach a RunPod network volume mounted at `/workspace` for production
 - Exposed HTTP ports: `8000` only
 
 Do not expose:
@@ -253,24 +261,38 @@ cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release -j $(nproc) --target llama-server
 ```
 
-Use the same idea on RunPod, but write everything under `/workspace`:
+That `b9294` pin is useful as a record of your local build, but do not use it as
+the first RunPod build for RTX 5090. Blackwell (`sm_120`) needs a CUDA 12.8+
+toolchain and a new enough `llama.cpp`; a mid-2024 commit may not understand the
+GPU target or newer multimodal flags. On RunPod, build current `main` first and
+record the exact commit that works.
+
+Build on RunPod under `/workspace`:
 
 ```bash
 cd /workspace
 git clone https://github.com/ggml-org/llama.cpp.git llama.cpp
 cd /workspace/llama.cpp
-git checkout b9294
+git pull --ff-only
+git rev-parse HEAD
 
 cmake -B build \
   -DGGML_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=120 \
   -DCMAKE_BUILD_TYPE=Release
 
 cmake --build build --config Release -j "$(nproc)" --target llama-server
 ```
 
-If the RTX 5090 image requires an explicit Blackwell target, rebuild with:
+If the build fails because the CUDA toolkit or CMake image is not ready for
+`sm_120`, verify the pod image has CUDA 12.8+ development tools and a recent
+CMake. Only pin a `llama.cpp` commit after you have verified it works on the
+actual RunPod RTX 5090.
+
+If you need to retry from a clean build directory:
 
 ```bash
+rm -rf build
 cmake -B build \
   -DGGML_CUDA=ON \
   -DCMAKE_CUDA_ARCHITECTURES=120 \
@@ -560,7 +582,7 @@ echo "Starting MLflow ..."
   >"$LOG_DIR/mlflow.log" 2>&1 &
 MLFLOW_PID=$!
 
-wait_for_http "http://127.0.0.1:5000/health" "MLflow"
+wait_for_http "http://127.0.0.1:5000/" "MLflow"
 
 echo "Starting llama-server ..."
 LLAMA_BIN="${LLAMA_SERVER_DIR:-/workspace/llama-server}/llama-server"
@@ -643,7 +665,7 @@ In a second pod terminal:
 ```bash
 pg_isready -h 127.0.0.1 -p 5432 -U postgres
 curl -fsS http://127.0.0.1:9000/minio/health/live
-curl -fsS http://127.0.0.1:5000/health
+curl -fsS http://127.0.0.1:5000/
 curl -fsS http://127.0.0.1:8056/v1/models
 curl -fsS http://127.0.0.1:8000/health
 ```
@@ -785,7 +807,7 @@ Useful checks:
 psql "$DATABASE_URL" -c "SELECT job_type, status, count(*) FROM jobs GROUP BY 1,2 ORDER BY 1,2;"
 /workspace/bin/mc alias set local http://127.0.0.1:9000 "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
 /workspace/bin/mc ls local
-curl -fsS http://127.0.0.1:5000/health
+curl -fsS http://127.0.0.1:5000/
 nvidia-smi
 ```
 
@@ -830,7 +852,9 @@ tail -f /workspace/logs/llama.log /workspace/logs/llm-1.log
 
 ## 18. Backups
 
-The network volume is durable, but it is not a backup. Back up off the pod.
+Whether `/workspace` is a network volume or the default volume disk, it is not
+a backup. Back up off the pod. A network volume survives pod deletion, but it is
+still one storage copy in one provider/region.
 
 Back up Postgres:
 
@@ -912,7 +936,7 @@ MLflow is down. Check:
 
 ```bash
 tail -n 100 /workspace/logs/mlflow.log
-curl -fsS http://127.0.0.1:5000/health
+curl -fsS http://127.0.0.1:5000/
 ```
 
 ### API cannot connect to Postgres
