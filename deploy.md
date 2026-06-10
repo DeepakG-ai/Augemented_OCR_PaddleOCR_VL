@@ -62,7 +62,8 @@ Use this layout:
 |-- models/qwen3.5/
 |   |-- Qwen3.5-9B-UD-Q4_K_XL.gguf
 |   `-- mmproj-F16.gguf
-|-- pgdata/
+|-- backups/
+|   `-- postgres/              # pg_dump backups (augocr_latest.dump, augocr_previous.dump)
 |-- minio-data/
 |-- mlflow/
 |   `-- artifacts/
@@ -104,14 +105,14 @@ If the repo already exists:
 
 ```bash
 cd /workspace/app
-git pull origin deploy_v1
+git pull origin deployment_v1
 ```
 
 If it does not exist:
 
 ```bash
 cd /workspace
-git clone -b deploy_v1 https://github.com/DeepakG-ai/Augemented_OCR_PaddleOCR_VL.git app
+git clone -b deployment_v1 https://github.com/DeepakG-ai/Augemented_OCR_PaddleOCR_VL.git app
 ```
 
 ## 6. Use Or Create Python Virtual Environment
@@ -309,11 +310,10 @@ bash ./start.sh
 
 ```text
 load /workspace/.env
-check the venv
-check model files
-check llama-server
-start Postgres
+check the venv, model files, llama-server
+start Postgres on local filesystem (/var/lib/postgresql/data)
 create/update DB user and DB
+if fresh initdb + backup exists → restore from /workspace/backups/postgres/augocr_latest.dump
 start supervisord
 ```
 
@@ -324,6 +324,7 @@ MinIO
 MLflow
 llama-server
 FastAPI on 8000
+pg-backup (pg_dump every 5 min → /workspace/backups/postgres/)
 normalize workers
 OCR workers
 LLM worker
@@ -379,10 +380,43 @@ supervisorctl -s unix:///workspace/supervisor.sock start all
 Stop Postgres:
 
 ```bash
-runuser -u postgres -- pg_ctl -D /workspace/pgdata stop
+runuser -u postgres -- pg_ctl -D "${PGDATA:-/var/lib/postgresql/data}" stop
 ```
 
-## 14. Manual llama-server Debug
+## 14. Postgres Backup and Pod Migration
+
+Postgres data lives on the local container filesystem (`/var/lib/postgresql/data`).
+It is **lost** when a pod is migrated or recreated. The `pg-backup` supervisord
+program protects against this by dumping to `/workspace/backups/postgres/` every
+5 minutes (configurable via `PG_BACKUP_INTERVAL`).
+
+Two backup files are kept:
+
+```text
+/workspace/backups/postgres/augocr_latest.dump     ← most recent successful dump
+/workspace/backups/postgres/augocr_previous.dump   ← one rotation back
+```
+
+**On pod migration:** `start.sh` detects a fresh `initdb` (empty PGDATA) and
+automatically restores from `augocr_latest.dump` before supervisord starts.
+No manual steps required — just run `bash /workspace/app/start.sh` as normal.
+
+**Worst-case data loss:** up to `PG_BACKUP_INTERVAL` seconds (default 5 minutes).
+
+To check backup status:
+
+```bash
+ls -lh /workspace/backups/postgres/
+tail -f /workspace/logs/pg-backup.log
+```
+
+To manually trigger a backup:
+
+```bash
+pg_dump -U postgres -Fc augocr > /workspace/backups/postgres/augocr_manual.dump
+```
+
+## 16. Manual llama-server Debug
 
 Use only when the full stack is stopped or port `8056` is free:
 
@@ -404,7 +438,7 @@ LD_LIBRARY_PATH=/workspace/llama-server /workspace/llama-server/llama-server \
   --jinja
 ```
 
-## 15. Troubleshooting
+## 17. Troubleshooting
 
 ### llama-server build fails
 
@@ -445,7 +479,7 @@ tail -n 100 /workspace/logs/llama.log
 tail -n 100 /workspace/logs/llm-1.log
 ```
 
-## 16. Security
+## 18. Security
 
 - Public port: `8000` only.
 - Private ports: `5432`, `8056`, `9000`, `9001`, `5000`.

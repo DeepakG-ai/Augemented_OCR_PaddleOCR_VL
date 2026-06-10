@@ -3,8 +3,12 @@ set -euo pipefail
 
 APP_DIR="${APP_DIR:-/workspace/app}"
 ENV_FILE="${ENV_FILE:-/workspace/.env}"
-PGDATA="${PGDATA:-/workspace/postgres/pgdata}"
+# Local filesystem — proper POSIX permissions, no network-volume issues.
+# Override in /workspace/.env if needed (e.g. PGDATA=/var/lib/postgresql/data).
+PGDATA="${PGDATA:-/var/lib/postgresql/data}"
 LOG_DIR="${LOG_DIR:-/workspace/logs}"
+PG_BACKUP_DIR="${PG_BACKUP_DIR:-/workspace/backups/postgres}"
+PG_BACKUP_INTERVAL="${PG_BACKUP_INTERVAL:-300}"
 
 if [ -z "${VENV_DIR:-}" ]; then
   for candidate in "$APP_DIR/.venv" /workspace/.venv /workspace/venvs/augocr; do
@@ -37,13 +41,14 @@ set -a
 source "$ENV_FILE"
 set +a
 
-mkdir -p "$LOG_DIR" /workspace/minio-data /workspace/mlflow/artifacts
-chmod 0777 "$LOG_DIR" 2>/dev/null || true
+mkdir -p "$LOG_DIR" "$PG_BACKUP_DIR" /workspace/minio-data /workspace/mlflow/artifacts
 
 export APP_DIR
 export VENV_DIR
 export PGDATA
 export LOG_DIR
+export PG_BACKUP_DIR
+export PG_BACKUP_INTERVAL
 export PATH="$VENV_DIR/bin:/usr/lib/postgresql/16/bin:/usr/lib/postgresql/15/bin:/usr/lib/postgresql/14/bin:$PATH"
 export LLAMA_BIN="${LLAMA_BIN:-/workspace/llama-server/llama-server}"
 export LLAMA_LIB_DIR="${LLAMA_LIB_DIR:-/workspace/llama-server}"
@@ -88,7 +93,7 @@ if ! command -v supervisord >/dev/null 2>&1; then
   exit 1
 fi
 
-for bin in runuser initdb pg_ctl pg_isready psql createdb curl; do
+for bin in runuser initdb pg_ctl pg_isready psql createdb pg_dump pg_restore curl; do
   if ! command -v "$bin" >/dev/null 2>&1; then
     echo "ERROR: '$bin' not found. Run: apt-get update && apt-get install -y postgresql postgresql-contrib curl"
     exit 1
@@ -102,39 +107,16 @@ if ! "$VENV_DIR/bin/python" -c "import uvicorn, mlflow" >/dev/null 2>&1; then
 fi
 
 echo "Starting Postgres..."
-PGDATA_PARENT="$(dirname "$PGDATA")"
-mkdir -p "$PGDATA_PARENT"
-chmod 0777 "$PGDATA_PARENT" 2>/dev/null || true
+FRESH_INIT=false
+mkdir -p "$PGDATA"
+chown postgres:postgres "$PGDATA"
 
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
-  if [ -d "$PGDATA" ] && [ -z "$(find "$PGDATA" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
-    rmdir "$PGDATA" 2>/dev/null || true
-  fi
-
-  if [ ! -d "$PGDATA" ]; then
-    if ! runuser -u postgres -- mkdir -p "$PGDATA"; then
-      echo "ERROR: postgres user cannot create $PGDATA."
-      echo "The /workspace mount is not writable by the postgres user. Use external Postgres or a RunPod volume that allows postgres to write."
-      exit 1
-    fi
-  fi
-fi
-
-if ! runuser -u postgres -- test -w "$PGDATA"; then
-  echo "ERROR: postgres user cannot write to $PGDATA."
-  echo "Current directory state:"
-  ls -ld "$PGDATA" "$PGDATA_PARENT" || true
-  echo "Use PGDATA=/workspace/postgres/pgdata and make sure /workspace/postgres is writable."
-  exit 1
+  FRESH_INIT=true
+  runuser -u postgres -- initdb -D "$PGDATA" -U postgres --auth-local=trust --auth-host=scram-sha-256
 fi
 
 POSTGRES_LOG_FILE="${POSTGRES_LOG_FILE:-$LOG_DIR/postgres.log}"
-touch "$POSTGRES_LOG_FILE" 2>/dev/null || true
-chmod 0666 "$POSTGRES_LOG_FILE" 2>/dev/null || true
-
-if [ ! -s "$PGDATA/PG_VERSION" ]; then
-  runuser -u postgres -- initdb -D "$PGDATA" -U postgres --auth-local=trust --auth-host=scram-sha-256
-fi
 
 if pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1; then
   echo "Postgres is already running."
@@ -182,6 +164,22 @@ SQL_DB="$(printf '%s' "$POSTGRES_DB" | sed "s/'/''/g")"
 DB="$(runuser -u postgres -- psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$SQL_DB'")"
 if [ "$DB" != "1" ]; then
   runuser -u postgres -- createdb -U postgres -O "$POSTGRES_USER" "$POSTGRES_DB"
+fi
+
+# Restore from backup only on a fresh initdb — never overwrites a populated DB.
+if [ "$FRESH_INIT" = "true" ] && [ -f "$PG_BACKUP_DIR/augocr_latest.dump" ]; then
+  echo "Fresh database detected — restoring from $PG_BACKUP_DIR/augocr_latest.dump ..."
+  runuser -u postgres -- pg_restore -U postgres -d "$POSTGRES_DB" \
+    --no-owner --role="$POSTGRES_USER" "$PG_BACKUP_DIR/augocr_latest.dump" \
+    && echo "Restore finished." \
+    || echo "WARNING: pg_restore exited with errors — continuing anyway."
+  TABLE_COUNT="$(runuser -u postgres -- psql -U postgres -d "$POSTGRES_DB" -tAc \
+    "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public'" 2>/dev/null || echo 0)"
+  if [ "${TABLE_COUNT:-0}" -gt 0 ]; then
+    echo "Restore OK — ${TABLE_COUNT} tables present."
+  else
+    echo "WARNING: Restore completed but no tables found. Check $PG_BACKUP_DIR/augocr_latest.dump"
+  fi
 fi
 
 export MINIO_ROOT_USER="$MINIO_ACCESS_KEY"
