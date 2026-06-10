@@ -3,7 +3,7 @@ set -euo pipefail
 
 APP_DIR="${APP_DIR:-/workspace/app}"
 ENV_FILE="${ENV_FILE:-/workspace/.env}"
-PGDATA="${PGDATA:-/workspace/pgdata}"
+PGDATA="${PGDATA:-/workspace/postgres/pgdata}"
 LOG_DIR="${LOG_DIR:-/workspace/logs}"
 
 if [ -z "${VENV_DIR:-}" ]; then
@@ -37,7 +37,8 @@ set -a
 source "$ENV_FILE"
 set +a
 
-mkdir -p "$LOG_DIR" "$PGDATA" /workspace/minio-data /workspace/mlflow/artifacts
+mkdir -p "$LOG_DIR" /workspace/minio-data /workspace/mlflow/artifacts
+chmod 0777 "$LOG_DIR" 2>/dev/null || true
 
 export APP_DIR
 export VENV_DIR
@@ -63,6 +64,8 @@ export LLAMA_PARALLEL="${LLAMA_PARALLEL:-1}"
 export LLAMA_IMAGE_MIN_TOKENS="${LLAMA_IMAGE_MIN_TOKENS:-1024}"
 export LLAMA_IMAGE_MAX_TOKENS="${LLAMA_IMAGE_MAX_TOKENS:-2048}"
 export LLM_PAGE_BATCH_SIZE="${LLM_PAGE_BATCH_SIZE:-$LLAMA_PARALLEL}"
+export POSTGRES_DB="${POSTGRES_DB:-augocr}"
+export POSTGRES_USER="${POSTGRES_USER:-augocr}"
 
 if [ ! -x "$LLAMA_BIN" ]; then
   echo "ERROR: llama-server not found or not executable: $LLAMA_BIN"
@@ -99,7 +102,35 @@ if ! "$VENV_DIR/bin/python" -c "import uvicorn, mlflow" >/dev/null 2>&1; then
 fi
 
 echo "Starting Postgres..."
-chown -R postgres:postgres "$PGDATA" "$LOG_DIR"
+PGDATA_PARENT="$(dirname "$PGDATA")"
+mkdir -p "$PGDATA_PARENT"
+chmod 0777 "$PGDATA_PARENT" 2>/dev/null || true
+
+if [ ! -s "$PGDATA/PG_VERSION" ]; then
+  if [ -d "$PGDATA" ] && [ -z "$(find "$PGDATA" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+    rmdir "$PGDATA" 2>/dev/null || true
+  fi
+
+  if [ ! -d "$PGDATA" ]; then
+    if ! runuser -u postgres -- mkdir -p "$PGDATA"; then
+      echo "ERROR: postgres user cannot create $PGDATA."
+      echo "The /workspace mount is not writable by the postgres user. Use external Postgres or a RunPod volume that allows postgres to write."
+      exit 1
+    fi
+  fi
+fi
+
+if ! runuser -u postgres -- test -w "$PGDATA"; then
+  echo "ERROR: postgres user cannot write to $PGDATA."
+  echo "Current directory state:"
+  ls -ld "$PGDATA" "$PGDATA_PARENT" || true
+  echo "Use PGDATA=/workspace/postgres/pgdata and make sure /workspace/postgres is writable."
+  exit 1
+fi
+
+POSTGRES_LOG_FILE="${POSTGRES_LOG_FILE:-$LOG_DIR/postgres.log}"
+touch "$POSTGRES_LOG_FILE" 2>/dev/null || true
+chmod 0666 "$POSTGRES_LOG_FILE" 2>/dev/null || true
 
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
   runuser -u postgres -- initdb -D "$PGDATA" -U postgres --auth-local=trust --auth-host=scram-sha-256
@@ -120,7 +151,7 @@ else
   fi
 
   runuser -u postgres -- pg_ctl -D "$PGDATA" \
-    -l "$LOG_DIR/postgres.log" \
+    -l "$POSTGRES_LOG_FILE" \
     -o "-c listen_addresses=127.0.0.1 -p 5432" \
     start
 fi
@@ -131,24 +162,26 @@ for i in $(seq 1 30); do
   fi
   if [ "$i" -eq 30 ]; then
     echo "ERROR: Postgres did not become ready within 30s. Last lines of postgres.log:"
-    tail -n 40 "$LOG_DIR/postgres.log" || true
+    tail -n 40 "$POSTGRES_LOG_FILE" || true
     exit 1
   fi
   sleep 1
 done
 
 SQL_PW="$(printf '%s' "$POSTGRES_PASSWORD" | sed "s/'/''/g")"
+SQL_USER="$(printf '%s' "$POSTGRES_USER" | sed "s/'/''/g")"
 
-ROLE="$(runuser -u postgres -- psql -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='augocr'")"
+ROLE="$(runuser -u postgres -- psql -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$SQL_USER'")"
 if [ "$ROLE" != "1" ]; then
-  runuser -u postgres -- psql -U postgres -c "CREATE ROLE augocr LOGIN PASSWORD '$SQL_PW';"
+  runuser -u postgres -- psql -U postgres -c "CREATE ROLE \"$POSTGRES_USER\" LOGIN PASSWORD '$SQL_PW';"
 else
-  runuser -u postgres -- psql -U postgres -c "ALTER ROLE augocr WITH PASSWORD '$SQL_PW';"
+  runuser -u postgres -- psql -U postgres -c "ALTER ROLE \"$POSTGRES_USER\" WITH PASSWORD '$SQL_PW';"
 fi
 
-DB="$(runuser -u postgres -- psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='augocr'")"
+SQL_DB="$(printf '%s' "$POSTGRES_DB" | sed "s/'/''/g")"
+DB="$(runuser -u postgres -- psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$SQL_DB'")"
 if [ "$DB" != "1" ]; then
-  runuser -u postgres -- createdb -U postgres -O augocr augocr
+  runuser -u postgres -- createdb -U postgres -O "$POSTGRES_USER" "$POSTGRES_DB"
 fi
 
 export MINIO_ROOT_USER="$MINIO_ACCESS_KEY"
