@@ -1,31 +1,48 @@
-FROM python:3.11-slim
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04
 
 WORKDIR /app
 
+ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
 ENV PADDLE_PDX_CACHE_HOME=/opt/paddleocr/pdx_cache
 ENV MODELSCOPE_CACHE=/opt/paddleocr/modelscope_cache
 ENV PADDLE_HOME=/opt/paddleocr/paddle_home
+ENV LLAMA_BIN=/opt/llama-server/llama-server
+ENV LLAMA_LIB_DIR=/opt/llama-server
 
-# System packages: app deps + postgres + supervisor + cmake (for llama build on pod)
+# System packages: app deps + postgres + supervisor + llama.cpp build deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl build-essential cmake git \
+    python3 python3-pip python3-venv \
+    curl ca-certificates build-essential cmake pkg-config git \
     libglib2.0-0 libsm6 libxrender1 libxext6 libgl1 libgomp1 \
     postgresql postgresql-contrib \
     supervisor \
-    net-tools procps \
+    net-tools procps wget \
     && rm -rf /var/lib/apt/lists/*
+
+# Build llama-server into the image so RunPod startup does not need git/cmake.
+RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp \
+    && cmake -S /tmp/llama.cpp -B /tmp/llama.cpp/build \
+        -DGGML_CUDA=ON \
+        -DCMAKE_CUDA_ARCHITECTURES=120 \
+        -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build /tmp/llama.cpp/build --config Release -j"$(nproc)" --target llama-server \
+    && mkdir -p /opt/llama-server \
+    && cp /tmp/llama.cpp/build/bin/llama-server /opt/llama-server/ \
+    && find /tmp/llama.cpp/build/bin -maxdepth 1 -name "*.so*" -exec cp {} /opt/llama-server/ \; \
+    && chmod +x /opt/llama-server/llama-server \
+    && rm -rf /tmp/llama.cpp
 
 # Python deps (includes mlflow)
 COPY backend/requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r /tmp/requirements.txt \
+RUN python3 -m pip install --no-cache-dir --break-system-packages --upgrade pip \
+    && python3 -m pip install --no-cache-dir --break-system-packages -r /tmp/requirements.txt \
     && rm -rf /root/.cache/pip
 
 # Pre-warm PaddleOCR models at build time so first inference is fast
-RUN python -c "\
+RUN python3 -c "\
 import numpy as np; from paddleocr import PaddleOCR; \
 ocr = PaddleOCR( \
     text_detection_model_name='PP-OCRv5_mobile_det', \

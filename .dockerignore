@@ -1,6 +1,7 @@
 .venv
 .env
 .env.*
+!.env.example
 .pip_tmp
 .pytest_cache
 __pycache__
