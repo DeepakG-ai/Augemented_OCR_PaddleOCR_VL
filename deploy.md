@@ -1,12 +1,17 @@
 # RunPod Manual Deployment Plan
 
-**Updated: 2026-06-10**
+**Updated: 2026-06-11**
 
 This branch is for the manual RunPod Ubuntu/PyTorch pod setup.
 
 We are not using Docker, Docker Compose, or a Windows `.exe` for this path.
 RunPod starts an Ubuntu container, then we run normal Linux processes from
 `/workspace`.
+
+**Database:** Postgres is **not** run in the pod. The app uses **Supabase**
+(managed Postgres) over the network via `DATABASE_URL`. Supabase owns the data,
+the backups, and the uptime — so pod restarts and migrations never touch your
+data. There is no local data dir and nothing to back up on the pod.
 
 ## 1. What Runs
 
@@ -15,7 +20,6 @@ background workers:
 
 ```text
 FastAPI + frontend        public port 8000
-Postgres                  private 127.0.0.1:5432
 MinIO                     private 127.0.0.1:9000 / 9001
 MLflow                    private 127.0.0.1:5000
 llama-server              private 127.0.0.1:8056
@@ -23,9 +27,13 @@ normalize worker          background process
 OCR worker                background process
 LLM worker                background process
 postprocess worker        background process
+
+Postgres                  external — Supabase (not in the pod)
 ```
 
-`start.sh` starts Postgres first, then hands the rest to `supervisord.conf`.
+`start.sh` validates the environment (incl. a Supabase connectivity check), then
+hands everything to `supervisord.conf`. The app creates its own schema on first
+startup, so a brand-new Supabase project needs no manual table setup.
 
 ## 2. Files We Need In The Repo
 
@@ -62,8 +70,6 @@ Use this layout:
 |-- models/qwen3.5/
 |   |-- Qwen3.5-9B-UD-Q4_K_XL.gguf
 |   `-- mmproj-F16.gguf
-|-- backups/
-|   `-- postgres/              # pg_dump backups (augocr_latest.dump, augocr_previous.dump)
 |-- minio-data/
 |-- mlflow/
 |   `-- artifacts/
@@ -82,9 +88,10 @@ apt-get update
 apt-get install -y \
   git curl wget ca-certificates build-essential cmake pkg-config \
   python3 python3-venv python3-pip \
-  postgresql postgresql-contrib \
   supervisor net-tools
 ```
+
+(No `postgresql` package — the database is Supabase, reached over the network.)
 
 Check:
 
@@ -234,6 +241,24 @@ ldd /workspace/llama-server/llama-server | grep -E "not found|cuda|ggml|llama"
 If `not found` appears, a shared library is missing from
 `/workspace/llama-server` or the CUDA runtime is missing.
 
+## 9b. Set Up Supabase (Database)
+
+1. Create a project at <https://supabase.com> (free tier is fine to start).
+2. Wait for it to finish provisioning, then go to **Project → Connect**.
+3. Choose the **Session pooler** tab (port **5432**). Copy that URI.
+   - Use the **Session** pooler, **not** the Transaction pooler (port 6543). The
+     app uses Postgres advisory locks during schema setup, which only work in
+     session mode.
+4. Append `?sslmode=require` to the end. The final value looks like:
+
+```text
+postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=require
+```
+
+That whole string is your `DATABASE_URL`. The app creates all its tables on
+first startup — you do not run any SQL by hand. Supabase databases are UTF8 by
+default, so the encoding problems from the local-Postgres setup don't exist here.
+
 ## 10. Create `/workspace/.env`
 
 Create the real env file:
@@ -246,10 +271,8 @@ nano /workspace/.env
 Minimum important values:
 
 ```env
-POSTGRES_DB=augocr
-POSTGRES_USER=augocr
-POSTGRES_PASSWORD=replace_with_strong_postgres_password
-DATABASE_URL=postgresql://augocr:replace_with_strong_postgres_password@127.0.0.1:5432/augocr
+# Supabase Session pooler (port 5432), URL ends with ?sslmode=require
+DATABASE_URL=postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=require
 
 MINIO_ENDPOINT=127.0.0.1:9000
 MINIO_ACCESS_KEY=replace_with_minio_access_key
@@ -294,7 +317,9 @@ Rules:
 - Do not commit `/workspace/.env`.
 - Do not put `8056` in `CORS_ALLOW_ORIGINS`.
 - `LLM_PAGE_BATCH_SIZE` must match `LLAMA_PARALLEL`.
-- Keep MinIO, MLflow, Postgres, and llama-server private.
+- `DATABASE_URL` must use the Supabase **Session** pooler (5432) and end with
+  `?sslmode=require`.
+- Keep MinIO, MLflow, and llama-server private.
 
 ## 11. Start The Whole App
 
@@ -311,9 +336,7 @@ bash ./start.sh
 ```text
 load /workspace/.env
 check the venv, model files, llama-server
-start Postgres on local filesystem (/var/lib/postgresql/data)
-create/update DB user and DB
-if fresh initdb + backup exists → restore from /workspace/backups/postgres/augocr_latest.dump
+test the Supabase connection (DATABASE_URL) — fail fast if unreachable
 start supervisord
 ```
 
@@ -324,7 +347,6 @@ MinIO
 MLflow
 llama-server
 FastAPI on 8000
-pg-backup (pg_dump every 5 min → /workspace/backups/postgres/)
 normalize workers
 OCR workers
 LLM worker
@@ -338,7 +360,6 @@ Keep that terminal running. If the terminal closes, the stack can stop.
 Open another pod terminal and run:
 
 ```bash
-pg_isready -h 127.0.0.1 -p 5432 -U postgres
 curl -fsS http://127.0.0.1:9000/minio/health/live
 curl -fsS http://127.0.0.1:5000/
 curl -fsS http://127.0.0.1:8056/v1/models
@@ -348,13 +369,12 @@ curl -fsS http://127.0.0.1:8000/health
 Check processes:
 
 ```bash
-ps aux | grep -E "uvicorn|backend.worker|llama-server|minio|mlflow|postgres" | grep -v grep
+ps aux | grep -E "uvicorn|backend.worker|llama-server|minio|mlflow" | grep -v grep
 ```
 
-Watch logs. The stack writes 6 grouped log files:
+Watch logs. The stack writes 5 grouped log files:
 
 ```text
-database.log    Postgres + automated backups
 llama.log       the LLM server (llama-server)
 pipeline.log    all extraction workers (normalize, ocr, llm, postprocess)
 api.log         FastAPI web server
@@ -389,46 +409,25 @@ supervisorctl -s unix:///workspace/supervisor.sock stop all
 supervisorctl -s unix:///workspace/supervisor.sock start all
 ```
 
-Stop Postgres:
+The database is Supabase, so there is nothing database-related to stop on the
+pod. Restarting or recreating the pod never affects your data.
 
-```bash
-runuser -u postgres -- pg_ctl -D "${PGDATA:-/var/lib/postgresql/data}" stop
-```
+## 14. Database and Backups
 
-## 14. Postgres Backup and Pod Migration
+The database is **Supabase** — managed Postgres. You do not run, back up, or
+restore Postgres on the pod:
 
-Postgres data lives on the local container filesystem (`/var/lib/postgresql/data`).
-It is **lost** when a pod is migrated or recreated. The `pg-backup` supervisord
-program protects against this by dumping to `/workspace/backups/postgres/` every
-5 minutes (configurable via `PG_BACKUP_INTERVAL`).
+- **Backups:** handled by Supabase (Project → Database → Backups). Paid plans
+  add point-in-time recovery.
+- **Pod restart / migration:** no effect on data — it lives in Supabase, not in
+  the pod.
+- **Schema:** created automatically by the app on first startup; migrations are
+  idempotent and run on every start.
 
-Two backup files are kept:
+To inspect the data, use the Supabase dashboard (Table editor / SQL editor) or
+connect any Postgres client to the same `DATABASE_URL`.
 
-```text
-/workspace/backups/postgres/augocr_latest.dump     ← most recent successful dump
-/workspace/backups/postgres/augocr_previous.dump   ← one rotation back
-```
-
-**On pod migration:** `start.sh` detects a fresh `initdb` (empty PGDATA) and
-automatically restores from `augocr_latest.dump` before supervisord starts.
-No manual steps required — just run `bash /workspace/app/start.sh` as normal.
-
-**Worst-case data loss:** up to `PG_BACKUP_INTERVAL` seconds (default 5 minutes).
-
-To check backup status:
-
-```bash
-ls -lh /workspace/backups/postgres/
-tail -f /workspace/logs/database.log
-```
-
-To manually trigger a backup:
-
-```bash
-pg_dump -U postgres -Fc augocr > /workspace/backups/postgres/augocr_manual.dump
-```
-
-## 16. Manual llama-server Debug
+## 15. Manual llama-server Debug
 
 Use only when the full stack is stopped or port `8056` is free:
 
@@ -450,7 +449,7 @@ LD_LIBRARY_PATH=/workspace/llama-server /workspace/llama-server/llama-server \
   --jinja
 ```
 
-## 17. Troubleshooting
+## 16. Troubleshooting
 
 ### llama-server build fails
 
@@ -476,10 +475,23 @@ tail -n 100 /workspace/logs/services.log
 tail -n 100 /workspace/logs/api.log
 ```
 
-### Postgres says already running or pid exists
+### Database connection fails at startup
 
-`start.sh` checks whether Postgres is already running and removes stale pid only
-when the pid no longer exists.
+`start.sh` runs a Supabase connectivity check and stops with an error if it
+fails. Common causes:
+
+- Using the **Transaction** pooler (port 6543) instead of the **Session** pooler
+  (5432) — switch to 5432.
+- Missing `?sslmode=require` at the end of `DATABASE_URL`.
+- Wrong password, or special characters in the password that need URL-encoding.
+- The Supabase project is paused (free tier pauses after inactivity) — resume it
+  in the dashboard.
+
+Test the connection directly:
+
+```bash
+"$VENV_DIR/bin/python" -c "import asyncio,asyncpg,os; asyncio.run(asyncpg.connect(os.environ['DATABASE_URL']))" && echo OK
+```
 
 ### App cannot reach LLM
 
@@ -491,11 +503,13 @@ tail -n 100 /workspace/logs/llama.log
 tail -n 100 /workspace/logs/pipeline.log
 ```
 
-## 18. Security
+## 17. Security
 
 - Public port: `8000` only.
-- Private ports: `5432`, `8056`, `9000`, `9001`, `5000`.
+- Private ports: `8056`, `9000`, `9001`, `5000`.
 - Never expose llama-server publicly.
-- Never commit `.env`.
+- Never commit `.env` — it holds the Supabase password and admin credentials.
+- Keep the Supabase `DATABASE_URL` secret; restrict access in the Supabase
+  dashboard where possible.
 - Treat MLflow traces as sensitive because they may contain prompts/results.
 - Use SSH tunnels if you need MinIO console or MLflow UI.
