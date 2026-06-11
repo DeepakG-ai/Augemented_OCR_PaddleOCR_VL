@@ -351,12 +351,24 @@ Check processes:
 ps aux | grep -E "uvicorn|backend.worker|llama-server|minio|mlflow|postgres" | grep -v grep
 ```
 
-Watch logs:
+Watch logs. The stack writes 6 grouped log files:
+
+```text
+database.log    Postgres + automated backups
+llama.log       the LLM server (llama-server)
+pipeline.log    all extraction workers (normalize, ocr, llm, postprocess)
+api.log         FastAPI web server
+services.log    MinIO + MLflow
+supervisord.log the process manager itself
+```
+
+Tail one feed, or all of them combined with the helper:
 
 ```bash
-tail -f /workspace/logs/api.log
-tail -f /workspace/logs/llama.log
-tail -f /workspace/logs/llm-1.log
+tail -f /workspace/logs/pipeline.log      # extraction activity
+tail -f /workspace/logs/llama.log         # LLM
+bash /workspace/app/logs.sh               # all services, one labelled stream
+bash /workspace/app/logs.sh pipeline llama  # only these two
 ```
 
 Open:
@@ -407,7 +419,7 @@ To check backup status:
 
 ```bash
 ls -lh /workspace/backups/postgres/
-tail -f /workspace/logs/pg-backup.log
+tail -f /workspace/logs/database.log
 ```
 
 To manually trigger a backup:
@@ -460,7 +472,7 @@ Check MinIO first:
 
 ```bash
 curl -fsS http://127.0.0.1:9000/minio/health/live
-tail -n 100 /workspace/logs/minio.log
+tail -n 100 /workspace/logs/services.log
 tail -n 100 /workspace/logs/api.log
 ```
 
@@ -476,7 +488,7 @@ Check:
 ```bash
 curl -fsS http://127.0.0.1:8056/v1/models
 tail -n 100 /workspace/logs/llama.log
-tail -n 100 /workspace/logs/llm-1.log
+tail -n 100 /workspace/logs/pipeline.log
 ```
 
 ## 18. Security

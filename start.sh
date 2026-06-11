@@ -116,7 +116,7 @@ if [ ! -s "$PGDATA/PG_VERSION" ]; then
   runuser -u postgres -- initdb -D "$PGDATA" -U postgres --auth-local=trust --auth-host=scram-sha-256
 fi
 
-POSTGRES_LOG_FILE="${POSTGRES_LOG_FILE:-$LOG_DIR/postgres.log}"
+POSTGRES_LOG_FILE="${POSTGRES_LOG_FILE:-$LOG_DIR/database.log}"
 
 if pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1; then
   echo "Postgres is already running."
@@ -162,8 +162,21 @@ fi
 
 SQL_DB="$(printf '%s' "$POSTGRES_DB" | sed "s/'/''/g")"
 DB="$(runuser -u postgres -- psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$SQL_DB'")"
+if [ "$DB" = "1" ]; then
+  # Postgres rejects non-ASCII text (the \uXXXX escapes in OCR/LLM JSON) when the
+  # database was created with SQL_ASCII — the default on minimal containers where
+  # the postgres locale is C. Recreate as UTF8 so extractions can be stored.
+  DB_ENC="$(runuser -u postgres -- psql -U postgres -tAc "SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname='$SQL_DB'")"
+  if [ "$DB_ENC" != "UTF8" ]; then
+    echo "WARNING: database '$POSTGRES_DB' has encoding $DB_ENC, not UTF8 — recreating as UTF8."
+    echo "         (extractions cannot store non-ASCII text under $DB_ENC; the admin user re-bootstraps on app start.)"
+    runuser -u postgres -- psql -U postgres -c "DROP DATABASE \"$POSTGRES_DB\" WITH (FORCE);"
+    DB=""
+  fi
+fi
 if [ "$DB" != "1" ]; then
-  runuser -u postgres -- createdb -U postgres -O "$POSTGRES_USER" "$POSTGRES_DB"
+  runuser -u postgres -- createdb -U postgres -O "$POSTGRES_USER" \
+    -E UTF8 -T template0 --lc-collate=C --lc-ctype=C "$POSTGRES_DB"
 fi
 
 # Restore from backup only on a fresh initdb — never overwrites a populated DB.
