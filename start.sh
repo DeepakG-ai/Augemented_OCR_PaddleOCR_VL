@@ -192,5 +192,6 @@ if [ ! -x "$MINIO_BIN" ]; then
   exit 1
 fi
 
+chmod +x "$APP_DIR/pg_backup.sh" 2>/dev/null || true
 echo "Starting services with supervisord..."
 exec supervisord -c "$APP_DIR/supervisord.conf"
