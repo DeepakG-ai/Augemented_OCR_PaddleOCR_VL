@@ -74,7 +74,8 @@ def _is_reusable_header_field(field_key: str, configured_header_fields: set[str]
         return False
     if configured_header_fields:
         return field_key in configured_header_fields
-    return False
+    # Template fields unavailable — allow all non-line-item fields through
+    return True
 
 
 
@@ -364,7 +365,7 @@ async def _apply_to_po_per_page(
     applied = 0
     for mem in memories:
         field_key = mem["field_key"]
-        if not configured_header_fields or field_key not in configured_header_fields:
+        if configured_header_fields and field_key not in configured_header_fields:
             logger.debug("Spatial memory skip: field=%s not in template (or template unavailable)", field_key)
             continue
 
@@ -509,7 +510,7 @@ async def apply_to_extraction(
         applied = 0
         for mem in memories:
             field_key = mem["field_key"]
-            if not configured_header_fields or field_key not in configured_header_fields:
+            if configured_header_fields and field_key not in configured_header_fields:
                 logger.debug("Spatial memory skip: field=%s not in template (or template unavailable)", field_key)
                 continue
 
