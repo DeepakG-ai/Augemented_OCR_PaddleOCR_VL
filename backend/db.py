@@ -26,6 +26,27 @@ async def create_pool() -> asyncpg.Pool:
     )
 
 
+# Hot-path indexes for the job queue. The only pre-existing jobs index is the
+# (extraction_id, job_type) dedupe unique index, which covers neither of the
+# queue's per-poll queries, so both fall back to a scan+sort as the table grows:
+#   - claim_job():          WHERE job_type=$1 AND status='queued'
+#                           ORDER BY priority ASC, created_at ASC
+#   - recover_stale_jobs(): WHERE job_type=$1 AND status='running'
+#                           AND updated_at < <cutoff>
+# These two partial indexes (queued / running only) keep each query reading just
+# the rows it needs. CREATE INDEX IF NOT EXISTS is idempotent — init() runs it on
+# every boot.
+_QUEUE_INDEX_SQL = """
+    CREATE INDEX IF NOT EXISTS jobs_claim_idx
+    ON jobs (job_type, priority, created_at)
+    WHERE status = 'queued';
+
+    CREATE INDEX IF NOT EXISTS jobs_stale_idx
+    ON jobs (job_type, updated_at)
+    WHERE status = 'running';
+"""
+
+
 # -- Schema bootstrap ------------------------------------------------------
 
 _SCHEMA_SQL = """
@@ -309,6 +330,8 @@ async def _init_db(pool: asyncpg.Pool) -> None:
             CREATE INDEX IF NOT EXISTS llm_usage_vendor_ts_idx
             ON llm_usage (vendor_id, ts DESC);
         """)
+        # Job-queue hot-path indexes (claim_job / recover_stale_jobs).
+        await conn.execute(_QUEUE_INDEX_SQL)
         # Auth migration: add user_id column to vendors for per-client isolation
         await conn.execute("""
             DO $$ BEGIN

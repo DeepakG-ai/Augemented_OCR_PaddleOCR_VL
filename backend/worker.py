@@ -1395,8 +1395,8 @@ async def process_job(pool, stage: str, job: dict) -> None:
 async def run_worker(stage: str, worker_name: str) -> None:
     if stage == "llm":
         setup_mlflow()
-    if stage == "ocr":
-        await ocr_runner.warmup_ocr_engines()
+    # OCR engines load lazily on first use (as in main) — no startup pre-warm,
+    # which on a network volume forced 3 simultaneous slow inits at boot.
     pool = await db_mod.create_pool()
     await db_mod.init(pool)
     plog.current_worker.set(worker_name)

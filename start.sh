@@ -61,12 +61,37 @@ export MMPROJ_GGUF="${MMPROJ_GGUF:-/workspace/models/qwen3.5/mmproj-F16.gguf}"
 export LLAMA_HOST="${LLAMA_HOST:-127.0.0.1}"
 export LLAMA_PORT="${LLAMA_PORT:-8056}"
 export LLAMA_N_GPU_LAYERS="${LLAMA_N_GPU_LAYERS:-99}"
-export LLAMA_CTX_SIZE="${LLAMA_CTX_SIZE:-8192}"
 export LLAMA_BATCH_SIZE="${LLAMA_BATCH_SIZE:-4096}"
 export LLAMA_PARALLEL="${LLAMA_PARALLEL:-1}"
 export LLAMA_IMAGE_MIN_TOKENS="${LLAMA_IMAGE_MIN_TOKENS:-1024}"
 export LLAMA_IMAGE_MAX_TOKENS="${LLAMA_IMAGE_MAX_TOKENS:-2048}"
+
+# ── llama-server context sizing for continuous batching ─────────────────────
+# llama-server runs with --cont-batching and splits the TOTAL context (-c)
+# evenly across the --parallel slots:  per-slot = LLAMA_CTX_SIZE / LLAMA_PARALLEL.
+# One page request (image + prompt + generated fields) needs about one
+# known-good single-slot context (8192) or it truncates. So the total context
+# must scale with the slot count — otherwise every slot is starved the moment
+# LLAMA_PARALLEL > 1 (e.g. parallel=4 with -c 8192 gives each slot only 2048).
+# We guarantee each slot gets at least LLAMA_CTX_PER_SLOT, auto-raising -c if a
+# too-small LLAMA_CTX_SIZE was provided in the env file.
+export LLAMA_CTX_PER_SLOT="${LLAMA_CTX_PER_SLOT:-8192}"
+_required_ctx=$(( LLAMA_PARALLEL * LLAMA_CTX_PER_SLOT ))
+export LLAMA_CTX_SIZE="${LLAMA_CTX_SIZE:-$_required_ctx}"
+if [ "$LLAMA_CTX_SIZE" -lt "$_required_ctx" ]; then
+  echo "NOTE: LLAMA_CTX_SIZE=$LLAMA_CTX_SIZE is too small for LLAMA_PARALLEL=$LLAMA_PARALLEL" \
+       "(each slot needs $LLAMA_CTX_PER_SLOT, total >= $_required_ctx). Raising -c to $_required_ctx."
+  export LLAMA_CTX_SIZE="$_required_ctx"
+fi
+
+# Concurrency to llama-server is driven by (llm workers) × LLM_PAGE_BATCH_SIZE.
+# With a single llm worker this defaults to the slot count so one multi-page PDF
+# can fill all slots; with multiple llm workers set LLM_PAGE_BATCH_SIZE=1 in .env
+# and let cont-batching interleave pages from different users across the slots.
 export LLM_PAGE_BATCH_SIZE="${LLM_PAGE_BATCH_SIZE:-$LLAMA_PARALLEL}"
+
+echo "llama-server: --parallel $LLAMA_PARALLEL -c $LLAMA_CTX_SIZE" \
+     "(per-slot $(( LLAMA_CTX_SIZE / LLAMA_PARALLEL )), cont-batching) | LLM_PAGE_BATCH_SIZE=$LLM_PAGE_BATCH_SIZE"
 
 if [ ! -x "$LLAMA_BIN" ]; then
   echo "ERROR: llama-server not found or not executable: $LLAMA_BIN"

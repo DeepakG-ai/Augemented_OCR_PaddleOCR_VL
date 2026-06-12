@@ -174,6 +174,9 @@ DPI_FLOOR        = _env_int_min("DPI_FLOOR",        96, 1)
 DPI_DEFAULT      = _env_int_min("DPI_DEFAULT",      128, 1)
 PDF_WORKERS      = _env_int_min("PDF_WORKERS",      2, 1)
 OCR_WORKERS      = _env_int_min("OCR_WORKERS",      3, 1)
+# Per-engine CPU math threads. Also used to pin OpenMP/MKL/OpenBLAS in
+# ocr_runner so OCR_WORKERS concurrent engines can't each grab every core.
+OCR_CPU_THREADS  = _env_int_min("OCR_CPU_THREADS",  4, 1)
 OCR_DEVICE       = os.getenv("OCR_DEVICE",      "cpu")
 
 
