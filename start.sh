@@ -109,15 +109,27 @@ if [ ! -f "$MMPROJ_GGUF" ]; then
   exit 1
 fi
 
-if ! command -v supervisord >/dev/null 2>&1; then
-  echo "ERROR: supervisord is not installed. Run: apt-get update && apt-get install -y supervisor"
-  exit 1
-fi
+# ── Auto-install missing system packages (apt / RunPod containers) ───────────
+_apt_updated=0
+_apt_ensure() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    if ! command -v apt-get >/dev/null 2>&1; then
+      echo "ERROR: '$1' not found and apt-get is unavailable. Install it manually."
+      exit 1
+    fi
+    if [ "$_apt_updated" -eq 0 ]; then
+      echo "Updating apt package index..."
+      apt-get update -qq
+      _apt_updated=1
+    fi
+    echo "Auto-installing: ${*:2}"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${@:2}"
+  fi
+}
 
-if ! command -v curl >/dev/null 2>&1; then
-  echo "ERROR: 'curl' not found. Run: apt-get update && apt-get install -y curl"
-  exit 1
-fi
+_apt_ensure supervisord  supervisor
+_apt_ensure curl         curl
+_apt_ensure pg_lsclusters postgresql-contrib
 
 if ! "$VENV_DIR/bin/python" -c "import uvicorn, mlflow, asyncpg" >/dev/null 2>&1; then
   echo "ERROR: venv at $VENV_DIR is missing required packages (uvicorn/mlflow/asyncpg)."
@@ -165,9 +177,11 @@ export MINIO_ROOT_PASSWORD="$MINIO_SECRET_KEY"
 export MINIO_BIN="${MINIO_BIN:-/workspace/bin/minio}"
 
 if [ ! -x "$MINIO_BIN" ]; then
-  echo "ERROR: MinIO binary not found or not executable: $MINIO_BIN"
-  echo "Install it with: wget https://dl.min.io/server/minio/release/linux-amd64/minio -O /workspace/bin/minio && chmod +x /workspace/bin/minio"
-  exit 1
+  echo "MinIO not found at $MINIO_BIN — downloading..."
+  mkdir -p "$(dirname "$MINIO_BIN")"
+  curl -fsSL "https://dl.min.io/server/minio/release/linux-amd64/minio" -o "$MINIO_BIN"
+  chmod +x "$MINIO_BIN"
+  echo "MinIO downloaded: $MINIO_BIN"
 fi
 
 echo "Starting services with supervisord..."
