@@ -111,24 +111,29 @@ if [ ! -x "$MINIO_BIN" ]; then
   exit 1
 fi
 
-# Kill any existing supervisord to prevent duplicate process explosions when
-# start.sh is run more than once.
+# --- Clean restart -----------------------------------------------------------
+# Running start.sh again should be a RESTART, not a duplicate. Stop any existing
+# supervisord, then reap orphaned services so their ports (minio 9000, llama
+# 8056, api 8000) are free for the fresh start. (A force-killed supervisord can
+# leave children running and holding their ports.)
 SUPERVISORD_PID_FILE="${SUPERVISORD_PID_FILE:-/workspace/supervisord.pid}"
-if [ -f "$SUPERVISORD_PID_FILE" ]; then
-  OLD_PID="$(cat "$SUPERVISORD_PID_FILE" 2>/dev/null || true)"
-  if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-    echo "Stopping existing supervisord (pid $OLD_PID)..."
-    kill -SIGTERM "$OLD_PID" 2>/dev/null || true
-    # Wait up to 10s for it to exit cleanly
-    for _i in $(seq 1 10); do
-      kill -0 "$OLD_PID" 2>/dev/null || break
-      sleep 1
-    done
-    # Force-kill if still running
-    kill -0 "$OLD_PID" 2>/dev/null && kill -SIGKILL "$OLD_PID" 2>/dev/null || true
-  fi
-  rm -f "$SUPERVISORD_PID_FILE"
+OLD_PID="$(cat "$SUPERVISORD_PID_FILE" 2>/dev/null || true)"
+if [ -z "${OLD_PID:-}" ]; then
+  OLD_PID="$(pgrep -f 'supervisord -c .*supervisord.conf' | head -1 || true)"
 fi
+if [ -n "${OLD_PID:-}" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+  echo "Stopping existing supervisord (pid $OLD_PID)..."
+  kill -TERM "$OLD_PID" 2>/dev/null || true
+  for _i in $(seq 1 15); do kill -0 "$OLD_PID" 2>/dev/null || break; sleep 1; done
+  kill -KILL "$OLD_PID" 2>/dev/null || true
+fi
+
+echo "Reaping any orphaned services..."
+for _pat in "/workspace/bin/minio server" "llama-server -m" "uvicorn backend.main" "backend.worker --stage" "mlflow server"; do
+  pkill -f "$_pat" 2>/dev/null || true
+done
+rm -f "$SUPERVISORD_PID_FILE" /workspace/supervisor.sock
+sleep 2
 
 echo "Starting services with supervisord..."
 exec supervisord -c "$APP_DIR/supervisord.conf"
