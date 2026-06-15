@@ -1395,7 +1395,11 @@ async def process_job(pool, stage: str, job: dict) -> None:
 async def run_worker(stage: str, worker_name: str) -> None:
     if stage == "llm":
         setup_mlflow()
-    if stage == "ocr":
+    # Warm the PaddleOCR engine at startup for every stage that runs OCR:
+    # the dedicated `ocr` stage, and `normalize` (which OCRs page 1 for vendor
+    # detection on scanned PDFs). This pays the one-time ~20-46s engine build at
+    # boot so no user request ever hits a cold start.
+    if stage in ("ocr", "normalize"):
         await ocr_runner.warmup_ocr_engines()
     pool = await db_mod.create_pool()
     await db_mod.init(pool)
