@@ -3,12 +3,9 @@ set -euo pipefail
 
 APP_DIR="${APP_DIR:-/workspace/app}"
 ENV_FILE="${ENV_FILE:-/workspace/.env}"
-# Local filesystem — proper POSIX permissions, no network-volume issues.
-# Override in /workspace/.env if needed (e.g. PGDATA=/var/lib/postgresql/data).
-PGDATA="${PGDATA:-/var/lib/postgresql/data}"
+# Postgres is now external (AWS) — see DATABASE_URL in /workspace/.env.
+# No local Postgres and no workspace backup are started by this script.
 LOG_DIR="${LOG_DIR:-/workspace/logs}"
-PG_BACKUP_DIR="${PG_BACKUP_DIR:-/workspace/backups/postgres}"
-PG_BACKUP_INTERVAL="${PG_BACKUP_INTERVAL:-300}"
 
 if [ -z "${VENV_DIR:-}" ]; then
   for candidate in "$APP_DIR/.venv" /workspace/.venv /workspace/venvs/augocr; do
@@ -41,15 +38,12 @@ set -a
 source "$ENV_FILE"
 set +a
 
-mkdir -p "$LOG_DIR" "$PG_BACKUP_DIR" /workspace/minio-data /workspace/mlflow/artifacts
+mkdir -p "$LOG_DIR" /workspace/minio-data /workspace/mlflow/artifacts
 
 export APP_DIR
 export VENV_DIR
-export PGDATA
 export LOG_DIR
-export PG_BACKUP_DIR
-export PG_BACKUP_INTERVAL
-export PATH="$VENV_DIR/bin:/usr/lib/postgresql/16/bin:/usr/lib/postgresql/15/bin:/usr/lib/postgresql/14/bin:$PATH"
+export PATH="$VENV_DIR/bin:$PATH"
 export LLAMA_BIN="${LLAMA_BIN:-/workspace/llama-server/llama-server}"
 export LLAMA_LIB_DIR="${LLAMA_LIB_DIR:-/workspace/llama-server}"
 # Keep PaddleOCR model caches on the persistent volume so a pod restart
@@ -57,7 +51,10 @@ export LLAMA_LIB_DIR="${LLAMA_LIB_DIR:-/workspace/llama-server}"
 export PADDLE_PDX_CACHE_HOME="${PADDLE_PDX_CACHE_HOME:-/workspace/paddleocr/pdx_cache}"
 export MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-/workspace/paddleocr/modelscope_cache}"
 export PADDLE_HOME="${PADDLE_HOME:-/workspace/paddleocr/paddle_home}"
-mkdir -p "$PADDLE_PDX_CACHE_HOME" "$MODELSCOPE_CACHE" "$PADDLE_HOME"
+# Persist CUDA JIT-compiled kernels on the persistent volume so each pod restart
+# doesn't recompile from scratch (which takes 40-70s per worker on first GPU use).
+export CUDA_CACHE_PATH="${CUDA_CACHE_PATH:-/workspace/paddleocr/cuda_cache}"
+mkdir -p "$PADDLE_PDX_CACHE_HOME" "$MODELSCOPE_CACHE" "$PADDLE_HOME" "$CUDA_CACHE_PATH"
 export MODEL_GGUF="${MODEL_GGUF:-/workspace/models/qwen3.5/Qwen3.5-9B-UD-Q4_K_XL.gguf}"
 export MMPROJ_GGUF="${MMPROJ_GGUF:-/workspace/models/qwen3.5/mmproj-F16.gguf}"
 export LLAMA_HOST="${LLAMA_HOST:-127.0.0.1}"
@@ -69,8 +66,6 @@ export LLAMA_PARALLEL="${LLAMA_PARALLEL:-1}"
 export LLAMA_IMAGE_MIN_TOKENS="${LLAMA_IMAGE_MIN_TOKENS:-1024}"
 export LLAMA_IMAGE_MAX_TOKENS="${LLAMA_IMAGE_MAX_TOKENS:-2048}"
 export LLM_PAGE_BATCH_SIZE="${LLM_PAGE_BATCH_SIZE:-$LLAMA_PARALLEL}"
-export POSTGRES_DB="${POSTGRES_DB:-augocr}"
-export POSTGRES_USER="${POSTGRES_USER:-augocr}"
 
 if [ ! -x "$LLAMA_BIN" ]; then
   echo "ERROR: llama-server not found or not executable: $LLAMA_BIN"
@@ -93,12 +88,10 @@ if ! command -v supervisord >/dev/null 2>&1; then
   exit 1
 fi
 
-for bin in runuser initdb pg_ctl pg_isready psql createdb pg_dump pg_restore curl; do
-  if ! command -v "$bin" >/dev/null 2>&1; then
-    echo "ERROR: '$bin' not found. Run: apt-get update && apt-get install -y postgresql postgresql-contrib curl"
-    exit 1
-  fi
-done
+if ! command -v curl >/dev/null 2>&1; then
+  echo "ERROR: 'curl' not found. Run: apt-get update && apt-get install -y curl"
+  exit 1
+fi
 
 if ! "$VENV_DIR/bin/python" -c "import uvicorn, mlflow" >/dev/null 2>&1; then
   echo "ERROR: venv at $VENV_DIR is missing required packages (uvicorn/mlflow)."
@@ -106,94 +99,7 @@ if ! "$VENV_DIR/bin/python" -c "import uvicorn, mlflow" >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Starting Postgres..."
-FRESH_INIT=false
-mkdir -p "$PGDATA"
-chown postgres:postgres "$PGDATA"
-
-if [ ! -s "$PGDATA/PG_VERSION" ]; then
-  FRESH_INIT=true
-  runuser -u postgres -- initdb -D "$PGDATA" -U postgres --auth-local=trust --auth-host=scram-sha-256
-fi
-
-POSTGRES_LOG_FILE="${POSTGRES_LOG_FILE:-$LOG_DIR/database.log}"
-
-if pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1; then
-  echo "Postgres is already running."
-else
-  if [ -f "$PGDATA/postmaster.pid" ]; then
-    POSTMASTER_PID="$(head -n 1 "$PGDATA/postmaster.pid" || true)"
-    # In a recreated container PIDs restart from 1, so the recorded PID usually
-    # belongs to an unrelated live process — kill -0 alone would wrongly keep
-    # the pid file. Only keep it when that PID is actually postgres.
-    if [ -z "$POSTMASTER_PID" ] || [ "$(cat "/proc/$POSTMASTER_PID/comm" 2>/dev/null)" != "postgres" ]; then
-      echo "Removing stale Postgres pid file."
-      rm -f "$PGDATA/postmaster.pid"
-    fi
-  fi
-
-  runuser -u postgres -- pg_ctl -D "$PGDATA" \
-    -l "$POSTGRES_LOG_FILE" \
-    -o "-c listen_addresses=127.0.0.1 -p 5432" \
-    start
-fi
-
-for i in $(seq 1 30); do
-  if pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1; then
-    break
-  fi
-  if [ "$i" -eq 30 ]; then
-    echo "ERROR: Postgres did not become ready within 30s. Last lines of postgres.log:"
-    tail -n 40 "$POSTGRES_LOG_FILE" || true
-    exit 1
-  fi
-  sleep 1
-done
-
-SQL_PW="$(printf '%s' "$POSTGRES_PASSWORD" | sed "s/'/''/g")"
-SQL_USER="$(printf '%s' "$POSTGRES_USER" | sed "s/'/''/g")"
-
-ROLE="$(runuser -u postgres -- psql -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$SQL_USER'")"
-if [ "$ROLE" != "1" ]; then
-  runuser -u postgres -- psql -U postgres -c "CREATE ROLE \"$POSTGRES_USER\" LOGIN PASSWORD '$SQL_PW';"
-else
-  runuser -u postgres -- psql -U postgres -c "ALTER ROLE \"$POSTGRES_USER\" WITH PASSWORD '$SQL_PW';"
-fi
-
-SQL_DB="$(printf '%s' "$POSTGRES_DB" | sed "s/'/''/g")"
-DB="$(runuser -u postgres -- psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$SQL_DB'")"
-if [ "$DB" = "1" ]; then
-  # Postgres rejects non-ASCII text (the \uXXXX escapes in OCR/LLM JSON) when the
-  # database was created with SQL_ASCII — the default on minimal containers where
-  # the postgres locale is C. Recreate as UTF8 so extractions can be stored.
-  DB_ENC="$(runuser -u postgres -- psql -U postgres -tAc "SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname='$SQL_DB'")"
-  if [ "$DB_ENC" != "UTF8" ]; then
-    echo "WARNING: database '$POSTGRES_DB' has encoding $DB_ENC, not UTF8 — recreating as UTF8."
-    echo "         (extractions cannot store non-ASCII text under $DB_ENC; the admin user re-bootstraps on app start.)"
-    runuser -u postgres -- psql -U postgres -c "DROP DATABASE \"$POSTGRES_DB\" WITH (FORCE);"
-    DB=""
-  fi
-fi
-if [ "$DB" != "1" ]; then
-  runuser -u postgres -- createdb -U postgres -O "$POSTGRES_USER" \
-    -E UTF8 -T template0 --lc-collate=C --lc-ctype=C "$POSTGRES_DB"
-fi
-
-# Restore from backup only on a fresh initdb — never overwrites a populated DB.
-if [ "$FRESH_INIT" = "true" ] && [ -f "$PG_BACKUP_DIR/augocr_latest.dump" ]; then
-  echo "Fresh database detected — restoring from $PG_BACKUP_DIR/augocr_latest.dump ..."
-  runuser -u postgres -- pg_restore -U postgres -d "$POSTGRES_DB" \
-    --no-owner --role="$POSTGRES_USER" "$PG_BACKUP_DIR/augocr_latest.dump" \
-    && echo "Restore finished." \
-    || echo "WARNING: pg_restore exited with errors — continuing anyway."
-  TABLE_COUNT="$(runuser -u postgres -- psql -U postgres -d "$POSTGRES_DB" -tAc \
-    "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public'" 2>/dev/null || echo 0)"
-  if [ "${TABLE_COUNT:-0}" -gt 0 ]; then
-    echo "Restore OK — ${TABLE_COUNT} tables present."
-  else
-    echo "WARNING: Restore completed but no tables found. Check $PG_BACKUP_DIR/augocr_latest.dump"
-  fi
-fi
+echo "Using external Postgres (DATABASE_URL from .env) — no local Postgres started."
 
 export MINIO_ROOT_USER="$MINIO_ACCESS_KEY"
 export MINIO_ROOT_PASSWORD="$MINIO_SECRET_KEY"
@@ -205,6 +111,24 @@ if [ ! -x "$MINIO_BIN" ]; then
   exit 1
 fi
 
-chmod +x "$APP_DIR/pg_backup.sh" 2>/dev/null || true
+# Kill any existing supervisord to prevent duplicate process explosions when
+# start.sh is run more than once.
+SUPERVISORD_PID_FILE="${SUPERVISORD_PID_FILE:-/workspace/supervisord.pid}"
+if [ -f "$SUPERVISORD_PID_FILE" ]; then
+  OLD_PID="$(cat "$SUPERVISORD_PID_FILE" 2>/dev/null || true)"
+  if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+    echo "Stopping existing supervisord (pid $OLD_PID)..."
+    kill -SIGTERM "$OLD_PID" 2>/dev/null || true
+    # Wait up to 10s for it to exit cleanly
+    for _i in $(seq 1 10); do
+      kill -0 "$OLD_PID" 2>/dev/null || break
+      sleep 1
+    done
+    # Force-kill if still running
+    kill -0 "$OLD_PID" 2>/dev/null && kill -SIGKILL "$OLD_PID" 2>/dev/null || true
+  fi
+  rm -f "$SUPERVISORD_PID_FILE"
+fi
+
 echo "Starting services with supervisord..."
 exec supervisord -c "$APP_DIR/supervisord.conf"
