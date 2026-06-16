@@ -106,7 +106,7 @@ from .mlflow_tracing import (
 )
 
 from .config import LLM_URL, LLM_MODEL, RATE_LIMIT_PER_MINUTE as RATE_LIMIT, MAX_UPLOAD_BYTES, MAX_DOCUMENT_PAGES
-from .config import CORS_ALLOW_ORIGINS
+from .config import CORS_ALLOW_ORIGINS, FRAME_ANCESTORS
 from .config import DEFAULT_SUBSCRIPTION_LIMIT, SUBSCRIPTION_WARNING_THRESHOLD
 from .config import PIPELINE_LOG_DIR
 
@@ -471,7 +471,12 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         response = await call_next(request)
-        response.headers["X-Frame-Options"] = "DENY"
+        # X-Frame-Options can only express DENY/SAMEORIGIN (ALLOW-FROM is dead in
+        # modern browsers), so when an embedding allowlist is configured we omit it
+        # entirely and let CSP frame-ancestors below do the scoping. With no
+        # allowlist configured, keep the hard DENY default.
+        if not FRAME_ANCESTORS:
+            response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         # Only add CSP and nosniff to HTML responses.
         # Applying nosniff to static files on Windows can cause the browser to
@@ -479,13 +484,20 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         content_type = response.headers.get("content-type", "")
         if "text/html" in content_type:
             response.headers["X-Content-Type-Options"] = "nosniff"
+            # Browser matches frame-ancestors against the PARENT page's origin.
+            # 'self' keeps standalone use working; configured origins allow the
+            # named partners (e.g. the Humanet portal) to embed the SPA.
+            frame_ancestors = (
+                "'self' " + " ".join(FRAME_ANCESTORS) if FRAME_ANCESTORS else "'none'"
+            )
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; "
                 "script-src 'self' 'unsafe-inline'; "
                 "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
                 "font-src 'self' https://fonts.gstatic.com; "
                 "img-src 'self' data: blob:; "
-                "connect-src 'self'"
+                "connect-src 'self'; "
+                f"frame-ancestors {frame_ancestors}"
             )
         return response
 

@@ -164,6 +164,22 @@ CORS_ALLOW_ORIGINS = [
     if origin.strip()
 ]
 
+# Origins permitted to embed this app in an <iframe>, via the CSP
+# `frame-ancestors` directive. Each entry is an ORIGIN — scheme + host + optional
+# port, NO path (e.g. "https://portal.myhumanet.com", not ".../aidemo/").
+# Empty (the default) keeps the secure posture: X-Frame-Options: DENY +
+# frame-ancestors 'none' — nobody may frame the app. Opt in PER-DEPLOYMENT via
+# the FRAME_ANCESTORS env var (comma-separated), so no partner domain is baked
+# into the source. Example for the Humanet demo:
+#   FRAME_ANCESTORS=http://localhost:8080,http://127.0.0.1:8080,https://portal.myhumanet.com
+# NOTE: localhost entries are local-XAMPP-demo only; drop them in production and
+# keep just the real hosted partner domain(s).
+FRAME_ANCESTORS = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv("FRAME_ANCESTORS", "").split(",")
+    if origin.strip()
+]
+
 # ---------------------------------------------------------------------------
 # PDF / image processing
 # ---------------------------------------------------------------------------
