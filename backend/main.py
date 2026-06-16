@@ -106,7 +106,7 @@ from .mlflow_tracing import (
 )
 
 from .config import LLM_URL, LLM_MODEL, RATE_LIMIT_PER_MINUTE as RATE_LIMIT, MAX_UPLOAD_BYTES, MAX_DOCUMENT_PAGES
-from .config import CORS_ALLOW_ORIGINS
+from .config import CORS_ALLOW_ORIGINS, FRAME_ANCESTORS
 from .config import DEFAULT_SUBSCRIPTION_LIMIT, SUBSCRIPTION_WARNING_THRESHOLD
 from .config import PIPELINE_LOG_DIR
 
@@ -468,25 +468,50 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
 
 # -- Security headers -------------------------------------------------------
 
+# Pre-compute frame-ancestors directive once at import time.
+# When FRAME_ANCESTORS is empty → secure default (X-Frame-Options: DENY).
+# When populated → CSP frame-ancestors 'self' <origins> (X-Frame-Options omitted
+# because CSP takes precedence in all modern browsers and the two can conflict).
+_frame_ancestors_directive: str | None = None
+if FRAME_ANCESTORS:
+    _fa_origins = " ".join(FRAME_ANCESTORS)
+    _frame_ancestors_directive = f"frame-ancestors 'self' {_fa_origins}"
+
+
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         response = await call_next(request)
-        response.headers["X-Frame-Options"] = "DENY"
+
+        # -- Framing protection ------------------------------------------------
+        if _frame_ancestors_directive:
+            # Partner origins configured — use CSP frame-ancestors instead of
+            # X-Frame-Options so the allowed origins can embed the app.
+            response.headers["Content-Security-Policy"] = _frame_ancestors_directive
+        else:
+            # No partners configured — lock down completely.
+            response.headers["X-Frame-Options"] = "DENY"
+
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        # Only add CSP and nosniff to HTML responses.
+
+        # Only add full CSP and nosniff to HTML responses.
         # Applying nosniff to static files on Windows can cause the browser to
         # reject CSS/JS served with wrong MIME types from Python's mimetypes module.
         content_type = response.headers.get("content-type", "")
         if "text/html" in content_type:
             response.headers["X-Content-Type-Options"] = "nosniff"
-            response.headers["Content-Security-Policy"] = (
-                "default-src 'self'; "
-                "script-src 'self' 'unsafe-inline'; "
-                "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-                "font-src 'self' https://fonts.gstatic.com; "
-                "img-src 'self' data: blob:; "
-                "connect-src 'self'"
-            )
+            csp_parts = [
+                "default-src 'self'",
+                "script-src 'self' 'unsafe-inline'",
+                "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+                "font-src 'self' https://fonts.gstatic.com",
+                "img-src 'self' data: blob:",
+                "connect-src 'self'",
+            ]
+            if _frame_ancestors_directive:
+                csp_parts.append(_frame_ancestors_directive)
+            else:
+                csp_parts.append("frame-ancestors 'none'")
+            response.headers["Content-Security-Policy"] = "; ".join(csp_parts)
         return response
 
 

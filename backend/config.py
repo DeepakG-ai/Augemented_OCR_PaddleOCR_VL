@@ -165,6 +165,20 @@ CORS_ALLOW_ORIGINS = [
 ]
 
 # ---------------------------------------------------------------------------
+# Iframe embedding (CSP frame-ancestors)
+# ---------------------------------------------------------------------------
+# Comma-separated list of origins allowed to embed this app in an <iframe>.
+# When empty (default), the middleware sends X-Frame-Options: DENY.
+# When set, it sends Content-Security-Policy: frame-ancestors 'self' <origins>
+# instead, and omits X-Frame-Options (CSP takes precedence in modern browsers).
+# Example: FRAME_ANCESTORS=https://portal.example.com,http://localhost:8080
+FRAME_ANCESTORS: list[str] = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv("FRAME_ANCESTORS", "").split(",")
+    if origin.strip()
+]
+
+# ---------------------------------------------------------------------------
 # PDF / image processing
 # ---------------------------------------------------------------------------
 MAX_LONG_SIDE_PX = _env_int_min("MAX_LONG_SIDE_PX", 1536, 1)
