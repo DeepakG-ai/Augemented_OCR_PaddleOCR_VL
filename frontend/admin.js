@@ -57,7 +57,7 @@ async function renderAdminUsersPage(app) {
         <div id="topupRequestsPanel">${_renderTopupRequestsPanel(topupReqs)}</div>
 
         <!-- Stats strip -->
-        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px">
             ${_userStatCard('Total Users', users.length, 'var(--text)')}
             ${_userStatCard('Active', users.filter(u=>u.is_active).length, 'var(--green)')}
             ${_userStatCard('Clients', clients.length, 'var(--blue)')}
@@ -888,7 +888,7 @@ function _renderUserHistory(data) {
     }
 
     const statBlock = `
-    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:14px">
         <div style="background:var(--bg2);border:1px solid var(--border);border-radius:3px;padding:10px 12px">
             <div style="font-size:9px;letter-spacing:0.1em;color:var(--text-dim);margin-bottom:4px">SUBSCRIPTIONS</div>
             <div style="font-size:16px;font-weight:700;font-family:var(--mono);color:var(--blue)">${subs.length}</div>
@@ -1048,7 +1048,7 @@ async function renderAdminSpatialMemoryPage(app) {
                 </button>
             </div>
         </div>
-        <div id="smStatsStrip" style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px"></div>
+        <div id="smStatsStrip" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:20px"></div>
         <div id="smTable"></div>
         <div id="smPager" style="display:flex;gap:10px;align-items:center;padding:12px 0;font-size:10px;color:var(--text-dim)"></div>
     </div>`;
@@ -1314,7 +1314,7 @@ function _renderQuotaEvents(events) {
     }).join('');
 
     el.innerHTML = `
-    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px">
         ${statCard('Grace Events',       graceCount,      'var(--amber,#e5c07b)')}
         ${statCard('Hard Blocks',        exceededCount,   'var(--red,#e06c75)')}
         ${statCard('Clients Affected',   clientSet.size,  'var(--blue)')}

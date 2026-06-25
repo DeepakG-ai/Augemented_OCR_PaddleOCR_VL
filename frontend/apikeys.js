@@ -37,7 +37,7 @@ async function renderApiKeysPage(app) {
         </div>
 
         <!-- Stats strip -->
-        <div id="akStatsStrip" style="display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:24px">
+        <div id="akStatsStrip" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px;margin-bottom:24px">
             ${_akStatsStripHTML(keys)}
         </div>
 

@@ -3288,23 +3288,38 @@ async def set_extraction_status(
     progress: dict | None = None,
     error: str | None = None,
     duration_ms: int | None = None,
+    end_to_end: bool = False,
 ) -> None:
+    # `end_to_end=True` recomputes duration_ms as the full pipeline wall-clock
+    # (created_at → now), overriding the LLM-stage-only value the llm worker
+    # stored. This is what the history page shows as "End-to-end latency", and it
+    # matches the live timer on the pipeline page (normalize → ocr → llm →
+    # postprocess), not just the llama-server call.
+    args = [
+        extraction_id,
+        status,
+        json.dumps(progress) if progress is not None else None,
+        error,
+    ]
+    if end_to_end:
+        # No $5: recompute from created_at in SQL. Passing an unused parameter
+        # would make asyncpg reject the query (arg-count mismatch).
+        duration_expr = "ROUND(EXTRACT(EPOCH FROM (NOW() - created_at)) * 1000)::INT"
+    else:
+        duration_expr = "COALESCE($5, duration_ms)"
+        args.append(duration_ms)
     async with pool.acquire() as conn:
         await conn.execute(
-            """
+            f"""
             UPDATE extractions
             SET status = $2,
                 progress = COALESCE($3::jsonb, progress),
                 error = $4,
-                duration_ms = COALESCE($5, duration_ms),
+                duration_ms = {duration_expr},
                 updated_at = NOW()
             WHERE id = $1
             """,
-            extraction_id,
-            status,
-            json.dumps(progress) if progress is not None else None,
-            error,
-            duration_ms,
+            *args,
         )
 
 

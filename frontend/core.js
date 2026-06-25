@@ -274,10 +274,9 @@ async function router() {
         await renderLoginPage(app);
         return;
     }
-    // Clear the previous page content synchronously so it disappears immediately
-    // on navigation, before async data fetches run. Without this, the old page
-    // stays visible for the duration of the first API call (~100ms).
-    app.innerHTML = headerHTML();
+    // Clear the previous page content synchronously and show a spinner so the
+    // content area isn't blank while async data fetches run.
+    app.innerHTML = headerHTML() + '<div class="page-content page-loading"></div>';
     if (route === '/' || route === '/vendors') {
         app.className = 'app';
         await renderVendorsPage(app);
@@ -375,7 +374,8 @@ function headerHTML() {
     return `
     <header class="header">
         <div class="logo" onclick="navigate('#/')">Augmented <span>OCR</span></div>
-        <nav class="nav-tabs">
+        <button class="nav-toggle" id="navToggle" aria-label="Toggle menu" onclick="toggleNav(event)">☰</button>
+        <nav class="nav-tabs" id="navTabs">
             <a class="nav-tab" data-route="/vendors" href="#/vendors">Vendors</a>
             <a class="nav-tab" data-route="/saved-templates" href="#/saved-templates">Templates</a>
             <a class="nav-tab" data-route="/extract" href="#/extract">Extraction</a>
@@ -396,6 +396,23 @@ function headerHTML() {
         </div>
     </header>`;
 }
+
+// ── MOBILE NAV (hamburger) ─────────────────────────────────────────────
+function toggleNav(e) {
+    if (e) e.stopPropagation();
+    document.querySelector('.header')?.classList.toggle('nav-open');
+}
+function closeNav() {
+    document.querySelector('.header')?.classList.remove('nav-open');
+}
+// Close the dropdown when a tab is picked or when clicking outside it.
+document.addEventListener('click', (e) => {
+    const header = document.querySelector('.header');
+    if (!header || !header.classList.contains('nav-open')) return;
+    if (e.target.closest('.nav-tab') || !e.target.closest('.nav-tabs, .nav-toggle')) {
+        header.classList.remove('nav-open');
+    }
+});
 
 // ── NAV HELPER (shared by every page render) ───────────────────────────
 function updateNavActive() {

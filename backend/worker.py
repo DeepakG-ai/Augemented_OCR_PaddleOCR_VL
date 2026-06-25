@@ -1189,6 +1189,7 @@ async def _process_postprocess(pool, job: dict) -> None:
                 "review_available": False,
                 "ocr_error": ocr_error,
             },
+            end_to_end=True,
         )
         try:
             await db_mod.release_quota_once(pool, base.get("document_id"), base.get("billing_user_id"))
@@ -1310,6 +1311,9 @@ async def _process_postprocess(pool, job: dict) -> None:
         extraction_id,
         "done",
         progress={"stage": "postprocess", "message": "Field mapping complete"},
+        # Replace the LLM-stage-only duration with the true end-to-end pipeline
+        # time so the history page latency matches the pipeline timer.
+        end_to_end=True,
     )
     try:
         await db_mod.release_quota_once(pool, base.get("document_id"), base.get("billing_user_id"))
