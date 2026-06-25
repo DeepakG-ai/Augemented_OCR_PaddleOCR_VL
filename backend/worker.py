@@ -14,6 +14,7 @@ import time
 from uuid import uuid4
 
 from . import db as db_mod
+from . import cache as cache_mod
 from . import extractor
 from . import geometry
 from . import ocr_runner
@@ -24,6 +25,7 @@ from . import page_logger
 from .logging_config import configure_logging, current_extraction_id, current_extraction_filename, get_logger
 from .object_store import ARTIFACTS_BUCKET, DOCUMENTS_BUCKET, get_store
 from .config import LLM_URL, LLM_MODEL, WORKER_POLL_SECONDS as POLL_INTERVAL_SECONDS, DEBUG_DUMP_BBOX
+from .config import DB_POOL_MIN_WORKER, DB_POOL_MAX_WORKER
 from .mlflow_tracing import (
     current_trace_context,
     setup_mlflow,
@@ -758,7 +760,10 @@ async def _process_llm(pool, job: dict) -> None:
         raise ValueError("Extraction not found for LLM job")
     document_row = await db_mod.get_document(pool, job["document_id"]) if job.get("document_id") else None
     base = _pipeline_base(extraction=extraction_row, document=document_row, job=job)
-    logger.info("── LLM started ── ext=%s vendor=%s", extraction_id, extraction_row.get("vendor_id"))
+    # Read layout-boxes flag from document metadata (UI=True, API=False by default)
+    _doc_meta = (document_row or {}).get("metadata") or {}
+    include_layout_boxes = bool(_doc_meta.get("include_layout_boxes", True))
+    logger.info("── LLM started ── ext=%s vendor=%s include_layout_boxes=%s", extraction_id, extraction_row.get("vendor_id"), include_layout_boxes)
 
     # Resolve the human who owns this extraction for MLflow trace tagging:
     # the explicit uploader (admin acting-as-client) first, else the vendor owner.
@@ -808,16 +813,19 @@ async def _process_llm(pool, job: dict) -> None:
         )
         # Page 2+ system prompt: fields only (current behaviour)
         system_prompt = extractor.build_system_prompt(**_prompt_args, include_boxes=False)
-        # Page 1 system prompt: fields + bounding boxes
-        system_prompt_page1 = extractor.build_system_prompt(
-            **_prompt_args,
-            include_boxes=True,
-        )
+        # Page 1 system prompt: fields + bounding boxes (only when layout boxes requested)
+        if include_layout_boxes:
+            system_prompt_page1 = extractor.build_system_prompt(
+                **_prompt_args,
+                include_boxes=True,
+            )
+        else:
+            system_prompt_page1 = None  # fields-only prompt for all pages
         prompt_trace["output"] = {
             "prompt_version": getattr(extractor, "PROMPT_VERSION", "unknown"),
             "gold_examples_count": len(gold_examples),
             "prompt_length": len(system_prompt),
-            "prompt_page1_length": len(system_prompt_page1),
+            "prompt_page1_length": len(system_prompt_page1 or ""),
             "system_prompt": system_prompt,
         }
     if gold_examples:
@@ -903,6 +911,7 @@ async def _process_llm(pool, job: dict) -> None:
                 existing_page_results=_raw_epr if isinstance(_raw_epr, list) else None,
                 pipeline_context=base,
                 pool=pool,
+                include_page1_boxes=include_layout_boxes,
                 system_prompt_page1=system_prompt_page1,
             )
             _result = output.get("result")
@@ -919,7 +928,7 @@ async def _process_llm(pool, job: dict) -> None:
 
     # ── Extract boxes from page 1 result and save to qwen_layout_boxes ──
     _page_results = output.get("page_results") or []
-    if tmpl and _page_results:
+    if include_layout_boxes and tmpl and _page_results:
         _p1 = next((pr for pr in _page_results if pr.get("_page") == 1 and "_error" not in pr), None)
         _p1_boxes = (_p1 or {}).get("boxes")
         if isinstance(_p1_boxes, dict) and _p1_boxes:
@@ -1103,7 +1112,9 @@ async def _process_postprocess(pool, job: dict) -> None:
         raise ValueError("Extraction not found for postprocess job")
     document = await db_mod.get_document(pool, extraction_row.get("document_id") or job.get("document_id"))
     base = _pipeline_base(extraction=extraction_row, document=document, job=job)
-    logger.info("── POSTPROCESS started ── ext=%s", extraction_id)
+    _doc_meta_pp = (document or {}).get("metadata") or {}
+    include_layout_boxes = bool(_doc_meta_pp.get("include_layout_boxes", True))
+    logger.info("── POSTPROCESS started ── ext=%s include_layout_boxes=%s", extraction_id, include_layout_boxes)
 
     result = extraction_row.get("result")
     if not result:
@@ -1198,7 +1209,7 @@ async def _process_postprocess(pool, job: dict) -> None:
         return
 
     qwen_boxes: dict = {}
-    if vendor_id and template_id:
+    if include_layout_boxes and vendor_id and template_id:
         qwen_boxes = await db_mod.get_qwen_layout_boxes(pool, vendor_id, template_id)
 
     mapping_engine = "none"
@@ -1225,7 +1236,10 @@ async def _process_postprocess(pool, job: dict) -> None:
         logger.info("Field locations built (qwen_layout): %d mappings (%.0fms)",
                     _field_location_count(field_locations), t["ms"])
     else:
-        logger.warning("Postprocess: no layout boxes - empty field_locations")
+        if not include_layout_boxes:
+            logger.info("Postprocess: layout boxes skipped (API JSON-only mode)")
+        else:
+            logger.warning("Postprocess: no layout boxes - empty field_locations")
         field_locations = {}
 
     with trace_named_step(
@@ -1306,11 +1320,15 @@ async def _process_postprocess(pool, job: dict) -> None:
 
     if await _stop_if_cancelled(pool, extraction_id, "postprocess", "Cancelled before completion"):
         raise JobCancelled("Cancelled before completion")
+    _final_progress = {"stage": "postprocess", "message": "Field mapping complete"}
+    if not include_layout_boxes:
+        _final_progress["layout_boxes_available"] = False
+        _final_progress["layout_boxes_reason"] = "api_json_only"
     await db_mod.set_extraction_status(
         pool,
         extraction_id,
         "done",
-        progress={"stage": "postprocess", "message": "Field mapping complete"},
+        progress=_final_progress,
         # Replace the LLM-stage-only duration with the true end-to-end pipeline
         # time so the history page latency matches the pipeline timer.
         end_to_end=True,
@@ -1405,8 +1423,10 @@ async def run_worker(stage: str, worker_name: str) -> None:
     # boot so no user request ever hits a cold start.
     if stage in ("ocr", "normalize"):
         await ocr_runner.warmup_ocr_engines()
-    pool = await db_mod.create_pool()
+    pool = await db_mod.create_pool(min_size=DB_POOL_MIN_WORKER, max_size=DB_POOL_MAX_WORKER)
     await db_mod.init(pool)
+    cache = await cache_mod.create_cache()
+    cache_mod.set_active_cache(cache)
     plog.current_worker.set(worker_name)
     logger.info("Worker started stage=%s name=%s", stage, worker_name)
     # Recover orphaned running jobs left by a previous crashed worker
@@ -1578,11 +1598,12 @@ async def run_worker(stage: str, worker_name: str) -> None:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
                 try:
-                    pool = await db_mod.create_pool()
+                    pool = await db_mod.create_pool(min_size=DB_POOL_MIN_WORKER, max_size=DB_POOL_MAX_WORKER)
                     await db_mod.init(pool)
                 except Exception as rc_exc:
                     logger.error("Worker DB reconnect failed: %s", rc_exc)
     finally:
+        await cache.close()
         await pool.close()
 
 

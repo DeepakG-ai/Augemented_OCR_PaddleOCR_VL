@@ -5,25 +5,108 @@ No ORM. Fields are stored as header_fields (JSONB) and line_item_fields (JSONB).
 """
 from __future__ import annotations
 
+import copy
 import json
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
 import asyncpg
 
-from .config import DATABASE_URL
+from .cache import get_cache
+from .config import (
+    DATABASE_URL,
+    DB_POOL_MIN_API,
+    DB_POOL_MAX_API,
+    CACHE_TTL_AUTH,
+    CACHE_TTL_APIKEY_TOUCH,
+    CACHE_TTL_VENDOR,
+    CACHE_TTL_TEMPLATE,
+    CACHE_TTL_MAPPING,
+    CACHE_TTL_ALIAS,
+)
 
 
 # -- Pool creation ---------------------------------------------------------
 
-async def create_pool() -> asyncpg.Pool:
-    """Create and return an asyncpg connection pool."""
+async def create_pool(
+    min_size: int = DB_POOL_MIN_API,
+    max_size: int = DB_POOL_MAX_API,
+) -> asyncpg.Pool:
+    """Create and return an asyncpg connection pool.
+
+    Defaults to the API-tier sizing. The pipeline workers pass the smaller
+    worker sizing (DB_POOL_MIN_WORKER / DB_POOL_MAX_WORKER) so that the many
+    worker processes don't collectively exhaust Postgres connections.
+    """
     return await asyncpg.create_pool(
         DATABASE_URL,
-        min_size=2,
-        max_size=10,
+        min_size=min_size,
+        max_size=max_size,
         command_timeout=30,
     )
+
+
+# -- Cache helpers ---------------------------------------------------------
+# Read-through caching for hot, read-mostly rows shared by the API and the
+# pipeline workers. The cache fails soft (see cache.py): with no Redis these
+# reduce to a plain DB call. Cached values are returned as shallow copies so a
+# caller mutating the result can't corrupt a shared entry — treat them as
+# read-only. Invalidation is explicit on the matching mutation below.
+
+async def _cached_read(key: str, ttl: int, loader):
+    """get_or_set, returning a deep copy of the result.
+
+    Callers may freely mutate what they get back (including nested lists/dicts
+    like template.header_fields) without ever corrupting the shared cache
+    entry. The copy costs microseconds versus the cross-region DB round trip it
+    avoids.
+    """
+    return copy.deepcopy(await get_cache().get_or_set(key, ttl, loader))
+
+
+async def invalidate_user_cache(user_id) -> None:
+    uid = _uuid_or_none(user_id)
+    if uid is not None:
+        await get_cache().delete(f"user:{uid}")
+
+
+async def invalidate_api_key_cache() -> None:
+    # Key cache is keyed by hash; mutations carry only the key id, so clear all
+    # cached keys (api-key mutations are rare and the set is tiny).
+    await get_cache().delete_pattern("apikey:*")
+
+
+async def invalidate_vendor_cache(vendor_id: str | None = None) -> None:
+    c = get_cache()
+    if vendor_id:
+        await c.delete(
+            f"vendor:{vendor_id}",
+            f"template:{vendor_id}",
+            f"mapping:{vendor_id}",
+            f"aliases:list:{vendor_id}",
+        )
+    await c.delete_pattern("vendors:list:*")
+    await c.delete_pattern("templates:list:*")
+    await c.delete_pattern("aliases:detect:*")
+
+
+async def invalidate_template_cache(vendor_id: str) -> None:
+    c = get_cache()
+    await c.delete(f"template:{vendor_id}")
+    await c.delete_pattern("templates:list:*")
+
+
+async def invalidate_mapping_cache(vendor_id: str) -> None:
+    await get_cache().delete(f"mapping:{vendor_id}")
+
+
+async def invalidate_alias_cache(vendor_id: str) -> None:
+    c = get_cache()
+    # "aliases:list:all" is the unfiltered variant — clear it too, in case a
+    # caller ever lists all aliases (today only the per-vendor list is used).
+    await c.delete(f"aliases:list:{vendor_id}", "aliases:list:all")
+    await c.delete_pattern("aliases:detect:*")
 
 
 # -- Schema bootstrap ------------------------------------------------------
@@ -308,6 +391,28 @@ async def _init_db(pool: asyncpg.Pool) -> None:
 
             CREATE INDEX IF NOT EXISTS llm_usage_vendor_ts_idx
             ON llm_usage (vendor_id, ts DESC);
+
+            -- Worker job-claim hot path: claim_job filters job_type + status
+            -- 'queued' and orders by priority, created_at. Partial index keeps
+            -- it tiny (only queued rows) and matches the exact predicate/order.
+            CREATE INDEX IF NOT EXISTS jobs_queue_claim_idx
+            ON jobs (job_type, priority, created_at)
+            WHERE status = 'queued';
+
+            -- Latest-job-for-extraction lookups (SSE progress, status reads).
+            CREATE INDEX IF NOT EXISTS jobs_extraction_created_idx
+            ON jobs (extraction_id, created_at DESC);
+
+            -- Extraction history listings (per-vendor and global, newest first)
+            -- and document joins.
+            CREATE INDEX IF NOT EXISTS extractions_vendor_created_idx
+            ON extractions (vendor_id, created_at DESC);
+
+            CREATE INDEX IF NOT EXISTS extractions_created_idx
+            ON extractions (created_at DESC);
+
+            CREATE INDEX IF NOT EXISTS extractions_document_idx
+            ON extractions (document_id);
         """)
         # Auth migration: add user_id column to vendors for per-client isolation
         await conn.execute("""
@@ -1255,25 +1360,31 @@ _VENDOR_COLS = "id, name, status, user_id, client_seq, created_at"
 
 
 async def get_vendor(pool: asyncpg.Pool, vendor_id: str) -> dict | None:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            f"SELECT {_VENDOR_COLS} FROM vendors WHERE id = $1",
-            vendor_id,
-        )
-        return _stringify_uuid_fields(dict(row), "user_id") if row else None
+    async def _load():
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT {_VENDOR_COLS} FROM vendors WHERE id = $1",
+                vendor_id,
+            )
+            return _stringify_uuid_fields(dict(row), "user_id") if row else None
+
+    return await _cached_read(f"vendor:{vendor_id}", CACHE_TTL_VENDOR, _load)
 
 
 async def list_vendors(pool: asyncpg.Pool, user_id: str | None = None) -> list[dict]:
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            f"""
-            SELECT {_VENDOR_COLS} FROM vendors
-            WHERE ($1::UUID IS NULL OR user_id = $1)
-            ORDER BY created_at DESC
-            """,
-            user_id,
-        )
-        return [_stringify_uuid_fields(dict(r), "user_id") for r in rows]
+    async def _load():
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT {_VENDOR_COLS} FROM vendors
+                WHERE ($1::UUID IS NULL OR user_id = $1)
+                ORDER BY created_at DESC
+                """,
+                user_id,
+            )
+            return [_stringify_uuid_fields(dict(r), "user_id") for r in rows]
+
+    return await _cached_read(f"vendors:list:{user_id or 'all'}", CACHE_TTL_VENDOR, _load)
 
 
 async def assign_vendor_owner(pool: asyncpg.Pool, vendor_id: str, user_id: str) -> dict | None:
@@ -1286,7 +1397,10 @@ async def assign_vendor_owner(pool: asyncpg.Pool, vendor_id: str, user_id: str) 
             """,
             user_id, vendor_id,
         )
-        return _stringify_uuid_fields(dict(row), "user_id") if row else None
+        if not row:
+            return None
+    await invalidate_vendor_cache(vendor_id)
+    return _stringify_uuid_fields(dict(row), "user_id")
 
 
 async def _next_client_seq(conn: asyncpg.Connection, user_id) -> int:
@@ -1331,7 +1445,9 @@ async def create_vendor_by_name(
                 """,
                 new_id, name, uid, seq,
             )
-            return _stringify_uuid_fields(dict(row), "user_id")
+            created = _stringify_uuid_fields(dict(row), "user_id")
+            await invalidate_vendor_cache(created["id"])
+            return created
         except asyncpg.exceptions.UniqueViolationError:
             # Concurrent create of the same name lost the race — return the winner.
             row = await conn.fetchrow(
@@ -1369,7 +1485,9 @@ async def upsert_vendor(
             """,
             vendor_id, name, uid, seq,
         )
-        return _stringify_uuid_fields(dict(row), "user_id")
+    result = _stringify_uuid_fields(dict(row), "user_id")
+    await invalidate_vendor_cache(result["id"])
+    return result
 
 
 async def get_vendor_owner(pool: asyncpg.Pool, vendor_id: str) -> str | None:
@@ -1431,15 +1549,19 @@ async def get_user_by_id(pool: asyncpg.Pool, user_id: str) -> dict | None:
     user_uuid = _uuid_or_none(user_id)
     if user_uuid is None:
         return None
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT id, email, role, is_active, created_at, subscription_limit
-            FROM users WHERE id = $1
-            """,
-            user_uuid,
-        )
-        return _stringify_uuid_fields(dict(row), "id") if row else None
+
+    async def _load():
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, email, role, is_active, created_at, subscription_limit
+                FROM users WHERE id = $1
+                """,
+                user_uuid,
+            )
+            return _stringify_uuid_fields(dict(row), "id") if row else None
+
+    return await _cached_read(f"user:{user_uuid}", CACHE_TTL_AUTH, _load)
 
 
 async def list_users(pool: asyncpg.Pool) -> list[dict]:
@@ -1485,7 +1607,8 @@ async def deactivate_user(pool: asyncpg.Pool, user_id: str) -> bool:
         result = await conn.execute(
             "UPDATE users SET is_active = FALSE WHERE id = $1", user_uuid,
         )
-        return result == "UPDATE 1"
+    await invalidate_user_cache(user_uuid)
+    return result == "UPDATE 1"
 
 
 async def reactivate_user(pool: asyncpg.Pool, user_id: str) -> bool:
@@ -1496,7 +1619,8 @@ async def reactivate_user(pool: asyncpg.Pool, user_id: str) -> bool:
         result = await conn.execute(
             "UPDATE users SET is_active = TRUE WHERE id = $1", user_uuid,
         )
-        return result == "UPDATE 1"
+    await invalidate_user_cache(user_uuid)
+    return result == "UPDATE 1"
 
 
 async def hard_delete_user(pool: asyncpg.Pool, user_id: str) -> bool:
@@ -1507,7 +1631,8 @@ async def hard_delete_user(pool: asyncpg.Pool, user_id: str) -> bool:
         result = await conn.execute(
             "DELETE FROM users WHERE id = $1", user_uuid,
         )
-        return result == "DELETE 1"
+    await invalidate_user_cache(user_uuid)
+    return result == "DELETE 1"
 
 
 async def reset_user_password(pool: asyncpg.Pool, user_id: str, hashed_pw: str) -> bool:
@@ -1518,7 +1643,8 @@ async def reset_user_password(pool: asyncpg.Pool, user_id: str, hashed_pw: str) 
         result = await conn.execute(
             "UPDATE users SET hashed_pw = $1 WHERE id = $2", hashed_pw, user_uuid,
         )
-        return result == "UPDATE 1"
+    await invalidate_user_cache(user_uuid)
+    return result == "UPDATE 1"
 
 
 async def delete_vendor(pool: asyncpg.Pool, vendor_id: str) -> bool:
@@ -1535,7 +1661,10 @@ async def delete_vendor(pool: asyncpg.Pool, vendor_id: str) -> bool:
             await conn.execute("DELETE FROM spatial_memory WHERE vendor_id = $1", vendor_id)
             await conn.execute("DELETE FROM qwen_layout_boxes WHERE vendor_id = $1", vendor_id)
             result = await conn.execute("DELETE FROM vendors WHERE id = $1", vendor_id)
-            return result == "DELETE 1"
+            deleted = result == "DELETE 1"
+    if deleted:
+        await invalidate_vendor_cache(vendor_id)
+    return deleted
 
 # -- Vendor alias queries --------------------------------------------------
 
@@ -1557,59 +1686,75 @@ async def insert_vendor_alias(
             """,
             vendor_id, pattern.strip(), weight, source,
         )
-        return dict(row) if row else None
+    if not row:
+        return None
+    await invalidate_alias_cache(vendor_id)
+    return dict(row)
 
 
 async def list_vendor_aliases(pool: asyncpg.Pool, vendor_id: str | None = None) -> list[dict]:
     """List vendor aliases, optionally filtered by vendor_id."""
-    async with pool.acquire() as conn:
-        if vendor_id:
-            rows = await conn.fetch(
-                """
-                SELECT va.id, va.vendor_id, v.name AS vendor_name, va.pattern, va.weight, va.source, va.created_at
-                FROM vendor_aliases va
-                JOIN vendors v ON v.id = va.vendor_id
-                WHERE va.vendor_id = $1
-                ORDER BY va.weight DESC, va.created_at ASC
-                """,
-                vendor_id,
-            )
-        else:
-            rows = await conn.fetch(
-                """
-                SELECT va.id, va.vendor_id, v.name AS vendor_name, va.pattern, va.weight, va.source, va.created_at
-                FROM vendor_aliases va
-                JOIN vendors v ON v.id = va.vendor_id
-                ORDER BY va.vendor_id, va.weight DESC, va.created_at ASC
-                """
-            )
-        return [dict(r) for r in rows]
+
+    async def _load():
+        async with pool.acquire() as conn:
+            if vendor_id:
+                rows = await conn.fetch(
+                    """
+                    SELECT va.id, va.vendor_id, v.name AS vendor_name, va.pattern, va.weight, va.source, va.created_at
+                    FROM vendor_aliases va
+                    JOIN vendors v ON v.id = va.vendor_id
+                    WHERE va.vendor_id = $1
+                    ORDER BY va.weight DESC, va.created_at ASC
+                    """,
+                    vendor_id,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT va.id, va.vendor_id, v.name AS vendor_name, va.pattern, va.weight, va.source, va.created_at
+                    FROM vendor_aliases va
+                    JOIN vendors v ON v.id = va.vendor_id
+                    ORDER BY va.vendor_id, va.weight DESC, va.created_at ASC
+                    """
+                )
+            return [dict(r) for r in rows]
+
+    return await _cached_read(f"aliases:list:{vendor_id or 'all'}", CACHE_TTL_ALIAS, _load)
 
 
 async def delete_vendor_alias(pool: asyncpg.Pool, alias_id: int) -> bool:
     """Delete a single vendor alias by id."""
     async with pool.acquire() as conn:
-        result = await conn.execute("DELETE FROM vendor_aliases WHERE id = $1", alias_id)
-        return result == "DELETE 1"
+        vendor_id = await conn.fetchval(
+            "DELETE FROM vendor_aliases WHERE id = $1 RETURNING vendor_id", alias_id,
+        )
+    if vendor_id is None:
+        return False
+    await invalidate_alias_cache(vendor_id)
+    return True
 
 
 async def get_all_aliases_for_detection(
     pool: asyncpg.Pool, user_id: str | None = None
 ) -> list[dict]:
     """Load vendor aliases for detection, optionally scoped to a single user's vendors."""
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT va.vendor_id, v.name AS vendor_name, va.pattern, va.weight, va.source
-            FROM vendor_aliases va
-            JOIN vendors v ON v.id = va.vendor_id
-            WHERE va.vendor_id <> '_auto'
-              AND ($1::UUID IS NULL OR v.user_id = $1)
-            ORDER BY va.vendor_id, va.weight DESC
-            """,
-            user_id,
-        )
-        return [dict(r) for r in rows]
+
+    async def _load():
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT va.vendor_id, v.name AS vendor_name, va.pattern, va.weight, va.source
+                FROM vendor_aliases va
+                JOIN vendors v ON v.id = va.vendor_id
+                WHERE va.vendor_id <> '_auto'
+                  AND ($1::UUID IS NULL OR v.user_id = $1)
+                ORDER BY va.vendor_id, va.weight DESC
+                """,
+                user_id,
+            )
+            return [dict(r) for r in rows]
+
+    return await _cached_read(f"aliases:detect:{user_id or 'all'}", CACHE_TTL_ALIAS, _load)
 
 
 # -- Spatial memory queries ------------------------------------------------
@@ -1942,16 +2087,19 @@ _TEMPLATE_COLS = """
 
 
 async def get_template(pool: asyncpg.Pool, vendor_id: str) -> dict | None:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            f"SELECT {_TEMPLATE_COLS} FROM templates WHERE vendor_id = $1",
-            vendor_id,
-        )
-        if not row:
-            return None
-        d = dict(row)
-        _parse_jsonb(d, "header_fields", "line_item_fields", "extraction_rules")
-        return d
+    async def _load():
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT {_TEMPLATE_COLS} FROM templates WHERE vendor_id = $1",
+                vendor_id,
+            )
+            if not row:
+                return None
+            d = dict(row)
+            _parse_jsonb(d, "header_fields", "line_item_fields", "extraction_rules")
+            return d
+
+    return await _cached_read(f"template:{vendor_id}", CACHE_TTL_TEMPLATE, _load)
 
 
 async def upsert_template(
@@ -1988,32 +2136,37 @@ async def upsert_template(
             instructions, json.dumps(rules),
             system_prompt, prompt_hash,
         )
-        d = dict(row)
-        _parse_jsonb(d, "header_fields", "line_item_fields", "extraction_rules")
-        return d
+    d = dict(row)
+    _parse_jsonb(d, "header_fields", "line_item_fields", "extraction_rules")
+    await invalidate_template_cache(vendor_id)
+    return d
 
 
 async def list_all_templates(pool: asyncpg.Pool, user_id: str | None = None) -> list[dict]:
     """Return all templates joined with vendor name for the saved-templates page."""
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            f"""
-            SELECT t.id, t.vendor_id, v.name AS vendor_name, t.format_type,
-                   t.header_fields, t.line_item_fields, t.prompt_instructions,
-                   t.extraction_rules, t.prompt_hash, t.created_at, t.updated_at
-            FROM templates t
-            JOIN vendors v ON v.id = t.vendor_id
-            WHERE ($1::UUID IS NULL OR v.user_id = $1)
-            ORDER BY t.updated_at DESC
-            """,
-            user_id,
-        )
-        results = []
-        for r in rows:
-            d = dict(r)
-            _parse_jsonb(d, "header_fields", "line_item_fields", "extraction_rules")
-            results.append(d)
-        return results
+
+    async def _load():
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT t.id, t.vendor_id, v.name AS vendor_name, t.format_type,
+                       t.header_fields, t.line_item_fields, t.prompt_instructions,
+                       t.extraction_rules, t.prompt_hash, t.created_at, t.updated_at
+                FROM templates t
+                JOIN vendors v ON v.id = t.vendor_id
+                WHERE ($1::UUID IS NULL OR v.user_id = $1)
+                ORDER BY t.updated_at DESC
+                """,
+                user_id,
+            )
+            results = []
+            for r in rows:
+                d = dict(r)
+                _parse_jsonb(d, "header_fields", "line_item_fields", "extraction_rules")
+                results.append(d)
+            return results
+
+    return await _cached_read(f"templates:list:{user_id or 'all'}", CACHE_TTL_TEMPLATE, _load)
 
 
 # -- Field mapping queries -------------------------------------------------
@@ -2026,17 +2179,21 @@ _FIELD_MAPPING_COLS = """
 
 async def get_field_mapping(pool: asyncpg.Pool, vendor_id: str) -> dict | None:
     """Return the ERP field mapping for a vendor, or None if not configured."""
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            f"SELECT {_FIELD_MAPPING_COLS} FROM field_mappings WHERE vendor_id = $1",
-            vendor_id,
-        )
-        if not row:
-            return None
-        d = dict(row)
-        _parse_jsonb(d, "header_map", "line_map", "header_snapshot",
-                     "line_snapshot", "pending_notices")
-        return d
+
+    async def _load():
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT {_FIELD_MAPPING_COLS} FROM field_mappings WHERE vendor_id = $1",
+                vendor_id,
+            )
+            if not row:
+                return None
+            d = dict(row)
+            _parse_jsonb(d, "header_map", "line_map", "header_snapshot",
+                         "line_snapshot", "pending_notices")
+            return d
+
+    return await _cached_read(f"mapping:{vendor_id}", CACHE_TTL_MAPPING, _load)
 
 
 async def upsert_field_mapping(
@@ -2074,10 +2231,11 @@ async def upsert_field_mapping(
             json.dumps(header_snapshot), json.dumps(line_snapshot),
             json.dumps(pending_notices), schema_id,
         )
-        d = dict(row)
-        _parse_jsonb(d, "header_map", "line_map", "header_snapshot",
-                     "line_snapshot", "pending_notices")
-        return d
+    d = dict(row)
+    _parse_jsonb(d, "header_map", "line_map", "header_snapshot",
+                 "line_snapshot", "pending_notices")
+    await invalidate_mapping_cache(vendor_id)
+    return d
 
 
 async def set_field_mapping_notices(
@@ -2090,6 +2248,7 @@ async def set_field_mapping_notices(
             "WHERE vendor_id = $1",
             vendor_id, json.dumps(pending_notices),
         )
+    await invalidate_mapping_cache(vendor_id)
 
 
 async def update_extraction_mapped_result(
@@ -3702,7 +3861,8 @@ async def update_user_subscription_limit(
             new_limit,
             uid,
         )
-        return result == "UPDATE 1"
+    await invalidate_user_cache(uid)  # subscription_limit is in the cached user row
+    return result == "UPDATE 1"
 
 
 # -- Subscriptions + top-ups (v2 quota model) ------------------------------
@@ -3795,6 +3955,7 @@ async def create_subscription(
                 "UPDATE users SET subscription_limit = $1 WHERE id = $2",
                 int(page_limit), uid,
             )
+    await invalidate_user_cache(uid)  # legacy subscription_limit mirror changed
     return _row_subscription(row)
 
 
@@ -3824,7 +3985,9 @@ async def cancel_subscription(
                     "UPDATE users SET subscription_limit = 0 WHERE id = $1",
                     uid,
                 )
-            return is_cancelled
+    if is_cancelled:
+        await invalidate_user_cache(uid)  # legacy subscription_limit mirror changed
+    return is_cancelled
 
 
 async def get_active_subscription(
@@ -4309,24 +4472,58 @@ async def list_api_keys(pool: asyncpg.Pool) -> list[dict]:
 
 
 async def verify_api_key_hash(pool: asyncpg.Pool, key_hash: str) -> dict | None:
-    """Look up an API key by its SHA-256 hash. Returns {id, user_id, is_active} or None.
-    Returns None if the key has expired.
+    """Look up an active API key by its SHA-256 hash, or None if missing/expired.
+
+    Cached positive-only, with the TTL capped at the key's own expiry so a
+    cached entry can never outlive the key it represents. Invalidated on any
+    api-key mutation (see invalidate_api_key_cache).
     """
+    cache = get_cache()
+    ckey = f"apikey:{key_hash}"
+    cached = await cache.get(ckey)
+    if cached is not None:
+        return dict(cached)
+
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT id, user_id, is_active
+            SELECT id, user_id, is_active, expires_at
             FROM api_keys
             WHERE key_hash = $1
               AND (expires_at IS NULL OR expires_at > NOW())
             """,
             key_hash,
         )
-    return dict(row) if row else None
+    if not row:
+        return None
+
+    result = dict(row)
+    ttl = CACHE_TTL_AUTH
+    expires_at = result.get("expires_at")
+    if expires_at is not None:
+        # Column is TIMESTAMPTZ (aware), but guard against a naive value ever
+        # reaching here — a TypeError must never break the auth path.
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        secs = int((expires_at - datetime.now(timezone.utc)).total_seconds())
+        if secs <= 0:
+            return result  # expired in the race window — return but don't cache
+        ttl = max(1, min(CACHE_TTL_AUTH, secs))
+    await cache.set(ckey, result, ttl)
+    return result
 
 
 async def touch_api_key(pool: asyncpg.Pool, key_hash: str) -> None:
-    """Update last_used_at timestamp for an API key."""
+    """Update last_used_at, throttled to at most once per key per window.
+
+    A marker key in the cache suppresses repeat writes; with no Redis the
+    marker is never seen, so this writes on every call exactly as before.
+    """
+    cache = get_cache()
+    tkey = f"apikey_touch:{key_hash}"
+    if await cache.get(tkey) is not None:
+        return
+    await cache.set(tkey, 1, ttl=CACHE_TTL_APIKEY_TOUCH)
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE api_keys SET last_used_at = NOW() WHERE key_hash = $1",
@@ -4341,6 +4538,7 @@ async def deactivate_api_key(pool: asyncpg.Pool, key_id: int) -> bool:
             "UPDATE api_keys SET is_active = FALSE WHERE id = $1",
             key_id,
         )
+    await invalidate_api_key_cache()
     return result == "UPDATE 1"
 
 
@@ -4351,6 +4549,7 @@ async def activate_api_key(pool: asyncpg.Pool, key_id: int) -> bool:
             "UPDATE api_keys SET is_active = TRUE WHERE id = $1",
             key_id,
         )
+    await invalidate_api_key_cache()
     return result == "UPDATE 1"
 
 
@@ -4361,6 +4560,7 @@ async def delete_api_key(pool: asyncpg.Pool, key_id: int) -> bool:
             "DELETE FROM api_keys WHERE id = $1",
             key_id,
         )
+    await invalidate_api_key_cache()
     return result == "DELETE 1"
 
 

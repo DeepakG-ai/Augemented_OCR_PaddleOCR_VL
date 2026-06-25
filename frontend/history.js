@@ -11,6 +11,7 @@ function _historyReviewUnavailable(e) {
     return e.status !== 'done'
         || e.error
         || progress.review_available === false
+        || progress.layout_boxes_available === false
         || progress.warning_code
         || progress.ocr_error
         || (e.result && typeof e.result === 'object' && e.result._all_pages_failed === true)
@@ -30,6 +31,7 @@ function _historyEffectiveStatus(e) {
 function _historyItemHTML(e, showDelete = false) {
     const reviewUnavailable = _historyReviewUnavailable(e);
     const effectiveStatus = _historyEffectiveStatus(e);
+    const layoutSkipped = (e.progress || {}).layout_boxes_available === false;
     return `
     <div class="history-item" onclick="showHistoryDetailSafe(${e.id})">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
@@ -43,6 +45,9 @@ function _historyItemHTML(e, showDelete = false) {
                     ${reviewUnavailable
                         ? `<span class="link-btn" style="font-size:9px;color:var(--text-dim);cursor:not-allowed" title="Review unavailable for this extraction">Review N/A</span>`
                         : `<a class="link-btn" href="#/review/${e.id}" onclick="event.stopPropagation()" style="font-size:9px">Review</a>`}
+                    ${layoutSkipped
+                        ? `<span style="font-size:8px;background:var(--bg2);border:1px solid var(--border);border-radius:3px;padding:1px 5px;margin-left:4px;color:var(--text-dim);cursor:help" title="Layout boxes were skipped because this extraction was submitted through the API in JSON-only mode.">JSON-only API</span>`
+                        : ''}
                 </div>
             </div>
             <div class="history-actions">

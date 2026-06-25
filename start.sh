@@ -93,6 +93,19 @@ if ! command -v curl >/dev/null 2>&1; then
   exit 1
 fi
 
+case "${CACHE_ENABLED:-true}" in
+  0|false|False|FALSE|no|No|NO|off|Off|OFF)
+    ;;
+  *)
+    if ! command -v redis-server >/dev/null 2>&1; then
+      echo "ERROR: redis-server is not installed but CACHE_ENABLED=${CACHE_ENABLED:-true}."
+      echo "Run: apt-get update && apt-get install -y redis-server"
+      echo "Or set CACHE_ENABLED=false in $ENV_FILE to run without Redis cache."
+      exit 1
+    fi
+    ;;
+esac
+
 if ! "$VENV_DIR/bin/python" -c "import uvicorn, mlflow" >/dev/null 2>&1; then
   echo "ERROR: venv at $VENV_DIR is missing required packages (uvicorn/mlflow)."
   echo "Run: $VENV_DIR/bin/pip install -r $APP_DIR/backend/requirements.txt"

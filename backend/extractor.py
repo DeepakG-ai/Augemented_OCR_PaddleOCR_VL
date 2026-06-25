@@ -569,6 +569,7 @@ async def extract_document(
     pipeline_context: dict | None = None,
     pool: Any | None = None,
     system_prompt_page1: str | None = None,
+    include_page1_boxes: bool = True,
 ) -> dict:
     """
     Process page 1 first, then process pages 2-N in configurable parallel batches.
@@ -625,7 +626,7 @@ async def extract_document(
             with trace_build_user_message(page_num, total) as msg_ctx:
                 user_msg = build_user_message(
                     header_fields, line_item_fields, page_num, total,
-                    include_boxes=is_page1,
+                    include_boxes=(is_page1 and include_page1_boxes),
                 )
                 msg_ctx["user_message"] = user_msg
 

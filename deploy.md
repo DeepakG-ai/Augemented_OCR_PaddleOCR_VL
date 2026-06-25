@@ -83,7 +83,7 @@ apt-get install -y \
   git curl wget ca-certificates build-essential cmake pkg-config \
   python3 python3-venv python3-pip \
   postgresql postgresql-contrib \
-  supervisor net-tools
+  redis-server supervisor net-tools
 ```
 
 Check:

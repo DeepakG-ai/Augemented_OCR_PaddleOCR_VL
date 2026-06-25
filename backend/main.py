@@ -34,6 +34,7 @@ from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from . import db as db_mod
+from . import cache as cache_mod
 from . import extractor
 from . import processor
 from . import page_logger
@@ -206,6 +207,10 @@ async def lifespan(app: FastAPI):
     await db_mod.init(app.state.pool)
     app.state.store = get_store()
 
+    # Optional Redis read cache (no-op fallback if disabled/unreachable).
+    app.state.cache = await cache_mod.create_cache()
+    cache_mod.set_active_cache(app.state.cache)
+
     # Bootstrap admin user from env vars on first startup
     admin_email = (os.getenv("ADMIN_EMAIL") or "").strip()
     admin_pw = os.getenv("ADMIN_PASSWORD") or ""
@@ -246,6 +251,7 @@ async def lifespan(app: FastAPI):
     logger.info("DB pool, object store, and MLflow ready")
     yield
     logger.info("Shutting down -- closing connections")
+    await app.state.cache.close()
     await app.state.pool.close()
     from .logging_config import shutdown_logging
     shutdown_logging()
@@ -2356,6 +2362,7 @@ async def ingest_document(
     ingest_metadata = {
         "billing_user_id": billing_user_id,
         "detect_user_id": detect_user_id,
+        "include_layout_boxes": True,
     }
 
     try:
@@ -3814,6 +3821,7 @@ async def extract_via_api_key(
     file: UploadFile = File(...),
     vendor_id: str | None = Form(None),
     async_mode: bool = Query(False, alias="async"),
+    include_boxes: bool = Query(False, description="Request layout bounding boxes (default false for API — faster). Set true to enable Review UI field highlighting."),
     user: dict = Depends(get_current_user_or_api_key),
 ):
     """Synchronous/Asynchronous PDF extraction endpoint for programmatic (API-key) clients.
@@ -3985,6 +3993,7 @@ async def extract_via_api_key(
                 "detect_user_id": user["id"],
                 "auth_method": user.get("auth_method"),
                 "api_key_id": user.get("api_key_id"),
+                "include_layout_boxes": include_boxes,
             }
             if idempotency_key:
                 doc_metadata["idempotency_key"] = idempotency_key

@@ -99,6 +99,39 @@ def _env_bool(name: str, default: bool) -> bool:
 # ---------------------------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://augocr:augocr@localhost:5432/augocr")
 
+# Connection-pool sizing, split by process role. The API runs as a single
+# process today and serves bursty reads plus long-lived SSE streams, so it gets
+# the larger pool. Each pipeline worker handles one job at a time and is
+# GPU/CPU-bound, so it gets a small pool — keeping the total connection count
+# (1 API + N workers) well under Postgres's max_connections. Tune via .env.
+DB_POOL_MIN_API    = _env_int_min("DB_POOL_MIN_API",    2, 0)
+DB_POOL_MAX_API    = _env_int_min("DB_POOL_MAX_API",    15, 1)
+DB_POOL_MIN_WORKER = _env_int_min("DB_POOL_MIN_WORKER", 1, 0)
+DB_POOL_MAX_WORKER = _env_int_min("DB_POOL_MAX_WORKER", 3, 1)
+
+# ---------------------------------------------------------------------------
+# Cache (Redis, optional)
+# ---------------------------------------------------------------------------
+# Read-through cache for hot, read-mostly DB reads (the DB is remote, so every
+# query is a cross-region round trip). Invalidation is explicit on the matching
+# mutation; the TTLs are a safety net. If disabled or Redis is unreachable the
+# cache degrades to a no-op and the app talks straight to Postgres — see
+# cache.py. Keep Redis private (localhost/authenticated): values are pickled.
+REDIS_URL           = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+CACHE_ENABLED       = _env_bool("CACHE_ENABLED", True)
+CACHE_PREFIX        = os.getenv("CACHE_PREFIX", "augocr")
+CACHE_TTL_AUTH      = _env_int_min("CACHE_TTL_AUTH",      60, 1)
+CACHE_TTL_VENDOR    = _env_int_min("CACHE_TTL_VENDOR",    600, 1)
+CACHE_TTL_TEMPLATE  = _env_int_min("CACHE_TTL_TEMPLATE",  600, 1)
+CACHE_TTL_MAPPING   = _env_int_min("CACHE_TTL_MAPPING",   600, 1)
+CACHE_TTL_ALIAS     = _env_int_min("CACHE_TTL_ALIAS",     300, 1)
+CACHE_TTL_DASHBOARD = _env_int_min("CACHE_TTL_DASHBOARD", 30, 1)
+# How often an API key's last_used_at is actually written. Without this, every
+# API-key request fires an UPDATE to the (remote) DB; throttling collapses that
+# to at most one write per key per window. No-op when Redis is off (writes as
+# before).
+CACHE_TTL_APIKEY_TOUCH = _env_int_min("CACHE_TTL_APIKEY_TOUCH", 60, 1)
+
 # ---------------------------------------------------------------------------
 # LLM (Qwen3-VL via llama-server)
 # ---------------------------------------------------------------------------
