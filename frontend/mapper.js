@@ -240,6 +240,11 @@ function mpMapperBodyHTML() {
         </div>
     </div>
     <svg class="mp-svg" id="mpSvg" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+            <marker id="mpArrow" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+                <polygon points="0 0, 8 4, 0 8" fill="context-stroke"/>
+            </marker>
+        </defs>
         <g id="mpConns"></g>
         <path id="mpLivePath" class="mp-live-path" style="display:none"/>
     </svg>`;
@@ -414,8 +419,8 @@ function mpDrawConn(g, srcEl, tgtEl, section, src, tgt) {
     hit.setAttribute('class', 'mp-conn-hit');
     hit.addEventListener('click', () => mpDisconnect(section, tgt));
 
-    g.appendChild(line);
     g.appendChild(hit);
+    g.appendChild(line);
 }
 
 // ── DRAG TO CONNECT ────────────────────────────────────────────────────
@@ -825,13 +830,14 @@ body.mp-dragging,body.mp-dragging *{cursor:grabbing!important;}
 .mp-svg{position:fixed;inset:0;width:100vw;height:100vh;z-index:40;
   pointer-events:none;overflow:visible;}
 .mp-conn-line{fill:none;stroke:var(--blue);stroke-width:1.6;
-  stroke-dasharray:7 4;animation:mpFlow 1.4s linear infinite;}
+  stroke-dasharray:7 4;animation:mpFlow 1.4s linear infinite;
+  marker-end:url(#mpArrow);}
 @keyframes mpFlow{to{stroke-dashoffset:-22;}}
 .mp-conn-hit{fill:none;stroke:transparent;stroke-width:14;
   pointer-events:stroke;cursor:pointer;}
 .mp-conn-hit:hover+.mp-conn-line,.mp-conn-line:hover{stroke:var(--red);}
 .mp-live-path{fill:none;stroke:var(--blue);stroke-width:1.8;
-  stroke-dasharray:6 4;opacity:0.8;}
+  stroke-dasharray:6 4;opacity:0.8;marker-end:url(#mpArrow);}
 
 /* compare view */
 .mp-compare{flex:1;display:flex;overflow:hidden;}

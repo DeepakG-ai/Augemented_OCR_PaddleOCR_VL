@@ -9,7 +9,7 @@ async function renderVendorsPage(app) {
     let vendors = [];
     let allUsers = [];
     let _vendorLoadError = null;
-    try { vendors = await apiJSON('/vendors'); } catch (e) {
+    try { vendors = await cachedJSON('/vendors'); } catch (e) {
         console.warn(e);
         _vendorLoadError = e.message || 'Failed to load vendors';
     }
@@ -126,6 +126,7 @@ async function submitAssignVendor() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ user_id: userId }),
         });
+        invalidateCache('/vendors', '/templates');
         showToast('Vendor assigned');
         closeModal('assignVendorModal');
         router();
@@ -158,6 +159,7 @@ async function deleteVendor(id, name) {
     if (!confirm(`Delete vendor "${name}" and all its data?`)) return;
     try {
         await apiFetch(`/vendors/${id}`, { method: 'DELETE' });
+        invalidateCache('/vendors', '/templates');
         showToast(`Vendor ${name} deleted`);
         router();
     } catch (e) { showToast('Delete failed: ' + e.message); }
@@ -223,6 +225,7 @@ async function saveNewVendor() {
     if (isAdmin && clientEl && clientEl.value) payload.user_id = clientEl.value;
     try {
         await apiJSON('/vendors', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        invalidateCache('/vendors');
         showToast(`Vendor ${name} created`);
     } catch (e) { showToast('Failed: ' + e.message); }
     closeModal('vendorModal');
@@ -237,10 +240,19 @@ let tplVendorName = '';
 
 async function renderTemplatePage(app, vendorId) {
     tplVendorId = vendorId;
-    let vendor = null, tmpl = null;
-    try { const vendors = await apiJSON('/vendors'); vendor = vendors.find(v => v.id === vendorId); } catch (e) { }
+    let vendor = null, tmpl = null, aliases = [];
+    // Fire the three independent reads at once instead of stacking round trips.
+    // allSettled so a missing template (404) or alias error doesn't block the
+    // page — matches the per-call try/catch this replaces.
+    const [vendorsRes, tmplRes, aliasRes] = await Promise.allSettled([
+        cachedJSON('/vendors'),
+        cachedJSON(`/vendors/${vendorId}/template`),
+        cachedJSON(`/vendors/${vendorId}/aliases`),
+    ]);
+    if (vendorsRes.status === 'fulfilled') vendor = vendorsRes.value.find(v => v.id === vendorId);
+    if (tmplRes.status === 'fulfilled') tmpl = tmplRes.value;
+    if (aliasRes.status === 'fulfilled') aliases = aliasRes.value || [];
     tplVendorName = vendor ? vendor.name : vendorId;
-    try { tmpl = await apiJSON(`/vendors/${vendorId}/template`); } catch (e) { }
 
     headerFields = tmpl ? [...(tmpl.header_fields || [])] : [];
     lineItemFields = tmpl ? [...(tmpl.line_item_fields || [])] : [];
@@ -333,7 +345,7 @@ async function renderTemplatePage(app, vendorId) {
 
     tplRenderHeaders(); tplRenderLines(); tplRenderRules(); updateTplFormatHint(); updateNavActive();
     if (isAdmin) tplShowPrompt('page1System');
-    fetchVendorAliases(vendorId);
+    tplRenderAliases(aliases);
 }
 
 function tplAddHeader() {
@@ -414,6 +426,7 @@ async function tplAddAlias() {
             body: JSON.stringify({ pattern: val, weight: 1 }),
         });
         inp.value = '';
+        invalidateCache(`/vendors/${tplVendorId}/aliases`);
         await fetchVendorAliases(tplVendorId);
         showToast('Alias added');
     } catch (e) { showToast('Failed: ' + e.message); }
@@ -422,6 +435,7 @@ async function tplAddAlias() {
 async function tplDeleteAlias(aliasId) {
     try {
         await apiJSON(`/vendors/aliases/${aliasId}`, { method: 'DELETE' });
+        invalidateCache(`/vendors/${tplVendorId}/aliases`);
         await fetchVendorAliases(tplVendorId);
         showToast('Alias removed');
     } catch (e) { showToast('Failed: ' + e.message); }
@@ -439,6 +453,7 @@ async function saveTplConfig() {
     };
     try {
         const resp = await apiJSON(`/vendors/${tplVendorId}/template`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        invalidateCache(`/vendors/${tplVendorId}/template`, '/templates');
         showToast(`Template saved — hash: ${(resp.prompt_hash || 'none').slice(0, 12)}...`);
     } catch (e) {
         const fields = e.error && Array.isArray(e.error.fields) ? e.error.fields : null;
@@ -452,14 +467,14 @@ async function saveTplConfig() {
 // ══════════════════════════════════════════════════════════════════════
 async function renderSavedTemplatesPage(app) {
     let templates = [];
-    try { templates = await apiJSON('/templates'); } catch (e) { console.warn(e); }
+    try { templates = await cachedJSON('/templates'); } catch (e) { console.warn(e); }
 
     const isAdmin = (getAuthUser() || {}).role === 'admin';
     let vendorClientMap = {};   // vendor_id → email
     let clientOrder = [];
     if (isAdmin) {
         try {
-            const [vendors, users] = await Promise.all([apiJSON('/vendors'), apiJSON('/admin/users')]);
+            const [vendors, users] = await Promise.all([cachedJSON('/vendors'), apiJSON('/admin/users')]);
             const userEmailMap = {};
             users.forEach(u => { userEmailMap[u.id] = u.email; });
             vendors.forEach(v => {

@@ -230,6 +230,27 @@ async function renderReviewPage(app, extractionId) {
             return;
         }
 
+        // API JSON-only mode: layout boxes were intentionally skipped.
+        // The JSON result is complete, but Review UI field highlighting is unavailable.
+        const layoutBoxesSkipped = progress.layout_boxes_available === false;
+        if (layoutBoxesSkipped) {
+            app.className = 'app';
+            app.innerHTML = headerHTML() + `
+                <div class="page-content" style="text-align:center;padding-top:60px">
+                    <div style="font-size:48px;margin-bottom:16px">ℹ️</div>
+                    <div class="page-title">Review Not Available</div>
+                    <p style="color:var(--text-dim);margin:12px auto;max-width:540px">
+                        This extraction was submitted via API. Layout boxes were not generated &mdash;
+                        field highlighting is unavailable, but corrections still work.
+                        The JSON result is complete and available in History.
+                    </p>
+                    <button class="small-btn" onclick="navigate('#/history')" style="margin-top:12px">View History</button>
+                    <button class="small-btn" onclick="navigate('#/extract')" style="margin-top:12px">Back to Extraction</button>
+                </div>`;
+            updateNavActive();
+            return;
+        }
+
         // OCR failed but the LLM still produced JSON: the extraction passed.
         // The review system needs OCR word boxes, so it can't run for this PDF.
         // Show only a message (the JSON itself is valid and lives in History).

@@ -109,6 +109,35 @@ async function apiFetch(path, opts = {}) {
 }
 async function apiJSON(path, opts = {}) { return (await apiFetch(path, opts)).json(); }
 
+// ── CLIENT-SIDE READ CACHE ─────────────────────────────────────────────
+// Short-lived in-memory cache for read-only GETs (vendors, templates,
+// aliases). It cuts repeat round trips to the (remote) API within a session
+// — e.g. navigating Vendors → Template → back reuses the vendor list instead
+// of refetching it across the ocean. Invalidated explicitly on the matching
+// mutation; the TTL is only a safety net for changes made elsewhere.
+// Resets on a full page reload. NEVER cache per-job/progress data here.
+const _apiCacheStore = new Map();        // path -> { data, ts }
+const API_CACHE_TTL_MS = 60000;          // 60s
+
+// Cache-aware GET. On a hit it returns the SAME object reference, so callers
+// must treat the result as read-only (copy before mutating). Only successful
+// responses are cached — apiJSON throws on error, so nothing is stored then.
+async function cachedJSON(path, ttlMs = API_CACHE_TTL_MS) {
+    const hit = _apiCacheStore.get(path);
+    if (hit && (Date.now() - hit.ts) < ttlMs) return hit.data;
+    const data = await apiJSON(path);
+    _apiCacheStore.set(path, { data, ts: Date.now() });
+    return data;
+}
+
+// Drop every cached entry whose path starts with any of the given prefixes.
+// Call this right before re-rendering after a create/update/delete.
+function invalidateCache(...prefixes) {
+    for (const key of _apiCacheStore.keys()) {
+        if (prefixes.some(p => key.startsWith(p))) _apiCacheStore.delete(key);
+    }
+}
+
 function formatDurationMs(durationMs) {
     return durationMs ? `${(durationMs / 1000).toFixed(1)}s` : '';
 }
