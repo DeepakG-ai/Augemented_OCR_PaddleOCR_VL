@@ -1,0 +1,231 @@
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+from fastapi.testclient import TestClient
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+import backend.main as main
+
+
+class ReviewApiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        main.app.state.pool = object()
+        cls.client = TestClient(main.app)
+
+    def setUp(self) -> None:
+        self.default_extraction = {
+            "id": 123,
+            "document_id": 1,
+            "vendor_id": "V1",
+            "vendor_name": "Vendor 1",
+            "template_id": None,
+            "filename": "test.pdf",
+            "total_pages": 1,
+            "format_type": "single_po_multipage",
+            "header_fields": [],
+            "line_item_fields": [],
+            "result": {"vendor_name": "OLD"},
+            "page_results": [],
+            "field_locations": {},
+            "ocr_data": [{"page_number": 1, "words": []}],
+            "corrected_result": None,
+            "correction_meta": None,
+            "export_object_key": None,
+            "progress": None,
+            "cancel_requested": False,
+            "status": "done",
+            "error": None,
+            "duration_ms": 10,
+            "created_at": "2026-04-06T00:00:00Z",
+            "updated_at": "2026-04-06T00:00:00Z",
+        }
+        self.get_extraction_patcher = patch.object(
+            main.db_mod, "get_extraction", new=AsyncMock(return_value=self.default_extraction)
+        )
+        self.get_latest_job_patcher = patch.object(
+            main.db_mod, "get_latest_job_for_extraction_type", new=AsyncMock(return_value=None)
+        )
+        self.get_extraction_patcher.start()
+        self.get_latest_job_patcher.start()
+
+    def tearDown(self) -> None:
+        self.get_extraction_patcher.stop()
+        self.get_latest_job_patcher.stop()
+
+    def test_get_extraction_ocr_returns_200_with_payload(self) -> None:
+        payload = [{"page_number": 1, "words": [{"text": "ACME", "box": [1, 2, 3, 4], "score": 0.9}]}]
+
+        with patch.object(main.db_mod, "get_ocr_data", new=AsyncMock(return_value=payload)):
+            response = self.client.get("/extractions/123/ocr")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"extraction_id": 123, "ocr_pages": payload})
+
+    def test_get_extraction_ocr_returns_404_when_missing(self) -> None:
+        with patch.object(main.db_mod, "get_ocr_data", new=AsyncMock(return_value=None)), \
+             patch.object(main.db_mod, "get_latest_job_for_extraction_type", new=AsyncMock(return_value=None)):
+            response = self.client.get("/extractions/123/ocr")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["error"]["message"], "No OCR data found for this extraction")
+
+    def test_get_extraction_ocr_returns_409_when_ocr_failed(self) -> None:
+        latest_ocr_job = {"status": "failed", "error": "ocr model failed"}
+
+        with patch.object(main.db_mod, "get_ocr_data", new=AsyncMock(return_value=None)), \
+             patch.object(main.db_mod, "get_latest_job_for_extraction_type", new=AsyncMock(return_value=latest_ocr_job)):
+            response = self.client.get("/extractions/123/ocr")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"]["code"], "REVIEW_UNAVAILABLE_OCR_FAILED")
+        self.assertEqual(response.json()["error"]["ocr_error"], "ocr model failed")
+
+    def test_save_corrections_requires_corrected_result(self) -> None:
+        response = self.client.put("/extractions/123/corrections", json={"field_locations": {}})
+
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("error", response.json())
+
+    def test_save_corrections_returns_404_for_missing_extraction(self) -> None:
+        with patch.object(main.db_mod, "get_extraction", new=AsyncMock(return_value=None)):
+            response = self.client.put(
+                "/extractions/123/corrections",
+                json={"corrected_result": {"vendor_name": "ACME"}, "field_locations": {}},
+            )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["error"]["message"], "Extraction 123 not found")
+
+    def test_save_corrections_returns_200_on_success(self) -> None:
+        extraction = {
+            "id": 123,
+            "document_id": 1,
+            "vendor_id": "V1",
+            "vendor_name": "Vendor 1",
+            "template_id": None,
+            "filename": "test.pdf",
+            "total_pages": 1,
+            "format_type": "single_po_multipage",
+            "header_fields": [],
+            "line_item_fields": [],
+            "result": {"vendor_name": "OLD"},
+            "page_results": [],
+            "field_locations": {},
+            "ocr_data": [{"page_number": 1, "words": []}],
+            "corrected_result": None,
+            "correction_meta": None,
+            "export_object_key": None,
+            "progress": None,
+            "cancel_requested": False,
+            "status": "done",
+            "error": None,
+            "duration_ms": 10,
+            "created_at": "2026-04-06T00:00:00Z",
+            "updated_at": "2026-04-06T00:00:00Z",
+        }
+        with patch.object(main.db_mod, "get_extraction", new=AsyncMock(return_value=extraction)), \
+             patch.object(main.db_mod, "save_corrections", new=AsyncMock(return_value=True)) as mock_save, \
+             patch.object(main.db_mod, "create_review_event", new=AsyncMock(return_value=77)), \
+             patch.object(main.db_mod, "ensure_job", new=AsyncMock(return_value=None)), \
+             patch.object(main.db_mod, "save_gold_example", new=AsyncMock(return_value=55)):
+            response = self.client.put(
+                "/extractions/123/corrections",
+                json={
+                    "corrected_result": {"vendor_name": "ACME"},
+                    "field_locations": {"vendor_name": {"page": 1, "box": [1, 2, 3, 4]}},
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "saved")
+        self.assertEqual(response.json()["extraction_id"], 123)
+        self.assertEqual(mock_save.await_count, 1)
+
+    def test_save_corrections_blocks_field_locations_when_ocr_failed(self) -> None:
+        extraction = {
+            "id": 123,
+            "document_id": 1,
+            "vendor_id": "V1",
+            "vendor_name": "Vendor 1",
+            "filename": "test.pdf",
+            "result": {"vendor_name": "OLD"},
+            "field_locations": {},
+            "ocr_data": None,
+            "status": "done",
+        }
+        latest_ocr_job = {"status": "failed", "error": "ocr model failed"}
+        with patch.object(main.db_mod, "get_extraction", new=AsyncMock(return_value=extraction)), \
+             patch.object(main.db_mod, "get_latest_job_for_extraction_type", new=AsyncMock(return_value=latest_ocr_job)), \
+             patch.object(main.db_mod, "save_corrections", new=AsyncMock(return_value=True)) as mock_save:
+            response = self.client.put(
+                "/extractions/123/corrections",
+                json={
+                    "corrected_result": {"vendor_name": "ACME"},
+                    "field_locations": {"vendor_name": {"page": 1, "box": [1, 2, 3, 4]}},
+                },
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"]["code"], "REVIEW_UNAVAILABLE_OCR_FAILED")
+        mock_save.assert_not_awaited()
+
+    def test_admin_usage_returns_manager_summaries(self) -> None:
+        document_rows = [
+            {
+                "doc_id": "42",
+                "vendor_id": "ROBERT_SCOTT",
+                "total_input_tokens": 1643,
+                "total_output_tokens": 461,
+                "grand_total": 2104,
+                "llm_calls": 1,
+                "avg_call_ms": 31500,
+            }
+        ]
+        daily_rows = [
+            {
+                "day": "2026-05-07",
+                "input_tokens": 1643,
+                "output_tokens": 461,
+                "total_tokens": 2104,
+                "docs_processed": 1,
+                "llm_calls": 1,
+                "avg_call_ms": 31500,
+            }
+        ]
+        call_rows = [
+            {
+                "id": 1,
+                "doc_id": "42",
+                "vendor_id": "ROBERT_SCOTT",
+                "page_num": 1,
+                "call_type": "extraction",
+                "prompt_tokens": 1643,
+                "completion_tokens": 461,
+                "total_tokens": 2104,
+            }
+        ]
+
+        with patch.object(main.db_mod, "get_llm_usage_document_summary", new=AsyncMock(return_value=document_rows)) as mock_docs, \
+             patch.object(main.db_mod, "get_llm_usage_daily_summary", new=AsyncMock(return_value=daily_rows)) as mock_days, \
+             patch.object(main.db_mod, "list_llm_usage_calls", new=AsyncMock(return_value=call_rows)) as mock_calls:
+            response = self.client.get("/admin/usage?include_calls=true&doc_id=42&vendor_id=ROBERT_SCOTT")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["documents"], document_rows)
+        self.assertEqual(payload["days"], daily_rows)
+        self.assertEqual(payload["calls"], call_rows)
+        mock_docs.assert_awaited_once()
+        mock_days.assert_awaited_once()
+        mock_calls.assert_awaited_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

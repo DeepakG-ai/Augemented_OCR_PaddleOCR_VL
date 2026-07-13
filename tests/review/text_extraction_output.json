@@ -1,0 +1,28 @@
+{
+  "pdf_file": "RJ SCHINNER 563773.pdf",
+  "total_pages": 3,
+  "text_data": [
+    {
+      "page_number": 1,
+      "page_width": 612.0,
+      "page_height": 792.0,
+      "total_spans": 0,
+      "spans": []
+    },
+    {
+      "page_number": 2,
+      "page_width": 612.0,
+      "page_height": 792.0,
+      "total_spans": 0,
+      "spans": []
+    },
+    {
+      "page_number": 3,
+      "page_width": 612.0,
+      "page_height": 792.0,
+      "total_spans": 0,
+      "spans": []
+    }
+  ],
+  "field_locations": {}
+}
