@@ -85,6 +85,15 @@ async function renderExtractPage(app) {
         </div>
         <input type="file" id="fileInput" accept="application/pdf,.pdf" style="display:none" onchange="handleFile(this.files[0])">
         <div id="fileBadge" style="display:none" class="file-badge"><span>✓</span><span id="fileNameLabel" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span></div>
+        <div class="divider"></div>
+        <div class="sidebar-section"><div class="section-title">Universal Agent</div></div>
+        <label style="display:flex;gap:6px;align-items:flex-start;cursor:pointer;font-size:10px;line-height:1.5;color:var(--text)">
+            <input type="checkbox" id="universalAgentToggle" style="margin-top:2px" onchange="toggleUniversalAgent(this.checked)">
+            <span><strong style="color:var(--blue)">Universal Agent — Invoice Only</strong><br>For mixed PDFs (e-way bill + tax invoice + PO in one file)</span>
+        </label>
+        <div id="universalAgentWarning" style="display:none;font-size:9px;color:var(--red);line-height:1.5;margin-top:6px;border-left:2px solid var(--red);padding-left:6px">
+            ⚠ The agent will auto-detect tax invoice pages. PO / e-way bill pages are DROPPED automatically — only invoice details (invoice number, date, items) are extracted. If NO invoice page is found, the extraction will fail with "no invoice found".
+        </div>
     </aside>
     <main class="viewer">
         <div id="extractionView" style="display:flex;flex-direction:column;width:100%;height:100%">
@@ -323,6 +332,37 @@ function extUpdateFormatHint() {
     const hints = { single_po_multipage: 'Page 1: header + line items. Pages 2-N: line items only, same PO.', po_per_page: 'Each page is a self-contained PO with its own header and line items.', single_page: 'Entire document is a single page. Extract all fields at once.' };
     const formatEl = document.getElementById('formatType');
     el.textContent = hints[formatEl ? formatEl.value : 'single_po_multipage'] || '';
+}
+
+function toggleUniversalAgent(on) {
+    const warn = document.getElementById('universalAgentWarning');
+    if (warn) warn.style.display = on ? 'block' : 'none';
+}
+
+function isUniversalAgentEnabled() {
+    const el = document.getElementById('universalAgentToggle');
+    return !!(el && el.checked);
+}
+
+function renderUniversalAgentNote(extraction, progress) {
+    // Show which pages the Universal Agent dropped (PO / e-way bill) on success.
+    const rs = document.getElementById('resultSection');
+    if (!rs) return;
+    const old = rs.querySelector('.ua-note');
+    if (old) old.remove();
+    let dropped = (progress && progress.dropped_pages) || [];
+    if (!dropped.length && Array.isArray(extraction.page_results)) {
+        dropped = extraction.page_results
+            .filter(pr => pr && pr._invoice === false && pr._page)
+            .map(pr => pr._page);
+    }
+    if (!dropped.length) return;
+    const note = document.createElement('div');
+    note.className = 'ua-note';
+    note.style.cssText = 'font-size:9px;color:var(--text-dim);line-height:1.5;margin-top:6px;border-left:2px solid var(--blue);padding-left:6px';
+    note.textContent = `Universal agent: dropped non-invoice page(s) ${dropped.join(', ')} — only tax invoice pages were extracted.`;
+    const block = document.getElementById('resultBlock');
+    rs.insertBefore(note, block);
 }
 
 
@@ -621,6 +661,7 @@ function _pipelineErrorMessage(extraction, message) {
         no_fields: 'The detected vendor’s template has no fields.',
         ocr_unavailable: 'OCR was unavailable while reading the document.',
         llm_failed: 'Vision (LLM) extraction failed — the model server was unreachable or returned an error.',
+        no_invoice_found: 'Universal agent: no tax invoice page was detected — every page was a purchase order / e-way bill and was dropped.',
     };
     if (_extractHasPipelineFailure(extraction) && !extraction.error) {
         return map.llm_failed;
@@ -837,6 +878,7 @@ function applyJobStatus(jobState) {
         lastResult = extraction.corrected_result || extraction.result;
         totalPages = extraction.total_pages || totalPages;
         showResult(lastResult);
+        if (isUniversalAgentEnabled()) renderUniversalAgentNote(extraction, progress);
         setStatus('optimal');
         document.getElementById('rpBadge').className = 'rp-badge optimal';
         document.getElementById('rpBadge').textContent = 'OPTIMAL';
@@ -1018,6 +1060,7 @@ async function runExtract() {
     const formData = new FormData();
     formData.append('file', loadedFile);
     if (v) formData.append('vendor_id', v.id);
+    if (isUniversalAgentEnabled()) formData.append('universal_agent', 'true');
     // Pass the selected client scope so the backend restricts vendor detection
     // to that client's aliases/templates only (prevents cross-tenant collisions).
     if (user && user.role === 'admin' && actAsClientId && actAsClientId !== 'ADMIN') {

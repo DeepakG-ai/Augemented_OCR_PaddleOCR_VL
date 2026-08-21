@@ -117,12 +117,16 @@ def build_system_prompt(
     format_type: str,
     gold_examples: list[dict] | None = None,
     include_boxes: bool = False,
+    universal_invoice: bool = False,
 ) -> str:
     """Build the reusable system prompt.
 
     Args:
         gold_examples: Human-reviewed correction diffs from past extractions.
         include_boxes: If True (page 1), also request bounding boxes.
+        universal_invoice: If True (Universal Agent mode), require a top-level
+            ``invoice`` flag on every page so non-invoice pages (PO, e-way
+            bill, ...) can be dropped before merging.
     """
     context_section = ""
     if instructions and instructions.strip():
@@ -170,10 +174,29 @@ Human review has corrected these field values. Do not copy either value. Instead
 - `fields`: extracted values"""
         bbox_rules = ""
 
+    # ── Universal Agent: per-page tax-invoice detection ──
+    if universal_invoice:
+        header_hint = ", ".join(header_fields) if header_fields else "invoice number, invoice date"
+        classification_section = f"""
+<page_classification>
+This PDF may MIX different document types across its pages: tax invoice, purchase order (PO), e-way bill, delivery note, etc.
+FIRST classify the page you are looking at, then extract:
+- Return top-level `"invoice": "True"` ONLY if this page contains a TAX INVOICE or invoice details (e.g., a "Tax Invoice"/"Invoice" heading, invoice number and invoice date fields such as: {header_hint}, taxable value, GST/CGST/SGST amounts, grand total).
+- Return top-level `"invoice": "False"` for every other page type (purchase order, e-way bill, delivery note, cover page, etc.).
+- ALWAYS extract the visible fields regardless of the classification — classification never replaces extraction.
+</page_classification>"""
+        return_keys = (
+            'Also return a top-level `"invoice"` key (string "True"/"False" — '
+            "does this page contain a tax invoice?).\n" + return_keys
+        )
+    else:
+        classification_section = ""
+
     return f"""You are a highly accurate document data extraction assistant.
 This request is processed one page at a time.
 
 {return_keys}
+{classification_section}
 {context_section}
 {rules_section}
 {gold_section}
@@ -201,6 +224,7 @@ def build_user_message(
     page_num: int,
     total_pages: int,
     include_boxes: bool = False,
+    universal_invoice: bool = False,
 ) -> str:
     """
     Build the user message for a single page.
@@ -208,7 +232,15 @@ def build_user_message(
     Args:
         include_boxes: If True (page 1 only), ask the LLM to also return
             a ``boxes`` dict with label bounding boxes alongside ``fields``.
+        universal_invoice: If True (Universal Agent mode), ask for a
+            top-level ``invoice`` flag classifying the page as tax invoice.
     """
+
+    invoice_key_section = ""
+    if universal_invoice:
+        invoice_key_section = """
+- `"invoice"`: string "True" if this page contains a tax invoice or invoice details
+  (invoice number, invoice date, taxable value, GST amounts), otherwise "False."""
 
     if header_fields or line_item_fields:
         # ── Extract Fields mode ──
@@ -230,6 +262,9 @@ def build_user_message(
             }
         else:
             full_template = {"fields": fields_template}
+
+        if universal_invoice:
+            full_template = {"invoice": "True/False", **full_template}
 
         header_section = ""
         if header_fields:
@@ -258,20 +293,26 @@ Return JSON in exactly this shape:
 
 <rules>
 - Empty or missing cells → null.
-- Extract every visible line item row.
+- Extract every visible line item row.{invoice_key_section}
 </rules>
 
 STRICTLY return ONLY valid JSON matching EXACTLY the structure above."""
 
     else:
         # ── Auto Extract mode (no bbox support) ──
+        invoice_auto_section = ""
+        if universal_invoice:
+            invoice_auto_section = """
+- Top-level `"invoice"`: string "True" if this page contains a tax invoice or invoice details
+  (invoice number, invoice date, taxable value, GST amounts), otherwise "False".
+"""
         return f"""Extract ALL data from this invoice/purchase order document (page {page_num} of {total_pages}).
 
 <critical>
 Count the number of rows in the line items table FIRST, then extract that exact number of items.
 </critical>
 
-Return JSON with:
+Return JSON with:{invoice_auto_section}
 - Header fields: extract all visible header fields (po_number, order_date, vendor, bill_to, ship_to, etc.)
 - Line items: extract all visible line item rows with all their columns
 
@@ -294,6 +335,7 @@ def compute_prompt_hash(
     rules: list[str],
     format_type: str = "single_page",
     gold_examples: list[dict] | None = None,
+    universal_invoice: bool = False,
 ) -> str:
     payload = json.dumps({
         "header_fields": sorted(header_fields),
@@ -303,6 +345,7 @@ def compute_prompt_hash(
         "format_type": format_type,
         "prompt_version": PROMPT_VERSION,
         "gold_examples": _gold_correction_examples(gold_examples),
+        "universal_invoice": universal_invoice,
     }, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()
 
@@ -570,17 +613,25 @@ async def extract_document(
     pool: Any | None = None,
     system_prompt_page1: str | None = None,
     include_page1_boxes: bool = True,
+    universal_agent: bool = False,
 ) -> dict:
     """
     Process page 1 first, then process pages 2-N in configurable parallel batches.
-    
+
     Ordering guarantees:
     - Page 1 runs alone so bbox/layout extraction remains deterministic
     - asyncio.gather returns results in INPUT order (page 1 before page 2)
     - Pages already successful in existing_page_results are skipped on retry
     - If any page in a batch fails, processing stops (no further batches)
     - merge_results always receives pages in page_number order
-    
+
+    Universal Agent mode (universal_agent=True): every page is classified by
+    the LLM as tax invoice or not; non-invoice pages (PO, e-way bill, ...) are
+    dropped and the invoice pages are merged into one logical document
+    (header from the first invoice page + line items from all invoice pages),
+    regardless of format_type. A missing classification flag keeps the page
+    (fail-open) so a prompt regression never silently drops real data.
+
     Returns {"result": ..., "page_results": [...], "cancelled": bool, "last_completed_page": int}.
     """
     total = len(pages)
@@ -627,6 +678,7 @@ async def extract_document(
                 user_msg = build_user_message(
                     header_fields, line_item_fields, page_num, total,
                     include_boxes=(is_page1 and include_page1_boxes),
+                    universal_invoice=universal_agent,
                 )
                 msg_ctx["user_message"] = user_msg
 
@@ -746,10 +798,51 @@ async def extract_document(
             break  # Gap found — stop counting
 
     # ── Build final result based on format ──
-    if format_type == "po_per_page":
+    dropped_pages: list[int] = []
+    if universal_agent:
+        # Universal Agent: keep only pages classified as tax invoice; drop
+        # everything else (PO, e-way bill, delivery note, ...). The invoice
+        # pages form ONE logical document: header from the first invoice
+        # page + line items from all invoice pages, regardless of format_type.
+        for pr in page_results:
+            if "_error" in pr:
+                pr["_invoice"] = None
+                continue
+            flag = _parse_invoice_flag(pr)
+            if flag is None:
+                # Fail-open: missing classification keeps the page so a prompt
+                # regression can never silently drop real invoice data.
+                pr["_invoice"] = True
+            else:
+                pr["_invoice"] = flag
+        invoice_pages = [pr for pr in page_results if pr.get("_invoice") is True]
+        dropped_pages = [pr.get("_page") for pr in page_results if pr.get("_invoice") is False]
+        logger.info(
+            "Universal agent: %d invoice page(s) kept, dropped non-invoice page(s): %s",
+            len(invoice_pages), dropped_pages or "none",
+        )
+        if not invoice_pages:
+            return {
+                "result": None,
+                "page_results": page_results,
+                "cancelled": cancelled or batch_had_failure,
+                "last_completed_page": last_completed_page,
+                "no_invoice_pages": True,
+                "dropped_pages": dropped_pages,
+            }
+        with trace_merge_results(total, f"universal_agent/{format_type}") as merge_ctx:
+            final = merge_results(invoice_pages, header_fields, line_item_fields)
+            if isinstance(final, dict):
+                _f = final.get("fields", final)
+                merge_ctx["merged_line_items"] = len(_f.get("line_items", []))
+                merge_ctx["merged_fields"] = len([
+                    k for k in (final.get("fields", final)).keys()
+                    if k not in ("line_items", "_format", "boxes", "invoice")
+                ])
+    elif format_type == "po_per_page":
         final = [
             pr.get("fields") if pr.get("fields") is not None
-            else {k: v for k, v in pr.items() if not k.startswith("_")}
+            else {k: v for k, v in pr.items() if not k.startswith("_") and k != "invoice"}
             for pr in page_results if "_error" not in pr
         ]
     elif format_type == "single_page" and len(page_results) == 1:
@@ -781,10 +874,25 @@ async def extract_document(
         "page_results": page_results,
         "cancelled": cancelled or batch_had_failure,
         "last_completed_page": last_completed_page,
+        "dropped_pages": dropped_pages,
     }
 
 
 # ── Result Merger ────────────────────────────────────────────────────
+
+def _parse_invoice_flag(page_result: dict) -> bool | None:
+    """Parse the Universal Agent ``invoice`` flag off a page result.
+
+    The prompt asks for the strings "True"/"False"; tolerate booleans and
+    case variants. Returns None when the model did not answer the flag.
+    """
+    raw = page_result.get("invoice")
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip().lower() == "true"
+    return None
+
 
 def _value_lines(value: Any) -> list[str]:
     if value is None:
@@ -853,7 +961,7 @@ def merge_results(
         errors = [pr.get("_error", "unknown") for pr in page_results]
         return {"_all_pages_failed": True, "errors": errors}
 
-    _meta_keys = {"_page", "_total_pages", "_error", "line_items", "fields", "boxes"}
+    _meta_keys = {"_page", "_total_pages", "_error", "line_items", "fields", "boxes", "invoice", "_invoice"}
 
     first_page = valid_pages[0]
     is_v3 = "fields" in first_page and isinstance(first_page.get("fields"), dict)

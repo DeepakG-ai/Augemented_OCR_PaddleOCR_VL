@@ -46,6 +46,11 @@ OCR_REVIEW_UNAVAILABLE_MESSAGE = (
 )
 LLM_FAILED_ERROR = "llm_failed"
 LLM_FAILED_MESSAGE = "LLM extraction failed on one or more pages. Retry or resume the extraction."
+NO_INVOICE_ERROR = "no_invoice_found"
+NO_INVOICE_MESSAGE = (
+    "Universal agent: no tax invoice page was detected in this document — "
+    "all pages were classified as purchase order / e-way bill and were dropped."
+)
 TERMINAL_EXTRACTION_STATUSES = {"done", "failed", "partial", "cancelled", "unverified"}
 
 
@@ -783,8 +788,10 @@ async def _process_llm(pool, job: dict) -> None:
     req_items = extraction_row.get("line_item_fields") or ((tmpl.get("line_item_fields") or []) if tmpl else [])
     # Template is source of truth; stale extraction record is fallback only
     req_format = (tmpl.get("format_type") if tmpl else None) or extraction_row.get("format_type") or "single_po_multipage"
-    logger.info("LLM config: model=%s format=%s headers=%s line_items=%s",
-                LLM_MODEL, req_format, req_header, req_items)
+    # Universal Agent mode: per-page invoice detection; non-invoice pages dropped
+    universal_agent = bool(extraction_row.get("universal_agent"))
+    logger.info("LLM config: model=%s format=%s universal_agent=%s headers=%s line_items=%s",
+                LLM_MODEL, req_format, universal_agent, req_header, req_items)
 
     # Always build fresh from current DB fields — no cached system_prompt column read.
     with trace_span(
@@ -795,6 +802,7 @@ async def _process_llm(pool, job: dict) -> None:
             "header_fields": req_header,
             "line_item_fields": req_items,
             "format_type": req_format,
+            "universal_agent": universal_agent,
         },
         attributes=base,
     ) as prompt_trace:
@@ -812,12 +820,13 @@ async def _process_llm(pool, job: dict) -> None:
             gold_examples=gold_examples,
         )
         # Page 2+ system prompt: fields only (current behaviour)
-        system_prompt = extractor.build_system_prompt(**_prompt_args, include_boxes=False)
+        system_prompt = extractor.build_system_prompt(**_prompt_args, include_boxes=False, universal_invoice=universal_agent)
         # Page 1 system prompt: fields + bounding boxes (only when layout boxes requested)
         if include_layout_boxes:
             system_prompt_page1 = extractor.build_system_prompt(
                 **_prompt_args,
                 include_boxes=True,
+                universal_invoice=universal_agent,
             )
         else:
             system_prompt_page1 = None  # fields-only prompt for all pages
@@ -882,6 +891,7 @@ async def _process_llm(pool, job: dict) -> None:
             "header_fields": req_header,
             "line_item_fields": req_items,
             "format_type": req_format,
+            "universal_agent": universal_agent,
             "model": LLM_MODEL,
         },
     ) as field_trace:
@@ -893,6 +903,7 @@ async def _process_llm(pool, job: dict) -> None:
             vendor=extraction_row.get("vendor_id"),
             model=LLM_MODEL,
             format_type=req_format,
+            universal_agent=str(universal_agent),
         )
         with plog.timed("extraction") as t:
             _raw_epr = job.get("payload", {}).get("existing_page_results")
@@ -913,6 +924,7 @@ async def _process_llm(pool, job: dict) -> None:
                 pool=pool,
                 include_page1_boxes=include_layout_boxes,
                 system_prompt_page1=system_prompt_page1,
+                universal_agent=universal_agent,
             )
             _result = output.get("result")
         _npr = len(output.get("page_results") or [])
@@ -929,7 +941,15 @@ async def _process_llm(pool, job: dict) -> None:
     # ── Extract boxes from page 1 result and save to qwen_layout_boxes ──
     _page_results = output.get("page_results") or []
     if include_layout_boxes and tmpl and _page_results:
-        _p1 = next((pr for pr in _page_results if pr.get("_page") == 1 and "_error" not in pr), None)
+        # Learn layout boxes from page 1 — but never from a page the Universal
+        # Agent classified as non-invoice (e.g., an e-way bill first page).
+        # page_results are sorted by page number, so the first kept page is
+        # page 1 when it is an invoice, else the first invoice page.
+        _p1 = next(
+            (pr for pr in _page_results
+             if "_error" not in pr and pr.get("_invoice") is not False),
+            None,
+        )
         _p1_boxes = (_p1 or {}).get("boxes")
         if isinstance(_p1_boxes, dict) and _p1_boxes:
             vendor_id_llm = extraction_row["vendor_id"]
@@ -973,8 +993,13 @@ async def _process_llm(pool, job: dict) -> None:
         {"page": pr["_page"], "error": pr["_error"], "error_type": page_logger.classify_error_type(pr["_error"])}
         for pr in _pr if "_error" in pr
     ]
+    _dropped_pages = output.get("dropped_pages") or []
+    no_invoice = bool(output.get("no_invoice_pages"))
     user_cancelled = False
-    if output.get("cancelled"):
+    if no_invoice:
+        # Universal Agent found zero tax-invoice pages — nothing extractable.
+        status = "failed"
+    elif output.get("cancelled"):
         user_cancelled = await db_mod.is_cancel_requested(pool, extraction_id)
         if user_cancelled:
             status = "partial" if _pr else "cancelled"
@@ -997,10 +1022,13 @@ async def _process_llm(pool, job: dict) -> None:
             _log_status = "partial" if _pr else "cancelled"
         else:
             _log_status = "failed"
-    elif _failed_pages:
+    elif _failed_pages or no_invoice:
         _log_status = "failed"
     else:
         _log_status = "done"
+    if universal_agent:
+        logger.info("Universal agent summary ext=%s: dropped non-invoice page(s): %s",
+                    extraction_id, _dropped_pages or "none")
     page_logger.append_log({
         "extraction_id": extraction_id,
         "filename": extraction_row.get("filename"),
@@ -1040,11 +1068,12 @@ async def _process_llm(pool, job: dict) -> None:
             output["page_results"],
             status,
             elapsed_ms,
-            error=LLM_FAILED_ERROR if status == "failed" else None,
+            error=NO_INVOICE_ERROR if no_invoice else LLM_FAILED_ERROR if status == "failed" else None,
             progress={
                 "stage": "llm",
                 "message": (
-                    "LLM extraction complete, awaiting field mapping"
+                    NO_INVOICE_MESSAGE if no_invoice
+                    else "LLM extraction complete, awaiting field mapping"
                     if status == "processing"
                     else LLM_FAILED_MESSAGE if status == "failed"
                     else status
@@ -1052,6 +1081,7 @@ async def _process_llm(pool, job: dict) -> None:
                 "last_completed_page": output.get("last_completed_page", 0),
                 "total_pages": len(pages),
                 "failed_pages": [p["page"] for p in _failed_pages],
+                "dropped_pages": _dropped_pages,
             },
         )
         persist_trace["output"] = {

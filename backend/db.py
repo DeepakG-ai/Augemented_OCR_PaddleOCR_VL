@@ -650,6 +650,12 @@ async def _init_db(pool: asyncpg.Pool) -> None:
                 ) THEN
                     ALTER TABLE extractions ADD COLUMN correction_meta JSONB;
                 END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'extractions' AND column_name = 'universal_agent'
+                ) THEN
+                    ALTER TABLE extractions ADD COLUMN universal_agent BOOLEAN NOT NULL DEFAULT FALSE;
+                END IF;
             END $$;
         """)
         await conn.execute("""
@@ -2371,7 +2377,7 @@ _EXTRACTION_COLS = """
     e.result, e.page_results, e.field_locations, e.ocr_data,
     e.corrected_result, e.correction_meta, e.export_object_key,
     e.progress, e.cancel_requested, e.status, e.error, e.duration_ms,
-    e.created_at, e.updated_at
+    e.universal_agent, e.created_at, e.updated_at
 """
 
 
@@ -2385,6 +2391,7 @@ async def create_extraction(
     header_fields: list[str],
     line_item_fields: list[str],
     document_id: int | None = None,
+    universal_agent: bool = False,
 ) -> dict:
     # vendor_id/format_type/fields may be None/empty when the document is
     # submitted for auto-detection — the normalize stage fills them in once it
@@ -2395,13 +2402,15 @@ async def create_extraction(
             """
             INSERT INTO extractions
                 (document_id, vendor_id, template_id, filename, total_pages,
-                 format_type, header_fields, line_item_fields, status, progress)
-            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, 'queued', $9::jsonb)
+                 format_type, header_fields, line_item_fields, status, progress,
+                 universal_agent)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, 'queued', $9::jsonb, $10)
             RETURNING id
             """,
             document_id, vendor_id, template_id, filename, total_pages,
             format_type, json.dumps(header_fields), json.dumps(line_item_fields),
             json.dumps({"stage": "queued", "message": "Queued for processing"}),
+            universal_agent,
         )
         return await get_extraction(pool, row["id"]) or {}
 

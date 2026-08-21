@@ -317,6 +317,7 @@ async def _submit_ingestion_job(
     metadata: dict | None = None,
     trace_context: dict | None = None,
     reserved_pages: int | None = None,
+    universal_agent: bool = False,
 ) -> dict:
     # When vendor_id is None the document is submitted for auto-detection: the
     # normalize worker detects the vendor and fills in template/format/fields
@@ -379,6 +380,7 @@ async def _submit_ingestion_job(
         header_fields=header_fields,
         line_item_fields=line_item_fields,
         document_id=document["id"],
+        universal_agent=universal_agent,
     )
 
     # If caller didn't provide a trace context (e.g. /ingest), create a root
@@ -2156,6 +2158,7 @@ async def ingest_document(
     header_fields: str = Form(None),
     line_item_fields: str = Form(None),
     source_ref: str = Form(None),
+    universal_agent: bool = Form(False),    # Universal Agent: keep only tax-invoice pages
     act_as_client_id: str | None = Form(
         None,
         description=(
@@ -2379,6 +2382,7 @@ async def ingest_document(
             source_ref=source_ref,
             metadata=ingest_metadata,
             reserved_pages=incoming_pages if user.get("role") != "admin" else None,
+            universal_agent=universal_agent,
         )
     except Exception:
         await _release_reserved_quota_once()
