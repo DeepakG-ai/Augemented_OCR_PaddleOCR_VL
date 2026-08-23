@@ -1,0 +1,37 @@
+[package]
+name = "augocr-pipeline"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "worker"
+path = "src/bin/worker.rs"
+
+[dependencies]
+augocr-common.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+sqlx.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+image.workspace = true
+base64.workspace = true
+rapidfuzz.workspace = true
+regex.workspace = true
+tokio-util.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[lints]
+workspace = true
+

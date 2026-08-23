@@ -1,0 +1,80 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/pipeline",
+    "crates/api",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+augocr-common = { path = "crates/common" }
+augocr-pipeline = { path = "crates/pipeline" }
+tokio-util = { version = "0.7", default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "fs", "io-util"] }
+axum = { version = "0.8", features = ["multipart"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "json", "uuid"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+serde = { version = "1", features = ["derive"] }
+# preserve_order keeps JSON object keys in insertion order, matching Python
+# dict semantics (e.g. contracts.attach_vendor puts "vendor" first).
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+async-trait = "0.1"
+futures = "0.3"
+jsonwebtoken = "9"
+bcrypt = "0.15"
+aes = "0.9"
+cbc = { version = "0.2", features = ["alloc"] }
+hmac = "0.12"
+rand = "0.8"
+base64 = "0.22"
+sha2 = "0.10"
+hex = "0.4"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+url = "2"
+http = "1"
+regex = "1"
+# Same algorithms as Python rapidfuzz (shared upstream project), so
+# token_sort_ratio scores match the behaviour vendor detection was tuned on.
+rapidfuzz = "0.5"
+bytes = "1"
+rusty-s3 = "0.5"
+# Pure-Rust decode/resize/encode for uploaded images (replaces Pillow). No
+# default features: we only want the codecs PIL was actually fed here.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "tiff", "webp"] }
+
+# Laptop-friendly dev profile: keep artifacts small, dependencies get mild
+# optimization so test/link cycles stay fast on an i5 / 16 GB machine.
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 1
+
+# Lint regime adopted from production-grade Rust codebases (codex-rs style):
+# fail the build on panic-prone patterns outside tests, keep format args
+# inlined, and never hold a lock across an await.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+await_holding_lock = "deny"
+await_holding_invalid_type = "deny"
+uninlined_format_args = "deny"
+redundant_clone = "deny"
+needless_collect = "deny"
+
+[workspace.lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+

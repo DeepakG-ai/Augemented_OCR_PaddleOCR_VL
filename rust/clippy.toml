@@ -1,0 +1,4 @@
+# Allow panics in tests only — mirrors clippy.toml of production Rust codebases.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+large-error-threshold = 256
